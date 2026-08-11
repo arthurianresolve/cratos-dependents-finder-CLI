@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -8,6 +10,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use futures::{StreamExt, stream};
 use semver::Version;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 
 use crate::{
     cargo_evidence::{
@@ -361,6 +364,8 @@ struct ManifestScanConfig<'a> {
     max_file_bytes: u64,
     tree_complete: bool,
     byte_ceiling: u64,
+    request_permits: &'a Semaphore,
+    max_in_flight: usize,
 }
 
 #[derive(Debug)]
@@ -377,14 +382,6 @@ impl RepositoryByteBudget {
             consumed: 0,
             limit_hit: false,
         }
-    }
-
-    fn remaining(&self) -> u64 {
-        self.limit.saturating_sub(self.consumed)
-    }
-
-    fn can_fetch(&mut self, declared_size: Option<u64>) -> bool {
-        self.can_fetch_below(declared_size, self.limit)
     }
 
     fn remaining_below(&self, ceiling: u64) -> u64 {
@@ -568,6 +565,9 @@ pub async fn scan(
     github: &GitHubClient,
     options: ScanOptions,
 ) -> Result<ScanOutcome> {
+    if options.jobs == 0 {
+        bail!("--jobs must be at least 1");
+    }
     if options.summary_json.as_deref() == Some(Path::new("-")) {
         bail!("--summary-json requires a file path; '-' would corrupt CSV stdout");
     }
@@ -621,7 +621,7 @@ pub async fn scan(
     };
 
     let mut groups = BTreeMap::<String, CandidateGroup>::new();
-    let mut retained_candidates = Vec::new();
+    let mut candidate_crates = HashSet::new();
     if matches!(options.discovery, Discovery::CratesIo | Discovery::Both) {
         let candidates = crates_io
             .reverse_dependencies_limited(&target_crate, options.max_candidates)
@@ -631,20 +631,14 @@ pub async fn scan(
             .is_some_and(|maximum| candidates.len() >= maximum);
         for candidate in candidates {
             if let Some(candidate) = filter_candidate(candidate, &options) {
-                retained_candidates.push(candidate);
+                summary.candidate_release_records += 1;
+                candidate_crates.insert(candidate.dependent_name.clone());
+                add_published_candidate(&mut groups, candidate);
             }
-        }
-        for candidate in retained_candidates.iter().cloned() {
-            add_published_candidate(&mut groups, candidate);
         }
     }
 
-    summary.candidate_release_records = retained_candidates.len();
-    summary.candidate_crates = retained_candidates
-        .iter()
-        .map(|candidate| candidate.dependent_name.as_str())
-        .collect::<HashSet<_>>()
-        .len();
+    summary.candidate_crates = candidate_crates.len();
 
     if matches!(options.discovery, Discovery::GithubCode | Discovery::Both) {
         add_github_code_candidates(
@@ -715,18 +709,17 @@ pub async fn scan(
         rows.push(sanitize_row(row));
     }
 
+    let github_requests = Arc::new(Semaphore::new(options.jobs));
     let work = resolution.resolved.into_iter().map(|resolved| {
         let client = github.clone();
         let context = context.clone();
         let options = options.clone();
-        async move { inspect_repository(&client, &context, resolved, &options).await }
+        let requests = Arc::clone(&github_requests);
+        async move { inspect_repository(&client, &context, resolved, &options, &requests).await }
     });
-    let inspections = stream::iter(work)
-        .buffer_unordered(options.jobs)
-        .collect::<Vec<_>>()
-        .await;
+    let mut inspections = stream::iter(work).buffer_unordered(options.jobs);
     let mut aggregate = InspectionResult::default();
-    for inspection in inspections {
+    while let Some(inspection) = inspections.next().await {
         aggregate.absorb(inspection);
     }
     rows.extend(aggregate.rows);
@@ -747,7 +740,8 @@ pub async fn scan(
     summary.repositories_exact_confirmed = aggregate.exact_confirmed_repositories;
     summary.partial |= summary.repositories_partial > 0
         || summary.repositories_failed > 0
-        || summary.repository_resolution_budget_exhausted;
+        || summary.repository_resolution_budget_exhausted
+        || summary.github_search_incomplete;
 
     rows.sort_by(|left, right| {
         (
@@ -884,7 +878,17 @@ async fn add_github_code_candidates(
     let queries = github_code_queries(target_crate, target_version);
 
     for (query, exact_name, source) in queries {
-        let result = github.search_code(&query, limit).await?;
+        let result = match github.search_code(&query, limit).await {
+            Ok(result) => result,
+            Err(error) => {
+                summary.github_search_incomplete = true;
+                summary.partial = true;
+                summary.notes.push(format!(
+                    "supplemental GitHub code search `{source}` failed; retained other candidate sources: {error:#}"
+                ));
+                continue;
+            }
+        };
         summary.github_search_results_returned += result.items.len();
         summary.github_search_total_count = summary
             .github_search_total_count
@@ -945,53 +949,64 @@ async fn resolve_repository_groups(
 ) -> RepositoryResolution {
     let total = groups.len();
     let resolution_budget = repository_resolution_budget(total, maximum);
-    let mut groups = groups.into_iter().take(resolution_budget).enumerate();
+    let mut work =
+        groups
+            .into_iter()
+            .take(resolution_budget)
+            .enumerate()
+            .map(|(position, group)| {
+                let client = github.clone();
+                async move {
+                    let repository = match group.repository_hint.as_ref() {
+                        Some(repo) => client.repository(repo).await,
+                        None => unreachable!("GitHub group always has a repository hint"),
+                    };
+                    (position, group, repository)
+                }
+            });
     let mut by_id = HashMap::<u64, ResolvedGroup>::new();
     let mut failures = Vec::new();
     let mut private_ids = HashSet::new();
     let mut considered = 0usize;
     let mut skipped_due_limit = false;
 
-    while maximum.is_none_or(|maximum| by_id.len() < maximum) {
-        let batch = groups.by_ref().take(jobs).collect::<Vec<_>>();
-        if batch.is_empty() {
-            break;
+    if maximum.is_none() {
+        let mut results = stream::iter(work).buffer_unordered(jobs);
+        while let Some((_, group, result)) = results.next().await {
+            considered += 1;
+            record_repository_resolution(
+                &mut by_id,
+                &mut failures,
+                &mut private_ids,
+                &mut skipped_due_limit,
+                maximum,
+                group,
+                result,
+            );
         }
-        considered += batch.len();
-        let work = batch.into_iter().map(|(position, group)| {
-            let client = github.clone();
-            async move {
-                let repository = match group.repository_hint.as_ref() {
-                    Some(repo) => client.repository(repo).await,
-                    None => unreachable!("GitHub group always has a repository hint"),
-                };
-                (position, group, repository)
+    } else {
+        while maximum.is_none_or(|maximum| by_id.len() < maximum) {
+            let batch = work.by_ref().take(jobs).collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
             }
-        });
-        let mut results = stream::iter(work)
-            .buffer_unordered(jobs)
-            .collect::<Vec<_>>()
-            .await;
-        results.sort_by_key(|(position, _, _)| *position);
+            considered += batch.len();
+            let mut results = stream::iter(batch)
+                .buffer_unordered(jobs)
+                .collect::<Vec<_>>()
+                .await;
+            results.sort_by_key(|(position, _, _)| *position);
 
-        for (_, group, result) in results {
-            match result {
-                Ok(repository) if repository.private => {
-                    private_ids.insert(repository.id);
-                }
-                Ok(repository) => {
-                    if let Some(existing) = by_id.get_mut(&repository.id) {
-                        existing.group.merge(group);
-                    } else if maximum.is_none_or(|maximum| by_id.len() < maximum) {
-                        by_id.insert(repository.id, ResolvedGroup { group, repository });
-                    } else {
-                        skipped_due_limit = true;
-                    }
-                }
-                Err(error) if maximum.is_none_or(|maximum| by_id.len() < maximum) => {
-                    failures.push((group, error));
-                }
-                Err(_) => skipped_due_limit = true,
+            for (_, group, result) in results {
+                record_repository_resolution(
+                    &mut by_id,
+                    &mut failures,
+                    &mut private_ids,
+                    &mut skipped_due_limit,
+                    maximum,
+                    group,
+                    result,
+                );
             }
         }
     }
@@ -1014,6 +1029,35 @@ async fn resolve_repository_groups(
     }
 }
 
+fn record_repository_resolution(
+    by_id: &mut HashMap<u64, ResolvedGroup>,
+    failures: &mut Vec<(CandidateGroup, anyhow::Error)>,
+    private_ids: &mut HashSet<u64>,
+    skipped_due_limit: &mut bool,
+    maximum: Option<usize>,
+    group: CandidateGroup,
+    result: Result<GitHubRepository>,
+) {
+    match result {
+        Ok(repository) if repository.private => {
+            private_ids.insert(repository.id);
+        }
+        Ok(repository) => {
+            if let Some(existing) = by_id.get_mut(&repository.id) {
+                existing.group.merge(group);
+            } else if maximum.is_none_or(|maximum| by_id.len() < maximum) {
+                by_id.insert(repository.id, ResolvedGroup { group, repository });
+            } else {
+                *skipped_due_limit = true;
+            }
+        }
+        Err(error) if maximum.is_none_or(|maximum| by_id.len() < maximum) => {
+            failures.push((group, error));
+        }
+        Err(_) => *skipped_due_limit = true,
+    }
+}
+
 fn repository_resolution_budget(total: usize, maximum: Option<usize>) -> usize {
     maximum.map_or(total, |maximum| {
         maximum
@@ -1022,11 +1066,23 @@ fn repository_resolution_budget(total: usize, maximum: Option<usize>) -> usize {
     })
 }
 
+async fn limited_github_request<T>(
+    request_permits: &Semaphore,
+    request: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let _permit = request_permits
+        .acquire()
+        .await
+        .context("GitHub request limiter closed unexpectedly")?;
+    request.await
+}
+
 async fn inspect_repository(
     github: &GitHubClient,
     context: &RunContext,
     resolved: ResolvedGroup,
     options: &ScanOptions,
+    request_permits: &Semaphore,
 ) -> InspectionResult {
     let mut result = InspectionResult::default();
     let repository = &resolved.repository;
@@ -1040,7 +1096,9 @@ async fn inspect_repository(
         return result;
     }
 
-    let head = match github.default_branch_head(repository).await {
+    let head = match limited_github_request(request_permits, github.default_branch_head(repository))
+        .await
+    {
         Ok(head) => head,
         Err(error) => {
             result.failed_repositories = 1;
@@ -1077,7 +1135,12 @@ async fn inspect_repository(
     };
 
     let repo = repository.repo();
-    let tree = match github.recursive_tree(&repo, &head.tree_sha).await {
+    let tree = match limited_github_request(
+        request_permits,
+        github.recursive_tree(&repo, &head.tree_sha),
+    )
+    .await
+    {
         Ok(tree) => tree,
         Err(error) => {
             result.failed_repositories = 1;
@@ -1101,19 +1164,20 @@ async fn inspect_repository(
     };
 
     result.scanned = 1;
-    let mut manifest_entries = tree
-        .tree
-        .iter()
-        .filter(|entry| entry.is_blob() && final_component(&entry.path) == "Cargo.toml")
-        .cloned()
-        .collect::<Vec<_>>();
+    let tree_truncated = tree.truncated;
+    let mut manifest_entries = Vec::new();
+    let mut lock_entries = Vec::new();
+    for entry in tree.tree {
+        if !entry.is_blob() {
+            continue;
+        }
+        match final_component(&entry.path) {
+            "Cargo.toml" => manifest_entries.push(entry),
+            "Cargo.lock" => lock_entries.push(entry),
+            _ => {}
+        }
+    }
     manifest_entries.sort_by(|left, right| left.path.cmp(&right.path));
-    let mut lock_entries = tree
-        .tree
-        .iter()
-        .filter(|entry| entry.is_blob() && final_component(&entry.path) == "Cargo.lock")
-        .cloned()
-        .collect::<Vec<_>>();
     lock_entries.sort_by(|left, right| left.path.cmp(&right.path));
     result.lockfiles_found = lock_entries.len();
 
@@ -1143,8 +1207,10 @@ async fn inspect_repository(
             target_crate: &context.target_crate,
             target_version: &context.target_version,
             max_file_bytes: options.max_file_bytes,
-            tree_complete: !tree.truncated,
+            tree_complete: !tree_truncated,
             byte_ceiling: manifest_byte_ceiling,
+            request_permits,
+            max_in_flight: options.jobs,
         },
     )
     .await;
@@ -1155,25 +1221,31 @@ async fn inspect_repository(
         .iter()
         .any(|candidate| candidate.declaration_enrichment_error.is_some());
     let repository_baseline_partial =
-        tree.truncated || !manifest_scan.complete || enrichment_partial;
+        tree_truncated || !manifest_scan.complete || enrichment_partial;
     let mut repository_became_partial = repository_baseline_partial || file_limit_hit;
+    let mut row_template = repository_row(
+        context,
+        &resolved.group,
+        repository,
+        Some(&head),
+        Some(stale),
+    );
+    apply_tree_and_manifest(
+        &mut row_template,
+        tree_truncated,
+        &manifest_scan,
+        enrichment_partial,
+    );
 
     if lock_entries.is_empty() {
-        let mut row = repository_row(
-            context,
-            &resolved.group,
-            repository,
-            Some(&head),
-            Some(stale),
-        );
-        apply_tree_and_manifest(&mut row, tree.truncated, &manifest_scan, enrichment_partial);
-        row.lock_status = if tree.truncated {
+        let mut row = row_template;
+        row.lock_status = if tree_truncated {
             "unknown_truncated"
         } else {
             "not_found"
         }
         .to_owned();
-        row.exact_resolution_status = if tree.truncated {
+        row.exact_resolution_status = if tree_truncated {
             "unknown"
         } else {
             "not_observed"
@@ -1184,14 +1256,7 @@ async fn inspect_repository(
         result.rows.push(sanitize_row(row));
     } else {
         for (lock_index, entry) in lock_entries.into_iter().enumerate() {
-            let mut row = repository_row(
-                context,
-                &resolved.group,
-                repository,
-                Some(&head),
-                Some(stale),
-            );
-            apply_tree_and_manifest(&mut row, tree.truncated, &manifest_scan, enrichment_partial);
+            let mut row = row_template.clone();
             row.cargo_lock_path = entry.path.clone();
             row.cargo_lock_blob_sha = entry.sha.clone();
 
@@ -1244,8 +1309,8 @@ async fn inspect_repository(
                 result.rows.push(sanitize_row(row));
                 continue;
             }
-
-            if !byte_budget.can_fetch(entry.size) {
+            let lock_byte_ceiling = byte_budget.limit;
+            if !byte_budget.can_fetch_below(entry.size, lock_byte_ceiling) {
                 row.lock_status = "repository_byte_budget_exceeded".to_owned();
                 row.exact_resolution_status = "unknown".to_owned();
                 row.recorded_relation = "unknown".to_owned();
@@ -1263,13 +1328,14 @@ async fn inspect_repository(
                 continue;
             }
 
-            let bytes = match github
-                .blob_by_sha(
-                    &repo,
-                    &entry.sha,
-                    options.max_file_bytes.min(byte_budget.remaining()),
-                )
-                .await
+            let max_bytes = options
+                .max_file_bytes
+                .min(byte_budget.remaining_below(lock_byte_ceiling));
+            let bytes = match limited_github_request(
+                request_permits,
+                github.blob_by_sha(&repo, &entry.sha, max_bytes),
+            )
+            .await
             {
                 Ok(bytes) => {
                     byte_budget.record(bytes.len());
@@ -1371,6 +1437,119 @@ async fn inspect_repository(
     result
 }
 
+#[derive(Debug)]
+enum CargoBlobFetch {
+    Symlink,
+    TooLarge,
+    ByteBudgetExceeded,
+    Failed(String),
+    Fetched(Vec<u8>),
+}
+
+struct CargoBlobFetchConfig<'a> {
+    selected_count: usize,
+    max_file_bytes: u64,
+    byte_ceiling: u64,
+    request_permits: &'a Semaphore,
+    max_in_flight: usize,
+}
+
+async fn fetch_cargo_blobs(
+    github: &GitHubClient,
+    repo: &GitHubRepo,
+    entries: &[GitHubTreeEntry],
+    byte_budget: &mut RepositoryByteBudget,
+    config: CargoBlobFetchConfig<'_>,
+) -> Vec<CargoBlobFetch> {
+    let selected_count = config.selected_count.min(entries.len());
+    let mut outcomes = Vec::with_capacity(selected_count);
+    outcomes.resize_with(selected_count, || None);
+    let mut cursor = 0usize;
+
+    while cursor < selected_count {
+        let mut reserved = 0u64;
+        let mut batch = Vec::new();
+        while cursor < selected_count && batch.len() < config.max_in_flight {
+            let entry = &entries[cursor];
+            if entry.mode == "120000" {
+                outcomes[cursor] = Some(CargoBlobFetch::Symlink);
+                cursor += 1;
+                continue;
+            }
+            if entry.size.is_some_and(|size| size > config.max_file_bytes) {
+                outcomes[cursor] = Some(CargoBlobFetch::TooLarge);
+                cursor += 1;
+                continue;
+            }
+
+            let available = config
+                .byte_ceiling
+                .min(byte_budget.limit)
+                .saturating_sub(byte_budget.consumed)
+                .saturating_sub(reserved);
+            match entry.size {
+                Some(size) if size <= available => {
+                    batch.push((cursor, entry, size));
+                    reserved = reserved.saturating_add(size);
+                    cursor += 1;
+                }
+                Some(_) if batch.is_empty() => {
+                    let admitted = byte_budget.can_fetch_below(entry.size, config.byte_ceiling);
+                    debug_assert!(!admitted);
+                    outcomes[cursor] = Some(CargoBlobFetch::ByteBudgetExceeded);
+                    cursor += 1;
+                }
+                Some(_) => break,
+                None if available == 0 && batch.is_empty() => {
+                    let admitted = byte_budget.can_fetch_below(None, config.byte_ceiling);
+                    debug_assert!(!admitted);
+                    outcomes[cursor] = Some(CargoBlobFetch::ByteBudgetExceeded);
+                    cursor += 1;
+                }
+                None if batch.is_empty() => {
+                    batch.push((cursor, entry, config.max_file_bytes.min(available)));
+                    cursor += 1;
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        if batch.is_empty() {
+            continue;
+        }
+        let work = batch
+            .into_iter()
+            .map(|(position, entry, max_bytes)| async move {
+                let result = limited_github_request(
+                    config.request_permits,
+                    github.blob_by_sha(repo, &entry.sha, max_bytes),
+                )
+                .await;
+                (position, result)
+            });
+        let mut fetched = stream::iter(work)
+            .buffer_unordered(config.max_in_flight)
+            .collect::<Vec<_>>()
+            .await;
+        fetched.sort_by_key(|(position, _)| *position);
+        for (position, result) in fetched {
+            outcomes[position] = Some(match result {
+                Ok(bytes) => {
+                    byte_budget.record(bytes.len());
+                    CargoBlobFetch::Fetched(bytes)
+                }
+                Err(error) => CargoBlobFetch::Failed(format!("{error:#}")),
+            });
+        }
+    }
+
+    outcomes
+        .into_iter()
+        .map(|outcome| outcome.expect("every selected Cargo blob has an outcome"))
+        .collect()
+}
+
 async fn scan_manifests(
     github: &GitHubClient,
     repo: &GitHubRepo,
@@ -1388,48 +1567,43 @@ async fn scan_manifests(
             REPOSITORY_MATCHED_FILE_LIMIT
         ));
     }
-    for entry in entries.iter().take(config.selected_count) {
-        if entry.mode == "120000" {
-            diagnostics.push(format!(
+    let fetches = fetch_cargo_blobs(
+        github,
+        repo,
+        entries,
+        byte_budget,
+        CargoBlobFetchConfig {
+            selected_count: config.selected_count,
+            max_file_bytes: config.max_file_bytes,
+            byte_ceiling: config.byte_ceiling,
+            request_permits: config.request_permits,
+            max_in_flight: config.max_in_flight,
+        },
+    )
+    .await;
+    for (entry, fetch) in entries.iter().take(config.selected_count).zip(fetches) {
+        match fetch {
+            CargoBlobFetch::Symlink => diagnostics.push(format!(
                 "{}: symbolic-link Cargo.toml was not followed",
                 entry.path
-            ));
-            continue;
-        }
-        if entry.size.is_some_and(|size| size > config.max_file_bytes) {
-            diagnostics.push(format!(
+            )),
+            CargoBlobFetch::TooLarge => diagnostics.push(format!(
                 "{}: manifest size {} exceeds cap {}",
                 entry.path,
                 entry.size.unwrap_or_default(),
                 config.max_file_bytes
-            ));
-            continue;
-        }
-        if !byte_budget.can_fetch_below(entry.size, config.byte_ceiling) {
-            diagnostics.push(format!(
+            )),
+            CargoBlobFetch::ByteBudgetExceeded => diagnostics.push(format!(
                 "{}: manifest would exceed the per-repository {}-byte Cargo-file budget",
                 entry.path, byte_budget.limit
-            ));
-            continue;
-        }
-        match github
-            .blob_by_sha(
-                repo,
-                &entry.sha,
-                config
-                    .max_file_bytes
-                    .min(byte_budget.remaining_below(config.byte_ceiling)),
-            )
-            .await
-        {
-            Ok(bytes) => {
-                byte_budget.record(bytes.len());
-                match String::from_utf8(bytes) {
-                    Ok(text) => manifests.push((entry.path.clone(), text)),
-                    Err(error) => diagnostics.push(format!("{}: {error}", entry.path)),
-                }
+            )),
+            CargoBlobFetch::Failed(error) => {
+                diagnostics.push(format!("{}: {error}", entry.path));
             }
-            Err(error) => diagnostics.push(format!("{}: {error:#}", entry.path)),
+            CargoBlobFetch::Fetched(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => manifests.push((entry.path.clone(), text)),
+                Err(error) => diagnostics.push(format!("{}: {error}", entry.path)),
+            },
         }
     }
 
@@ -1557,24 +1731,22 @@ fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
         .published
         .iter()
         .any(|candidate| candidate.declaration_enrichment_error.is_some());
+    let requirement_evaluations = declarations
+        .iter()
+        .map(|declaration| {
+            evaluate_cargo_requirement(&declaration.requirement, &context.target_version)
+        })
+        .collect::<Vec<_>>();
     let accepts = tri_state(
-        declarations
+        requirement_evaluations
             .iter()
-            .map(|declaration| {
-                evaluate_cargo_requirement(&declaration.requirement, &context.target_version)
-                    .accepts
-            })
-            .collect::<Vec<_>>(),
+            .map(|evaluation| evaluation.accepts),
         enrichment_unknown,
     );
     let exact_pin = tri_state(
-        declarations
+        requirement_evaluations
             .iter()
-            .map(|declaration| {
-                evaluate_cargo_requirement(&declaration.requirement, &context.target_version)
-                    .explicit_exact_pin
-            })
-            .collect::<Vec<_>>(),
+            .map(|evaluation| evaluation.explicit_exact_pin),
         enrichment_unknown,
     );
     let observed_optional = declarations.iter().any(|declaration| declaration.optional);
@@ -1712,10 +1884,21 @@ fn repository_row(
     row
 }
 
-fn tri_state(values: Vec<Option<bool>>, force_unknown_if_no_match: bool) -> String {
-    if values.contains(&Some(true)) {
-        "true"
-    } else if force_unknown_if_no_match || values.is_empty() || values.iter().any(Option::is_none) {
+fn tri_state(
+    values: impl IntoIterator<Item = Option<bool>>,
+    force_unknown_if_no_match: bool,
+) -> String {
+    let mut saw_value = false;
+    let mut saw_unknown = false;
+    for value in values {
+        saw_value = true;
+        match value {
+            Some(true) => return "true".to_owned(),
+            Some(false) => {}
+            None => saw_unknown = true,
+        }
+    }
+    if force_unknown_if_no_match || !saw_value || saw_unknown {
         "unknown"
     } else {
         "false"
@@ -1798,6 +1981,11 @@ fn sanitize_row(mut row: CsvRow) -> CsvRow {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
+    use url::Url;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
 
     use super::*;
     use crate::crates_io::RepresentativeDependency;
@@ -2050,6 +2238,58 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn supplemental_code_search_failures_preserve_other_candidates() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/code"))
+            .and(query_param("q", "fs2 0.4.3 filename:Cargo.lock is:public"))
+            .respond_with(ResponseTemplate::new(422))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search/code"))
+            .and(query_param("q", "fs2 filename:Cargo.toml is:public"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": 0,
+                "incomplete_results": false,
+                "items": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let github = GitHubClient::with_api_base(
+            Some("test-token".to_owned()),
+            Url::parse(&format!("{}/", server.uri())).unwrap(),
+        )
+        .unwrap();
+        let mut groups = BTreeMap::from([("existing".to_owned(), CandidateGroup::default())]);
+        let mut summary = ScanSummary::default();
+
+        add_github_code_candidates(
+            &github,
+            "fs2",
+            &Version::parse("0.4.3").unwrap(),
+            10,
+            &mut groups,
+            &mut summary,
+        )
+        .await
+        .unwrap();
+
+        assert!(groups.contains_key("existing"));
+        assert!(summary.github_search_incomplete);
+        assert!(summary.partial);
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note.contains("github_rest_code_search_lock_seed"))
+        );
+        server.verify().await;
+    }
+
     #[test]
     fn unclassified_presence_is_not_an_exact_dependency_confirmation() {
         assert!(relation_confirms_dependency(RecordedRelation::Direct));
@@ -2089,7 +2329,59 @@ mod tests {
         budget.record(40);
         assert!(!budget.can_fetch_below(Some(30), 60));
         assert!(budget.limit_hit);
-        assert_eq!(budget.remaining(), 60);
+        assert_eq!(budget.remaining_below(budget.limit), 60);
+    }
+
+    #[tokio::test]
+    async fn failed_blob_fetch_releases_budget_for_the_next_file() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/git/blobs/first"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/git/blobs/second"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"second"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let github =
+            GitHubClient::with_api_base(None, Url::parse(&format!("{}/", server.uri())).unwrap())
+                .unwrap();
+        let repo = GitHubRepo::new("acme", "widget").unwrap();
+        let mut first = tree_entry("first/Cargo.lock", "100644", Some(6));
+        first.sha = "first".to_owned();
+        let mut second = tree_entry("second/Cargo.lock", "100644", Some(6));
+        second.sha = "second".to_owned();
+        let entries = vec![first, second];
+        let mut budget = RepositoryByteBudget::new(6);
+        let permits = Semaphore::new(2);
+
+        let outcomes = fetch_cargo_blobs(
+            &github,
+            &repo,
+            &entries,
+            &mut budget,
+            CargoBlobFetchConfig {
+                selected_count: 2,
+                max_file_bytes: 10,
+                byte_ceiling: 6,
+                request_permits: &permits,
+                max_in_flight: 2,
+            },
+        )
+        .await;
+
+        assert!(matches!(&outcomes[0], CargoBlobFetch::Failed(_)));
+        assert!(matches!(
+            &outcomes[1],
+            CargoBlobFetch::Fetched(bytes) if bytes == b"second"
+        ));
+        assert_eq!(budget.consumed, 6);
+        assert!(!budget.limit_hit);
+        server.verify().await;
     }
 
     #[test]

@@ -22,7 +22,7 @@ const REQUIRED_MATCH_NOT_FOUND_EXIT_CODE: i32 = 3;
     long_about = "Evidence-oriented inventory of repositories that declare or resolve a Cargo crate version. Results are bounded by public registry and GitHub coverage and are never represented as exhaustive."
 )]
 pub struct Cli {
-    /// Maximum number of repositories inspected concurrently.
+    /// Maximum concurrent repository inspections and GitHub requests.
     #[arg(long, global = true, default_value_t = 4, value_parser = parse_jobs)]
     jobs: usize,
 

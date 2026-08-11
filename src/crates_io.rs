@@ -18,6 +18,7 @@ const API_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const API_RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
 const SPARSE_INDEX_RESPONSE_LIMIT: usize = 64 * 1024 * 1024;
+const RESPONSE_PREALLOC_LIMIT: u64 = 1024 * 1024;
 const MAX_TRANSIENT_RETRIES: usize = 2;
 const REVERSE_DEPENDENCIES_PER_PAGE: usize = 100;
 const INDEX_FETCH_CONCURRENCY: usize = 8;
@@ -201,6 +202,7 @@ impl CratesIoClient {
         let mut page_number = 1usize;
         let mut candidates = Vec::new();
         let mut seen_versions = HashSet::new();
+        let mut records_seen = 0usize;
 
         loop {
             let mut url = endpoint_url(
@@ -219,6 +221,7 @@ impl CratesIoClient {
             let reported_total = response.meta.total;
             let page_len = response.dependencies.len();
             let joined = join_reverse_page(response)?;
+            records_seen = records_seen.saturating_add(page_len);
 
             for candidate in joined {
                 if seen_versions.insert(candidate.version_id) {
@@ -232,7 +235,7 @@ impl CratesIoClient {
             if limit.is_some_and(|limit| candidates.len() >= limit)
                 || !has_another_reverse_page(
                     page_len,
-                    candidates.len(),
+                    records_seen,
                     reported_total,
                     self.inner.reverse_dependencies_per_page,
                 )
@@ -315,15 +318,17 @@ impl CratesIoClient {
                 self.wait_for_api_slot().await;
             }
 
-            // Transport failures are intentionally not retried. Only a concrete
-            // transient HTTP status is eligible for the short retry policy.
-            let response = self
-                .inner
-                .http
-                .get(url.clone())
-                .send()
-                .await
-                .with_context(|| format!("GET `{url}` failed"))?;
+            let response = match self.inner.http.get(url.clone()).send().await {
+                Ok(response) => response,
+                Err(error)
+                    if attempt < MAX_TRANSIENT_RETRIES
+                        && (error.is_connect() || error.is_timeout()) =>
+                {
+                    tokio::time::sleep(transient_backoff(attempt)).await;
+                    continue;
+                }
+                Err(error) => return Err(error).with_context(|| format!("GET `{url}` failed")),
+            };
 
             if !is_transient(response.status()) || attempt == MAX_TRANSIENT_RETRIES {
                 return Ok(response);
@@ -332,8 +337,9 @@ impl CratesIoClient {
             let Some(retry_delay) = retry_delay(&response, attempt) else {
                 return Ok(response);
             };
-            // Consume the body before reusing the pooled connection.
-            let _ = response.bytes().await;
+            // Never buffer an untrusted transient error body just to reuse the
+            // connection. Dropping it keeps retry memory bounded.
+            drop(response);
             tokio::time::sleep(retry_delay).await;
         }
 
@@ -540,11 +546,11 @@ fn representative_declaration(representative: &RepresentativeDependency) -> Depe
 
 fn has_another_reverse_page(
     page_len: usize,
-    unique_collected: usize,
+    records_seen: usize,
     reported_total: usize,
     per_page: usize,
 ) -> bool {
-    page_len == per_page && unique_collected < reported_total
+    page_len == per_page && records_seen < reported_total
 }
 
 fn extract_index_declarations(
@@ -663,7 +669,17 @@ async fn decode_text(response: reqwest::Response, url: &Url) -> Result<String> {
 }
 
 async fn read_limited(mut response: reqwest::Response, url: &Url, limit: usize) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
+    let declared_length = response.content_length();
+    if let Some(length) = declared_length {
+        ensure!(
+            length <= limit as u64,
+            "response from `{url}` declares {length} bytes, exceeding the {limit}-byte decoded-body cap"
+        );
+    }
+    let capacity = declared_length
+        .unwrap_or_default()
+        .min(RESPONSE_PREALLOC_LIMIT) as usize;
+    let mut body = Vec::with_capacity(capacity);
     while let Some(chunk) = response
         .chunk()
         .await
@@ -689,7 +705,10 @@ fn response_excerpt(body: &[u8]) -> String {
 }
 
 fn is_transient(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+    ) || status.is_server_error()
 }
 
 fn retry_delay(response: &reqwest::Response, attempt: usize) -> Option<Duration> {
@@ -706,7 +725,11 @@ fn retry_delay(response: &reqwest::Response, attempt: usize) -> Option<Duration>
             .map(Duration::from_secs);
     }
 
-    Some(Duration::from_millis(250 * (attempt as u64 + 1)))
+    Some(transient_backoff(attempt))
+}
+
+fn transient_backoff(attempt: usize) -> Duration {
+    Duration::from_millis(250 * (attempt as u64 + 1))
 }
 
 fn default_true() -> bool {
@@ -789,6 +812,7 @@ mod tests {
         assert!(!has_another_reverse_page(100, 100, 100, 100));
         assert!(!has_another_reverse_page(99, 99, 201, 100));
         assert!(!has_another_reverse_page(0, 0, 1, 100));
+        assert!(is_transient(StatusCode::REQUEST_TIMEOUT));
     }
 
     #[test]
@@ -914,6 +938,58 @@ mod tests {
         assert_eq!(candidates[1].dependent_name, "alpha");
         assert_eq!(candidates[2].dependent_name, "gamma");
         assert_eq!(candidates[2].representative.kind, "dev");
+    }
+
+    #[tokio::test]
+    async fn repeated_reverse_dependency_pages_stop_at_the_reported_total() {
+        let server = MockServer::start().await;
+        let api_path = "/api/v1/crates/fs2/reverse_dependencies";
+        let repeated_page = json!({
+            "dependencies": [
+                {"id":1,"version_id":10,"crate_id":"fs2","req":"^0.4.3","kind":"normal","downloads":100},
+                {"id":2,"version_id":20,"crate_id":"fs2","req":"^0.4.3","kind":"normal","downloads":90}
+            ],
+            "versions": [
+                {"id":10,"crate":"alpha","num":"1.0.0","yanked":false,"repository":null},
+                {"id":20,"crate":"beta","num":"1.0.0","yanked":false,"repository":null}
+            ],
+            "meta":{"total":4}
+        });
+        for page in ["1", "2"] {
+            Mock::given(method("GET"))
+                .and(path(api_path))
+                .and(query_param("page", page))
+                .and(query_param("per_page", "2"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(repeated_page.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        for name in ["alpha", "beta"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/index/{}", sparse_index_path(name).unwrap())))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(
+                        json!({"name":name,"vers":"1.0.0","deps":[{"name":"fs2","req":"^0.4.3"}]})
+                            .to_string(),
+                    ),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let client = CratesIoClient::with_configuration(
+            Url::parse(&format!("{}/api/v1/", server.uri())).unwrap(),
+            Url::parse(&format!("{}/index/", server.uri())).unwrap(),
+            Duration::ZERO,
+            2,
+        )
+        .unwrap();
+        let candidates = client.reverse_dependencies("fs2").await.unwrap();
+
+        assert_eq!(candidates.len(), 2);
+        server.verify().await;
     }
 
     #[tokio::test]

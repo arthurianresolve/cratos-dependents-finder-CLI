@@ -101,7 +101,7 @@ source = "{CRATES_IO_SOURCE}"
             summary_json: Some(summary_path.clone()),
             allow_partial: false,
             require_match: true,
-            jobs: 1,
+            jobs: 2,
         },
     )
     .await

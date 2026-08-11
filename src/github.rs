@@ -23,6 +23,7 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ERROR_BODY_LIMIT: u64 = 16 * 1024;
 const JSON_RESPONSE_LIMIT: u64 = 16 * 1024 * 1024;
 const JSON_BLOB_OVERHEAD: u64 = 64 * 1024;
+const RESPONSE_PREALLOC_LIMIT: u64 = 1024 * 1024;
 const REST_SEARCH_LIMIT: usize = 1_000;
 const REST_SEARCH_PAGE_SIZE: usize = 100;
 
@@ -715,9 +716,9 @@ impl GitHubClient {
             incomplete_results: false,
             items: Vec::with_capacity(limit),
         };
+        let page_size = limit.min(REST_SEARCH_PAGE_SIZE);
         let mut page = 1usize;
         while result.items.len() < limit {
-            let page_size = (limit - result.items.len()).min(REST_SEARCH_PAGE_SIZE);
             let mut url = self.endpoint(["search", kind])?;
             url.query_pairs_mut()
                 .append_pair("q", query)
@@ -752,13 +753,25 @@ impl GitHubClient {
 
     async fn send_get(&self, url: Url, accept: &'static str) -> Result<Response> {
         for attempt in 0..MAX_ATTEMPTS {
-            let response = self
+            let response = match self
                 .client
                 .get(url.clone())
                 .header(ACCEPT, accept)
                 .send()
                 .await
-                .with_context(|| format!("GitHub request failed for {}", url.path()))?;
+            {
+                Ok(response) => response,
+                Err(error)
+                    if attempt + 1 < MAX_ATTEMPTS && (error.is_connect() || error.is_timeout()) =>
+                {
+                    tokio::time::sleep(short_backoff(attempt)).await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("GitHub request failed for {}", url.path()));
+                }
+            };
             if response.status().is_success() {
                 return Ok(response);
             }
@@ -890,8 +903,15 @@ fn retry_action(
     attempt: usize,
     now: DateTime<Utc>,
 ) -> RetryAction {
-    let transient =
-        status == StatusCode::TOO_MANY_REQUESTS || matches!(status.as_u16(), 500 | 502 | 503 | 504);
+    let transient = matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    ) || (status == StatusCode::FORBIDDEN && headers.contains_key(RETRY_AFTER));
     if !transient {
         return RetryAction::DoNotRetry;
     }
@@ -919,8 +939,12 @@ fn retry_action(
         }
     }
 
+    RetryAction::RetryAfter(short_backoff(attempt))
+}
+
+fn short_backoff(attempt: usize) -> Duration {
     let multiplier = 1u64 << attempt.min(3);
-    RetryAction::RetryAfter(Duration::from_millis(100 * multiplier))
+    Duration::from_millis(100 * multiplier)
 }
 
 fn numeric_header(headers: &HeaderMap, name: &'static str) -> Option<u64> {
@@ -932,13 +956,17 @@ fn text_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
 }
 
 async fn read_limited(mut response: Response, max_bytes: u64) -> Result<Vec<u8>> {
-    if let Some(length) = response.content_length() {
+    let declared_length = response.content_length();
+    if let Some(length) = declared_length {
         ensure!(
             length <= max_bytes,
             "response declared {length} bytes, exceeding the {max_bytes}-byte cap"
         );
     }
-    let mut body = Vec::new();
+    let capacity = declared_length
+        .unwrap_or_default()
+        .min(RESPONSE_PREALLOC_LIMIT) as usize;
+    let mut body = Vec::with_capacity(capacity);
     let mut received = 0u64;
     while let Some(chunk) = response
         .chunk()
@@ -1374,6 +1402,42 @@ mod tests {
         assert!(!result.bounded());
     }
 
+    #[tokio::test]
+    async fn keeps_the_search_page_size_fixed_across_pages() {
+        let server = MockServer::start().await;
+        let first_page = (1..=100)
+            .map(|id| repository_json("acme", &format!("widget-{id}"), id))
+            .collect::<Vec<_>>();
+        let second_page = (101..=200)
+            .map(|id| repository_json("acme", &format!("widget-{id}"), id))
+            .collect::<Vec<_>>();
+        for (page, items) in [("1", first_page), ("2", second_page)] {
+            Mock::given(method("GET"))
+                .and(path("/search/repositories"))
+                .and(query_param("q", "widget in:name is:public"))
+                .and(query_param("per_page", "100"))
+                .and(query_param("page", page))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "total_count": 200,
+                    "incomplete_results": false,
+                    "items": items
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let result = test_client(&server, None)
+            .search_repositories_by_name("widget", 150)
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 150);
+        assert_eq!(result.items[0].id, 1);
+        assert_eq!(result.items[149].id, 150);
+        server.verify().await;
+    }
+
     #[test]
     fn retries_only_transient_statuses_and_short_delays() {
         let now = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
@@ -1393,6 +1457,15 @@ mod tests {
         assert_eq!(
             retry_action(StatusCode::FORBIDDEN, &HeaderMap::new(), 0, now),
             RetryAction::DoNotRetry
+        );
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        assert_eq!(
+            retry_action(StatusCode::FORBIDDEN, &headers, 0, now),
+            RetryAction::RetryAfter(Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_action(StatusCode::REQUEST_TIMEOUT, &HeaderMap::new(), 0, now),
+            RetryAction::RetryAfter(Duration::from_millis(100))
         );
         assert_eq!(
             retry_action(StatusCode::BAD_GATEWAY, &HeaderMap::new(), 1, now),

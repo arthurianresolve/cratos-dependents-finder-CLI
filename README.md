@@ -142,7 +142,9 @@ Repository inspection is public-only. Private search results or repositories
 visible to the supplied token are discarded. Per-file, per-repository matched
 file-count, cumulative download, request-time, and JSON-response bounds prevent
 a pathological repository from consuming unbounded resources; reaching one of
-those bounds is recorded as partial evidence.
+those bounds is recorded as partial evidence. Cargo manifest blobs are fetched
+concurrently while one shared `--jobs` limit bounds GitHub request pressure
+across all repository inspections.
 
 ## Requirement filters
 
