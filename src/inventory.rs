@@ -838,19 +838,21 @@ fn add_published_candidate(
             Some(repo),
             None,
         ),
-        None if repository.is_some() => (
-            format!("unsupported:{}", repository.unwrap().to_ascii_lowercase()),
-            None,
-            Some("candidate repository is not a canonical github.com repository".to_owned()),
-        ),
-        None => (
-            format!(
-                "missing:{}@{}",
-                candidate.dependent_name, candidate.dependent_version
+        None => match repository {
+            Some(repository) => (
+                format!("unsupported:{}", repository.to_ascii_lowercase()),
+                None,
+                Some("candidate repository is not a canonical github.com repository".to_owned()),
             ),
-            None,
-            Some("dependent crate version has no repository URL".to_owned()),
-        ),
+            None => (
+                format!(
+                    "missing:{}@{}",
+                    candidate.dependent_name, candidate.dependent_version
+                ),
+                None,
+                Some("dependent crate version has no repository URL".to_owned()),
+            ),
+        },
     };
     let group = groups.entry(key).or_default();
     group.repository_hint = group.repository_hint.take().or(hint);
