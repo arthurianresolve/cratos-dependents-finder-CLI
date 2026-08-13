@@ -638,6 +638,17 @@ msrv_observations.push(msrv_observation);
             &right.message,
         ))
     });
+// Pick the lowest semver-valid rust-version as the workspace effective MSRV.
+let (effective_msrv, effective_msrv_source) = msrv_observations
+    .iter()
+    .filter_map(|obs| {
+        obs.msrv.as_deref().and_then(|v| {
+            semver::Version::parse(v).ok().map(|parsed| (parsed, v.to_owned(), obs.source))
+        })
+    })
+    .min_by(|(a, _, _), (b, _, _)| a.cmp(b))
+    .map(|(_, raw, src)| (Some(raw), src))
+    .unwrap_or((None, MsrvSource::NotDeclared));
 
     ManifestEvidence {
         target_name: target_name.to_owned(),
