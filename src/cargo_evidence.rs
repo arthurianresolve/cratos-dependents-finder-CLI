@@ -658,7 +658,9 @@ let (effective_msrv, effective_msrv_source) = msrv_observations
         analysis_complete: diagnostics.is_empty(),
         declarations,
         diagnostics,
-    }
+        msrv_observations,
+        effective_msrv,
+        effective_msrv_source,
 }
 
 struct ParsedManifest {
