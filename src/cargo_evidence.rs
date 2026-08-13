@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use cargo_lock::{Lockfile, Package};
+use regex::Regex;
 use semver::{Op, Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
@@ -323,6 +324,17 @@ pub struct MsrvObservation {
     pub source: MsrvSource,
 }
 
+static OS_PATTERN: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r#"target_os\s*=\s*"([^"]+)""#).expect("OS selector pattern is valid")
+});
+
+/// OS names observed in `cfg(target_os = "...")` dependency selectors.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OsSupport {
+    pub observed_targets: Vec<String>,
+    pub has_unconditional_declaration: bool,
+}
+
 /// Direct-declaration evidence collected from all supplied manifests.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ManifestEvidence {
@@ -485,6 +497,7 @@ where
     }
 
     let mut declarations = Vec::new();
+    let mut msrv_observations = Vec::new();
     for (manifest_index, manifest) in parsed_manifests.iter().enumerate() {
         let package_name = manifest
             .document
@@ -493,7 +506,7 @@ where
             .and_then(|package| package.get("name"))
             .and_then(toml::Value::as_str)
             .map(str::to_owned);
-// --- MSRV extraction ---
+        // --- MSRV extraction ---
         let rust_version_value = manifest
             .document
             .get("package")
@@ -501,38 +514,41 @@ where
             .and_then(|pkg| pkg.get("rust-version"));
 
         let msrv_observation = match rust_version_value {
-        Some(toml::Value::String(v)) => MsrvObservation {
-             manifest_path: manifest.path.clone(),
-             msrv: Some(v.clone()),
-             source: MsrvSource::PackageField,
-    },
-    Some(toml::Value::Table(t)) if t.get("workspace").and_then(toml::Value::as_bool) == Some(true) => {
-        // workspace-inherited: try to resolve from workspace root
-        let resolved = find_workspace_root(manifest_index, &parsed_manifests, &workspace_roots)
-            .and_then(|root_idx| {
-                parsed_manifests[root_idx]
-                    .document
-                    .get("workspace")
-                    .and_then(toml::Value::as_table)
-                    .and_then(|ws| ws.get("package"))
-                    .and_then(toml::Value::as_table)
-                    .and_then(|pkg| pkg.get("rust-version"))
-                    .and_then(toml::Value::as_str)
-                    .map(str::to_owned)
-            });
-        MsrvObservation {
-            manifest_path: manifest.path.clone(),
-            msrv: resolved,
-            source: MsrvSource::WorkspaceInherited,
-        }
-    }
-    _ => MsrvObservation {
-        manifest_path: manifest.path.clone(),
-        msrv: None,
-        source: MsrvSource::NotDeclared,
-    },
-};
-msrv_observations.push(msrv_observation);
+            Some(toml::Value::String(v)) => MsrvObservation {
+                manifest_path: manifest.path.clone(),
+                msrv: Some(v.clone()),
+                source: MsrvSource::PackageField,
+            },
+            Some(toml::Value::Table(t))
+                if t.get("workspace").and_then(toml::Value::as_bool) == Some(true) =>
+            {
+                // workspace-inherited: try to resolve from workspace root
+                let resolved =
+                    find_workspace_root(manifest_index, &parsed_manifests, &workspace_roots)
+                        .and_then(|root_idx| {
+                            parsed_manifests[root_idx]
+                                .document
+                                .get("workspace")
+                                .and_then(toml::Value::as_table)
+                                .and_then(|ws| ws.get("package"))
+                                .and_then(toml::Value::as_table)
+                                .and_then(|pkg| pkg.get("rust-version"))
+                                .and_then(toml::Value::as_str)
+                                .map(str::to_owned)
+                        });
+                MsrvObservation {
+                    manifest_path: manifest.path.clone(),
+                    msrv: resolved,
+                    source: MsrvSource::WorkspaceInherited,
+                }
+            }
+            _ => MsrvObservation {
+                manifest_path: manifest.path.clone(),
+                msrv: None,
+                source: MsrvSource::NotDeclared,
+            },
+        };
+        msrv_observations.push(msrv_observation);
         for table in dependency_tables(&manifest.document) {
             for (alias, value) in table.dependencies {
                 let Some(member_spec) =
@@ -638,17 +654,19 @@ msrv_observations.push(msrv_observation);
             &right.message,
         ))
     });
-// Pick the lowest semver-valid rust-version as the workspace effective MSRV.
-let (effective_msrv, effective_msrv_source) = msrv_observations
-    .iter()
-    .filter_map(|obs| {
-        obs.msrv.as_deref().and_then(|v| {
-            semver::Version::parse(v).ok().map(|parsed| (parsed, v.to_owned(), obs.source))
+    // Pick the lowest semver-valid rust-version as the workspace effective MSRV.
+    let (effective_msrv, effective_msrv_source) = msrv_observations
+        .iter()
+        .filter_map(|obs| {
+            obs.msrv.as_deref().and_then(|v| {
+                semver::Version::parse(v)
+                    .ok()
+                    .map(|parsed| (parsed, v.to_owned(), obs.source))
+            })
         })
-    })
-    .min_by(|(a, _, _), (b, _, _)| a.cmp(b))
-    .map(|(_, raw, src)| (Some(raw), src))
-    .unwrap_or((None, MsrvSource::NotDeclared));
+        .min_by(|(a, _, _), (b, _, _)| a.cmp(b))
+        .map(|(_, raw, src)| (Some(raw), src))
+        .unwrap_or((None, MsrvSource::NotDeclared));
 
     ManifestEvidence {
         target_name: target_name.to_owned(),
@@ -661,6 +679,29 @@ let (effective_msrv, effective_msrv_source) = msrv_observations
         msrv_observations,
         effective_msrv,
         effective_msrv_source,
+    }
+}
+
+/// Aggregate OS selectors from direct dependency declarations.
+pub fn aggregate_os_support(declarations: &[DirectDeclaration]) -> OsSupport {
+    let mut observed_targets = BTreeSet::new();
+    let mut has_unconditional_declaration = false;
+
+    for declaration in declarations {
+        match declaration.target.as_deref() {
+            None => has_unconditional_declaration = true,
+            Some(target) => {
+                for capture in OS_PATTERN.captures_iter(target) {
+                    observed_targets.insert(capture[1].to_owned());
+                }
+            }
+        }
+    }
+
+    OsSupport {
+        observed_targets: observed_targets.into_iter().collect(),
+        has_unconditional_declaration,
+    }
 }
 
 struct ParsedManifest {
@@ -1344,5 +1385,71 @@ fs2 = { version = "not semver", optional = false }
         );
         assert_eq!(evidence.declarations[0].requirement_accepts, None);
         assert!(evidence.declarations[0].requirement_error.is_some());
+    }
+
+    #[test]
+    fn extracts_package_msrv_and_os_selectors() {
+        let manifest = r#"
+[package]
+name = "app"
+version = "0.1.0"
+rust-version = "1.70.0"
+
+[dependencies]
+fs2 = "0.4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+fs2 = "0.4"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+fs2 = "0.4"
+"#;
+        let evidence =
+            analyze_cargo_manifests([("Cargo.toml", manifest)], "fs2", &version("0.4.3"));
+
+        assert_eq!(evidence.effective_msrv.as_deref(), Some("1.70.0"));
+        assert_eq!(evidence.effective_msrv_source, MsrvSource::PackageField);
+        let os = aggregate_os_support(&evidence.declarations);
+        assert_eq!(os.observed_targets, vec!["linux", "macos", "windows"]);
+        assert!(os.has_unconditional_declaration);
+    }
+
+    #[test]
+    fn inherits_workspace_msrv_and_reports_not_declared() {
+        let root = r#"
+[workspace]
+members = ["member"]
+[workspace.package]
+rust-version = "1.65.0"
+"#;
+        let member = r#"
+[package]
+name = "member"
+version = "0.1.0"
+rust-version.workspace = true
+[dependencies]
+fs2 = "0.4"
+"#;
+        let inherited = analyze_cargo_manifests(
+            [("Cargo.toml", root), ("member/Cargo.toml", member)],
+            "fs2",
+            &version("0.4.3"),
+        );
+        assert_eq!(inherited.effective_msrv.as_deref(), Some("1.65.0"));
+        assert_eq!(
+            inherited.effective_msrv_source,
+            MsrvSource::WorkspaceInherited
+        );
+
+        let no_msrv = analyze_cargo_manifests(
+            [(
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+            )],
+            "fs2",
+            &version("0.4.3"),
+        );
+        assert_eq!(no_msrv.effective_msrv, None);
+        assert_eq!(no_msrv.effective_msrv_source, MsrvSource::NotDeclared);
     }
 }

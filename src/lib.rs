@@ -6,6 +6,7 @@ pub mod inventory;
 pub mod links;
 pub mod model;
 pub mod output;
+pub mod report;
 pub mod resolve;
 
 #[cfg(test)]

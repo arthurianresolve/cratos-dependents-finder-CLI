@@ -113,6 +113,22 @@ Run `cargo run --locked -- scan --help` for kind, optional-dependency,
 fork/archive, candidate cap, file-size, activity, partial-result, and
 require-match controls.
 
+### Report an existing CSV
+
+`report` performs offline sorting/grouping, so it does not contact crates.io or
+GitHub:
+
+```powershell
+cargo run --locked -- report fs2-0.4.3.csv `
+  --sort msrv-asc `
+  --group-by stale
+
+cargo run --locked -- report fs2-0.4.3.csv --json
+```
+
+The report command expects the current scan CSV schema and fails with a clear
+column error when given an unrelated CSV.
+
 ## What `scan` does
 
 For a crates.io-seeded run, the CLI:
@@ -179,6 +195,8 @@ boolean. It includes:
   every resolved target version/source, exact occurrence counts, and exact
   crates.io-registry occurrence counts;
 - current manifest declarations and requirements;
+- declared MSRV observations and effective MSRV source, plus OS names inferred
+  from `cfg(target_os = "...")` dependency selectors;
 - recorded direct/transitive relation and shortest lockfile-graph depth when it
   can be established;
 - row-level error codes and messages.

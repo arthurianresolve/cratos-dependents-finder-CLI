@@ -8,6 +8,7 @@ use crate::{
     github::GitHubClient,
     inventory::{ScanOptions, scan},
     links::build_links,
+    report,
     resolve::{ResolveOptions, resolve_target},
 };
 
@@ -38,6 +39,8 @@ enum Command {
     Links(LinksArgs),
     /// Build a CSV inventory and verify immutable default-branch snapshots.
     Scan(ScanArgs),
+    /// Read a previous CSV inventory and emit an offline summary.
+    Report(ReportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -167,6 +170,39 @@ struct ScanArgs {
     require_match: bool,
 }
 
+#[derive(Debug, Args)]
+struct ReportArgs {
+    /// CSV file produced by `scan`.
+    input: PathBuf,
+
+    /// Sort rows by the selected field.
+    #[arg(long, value_enum, default_value_t = ReportSort::LastCommitDesc)]
+    sort: ReportSort,
+
+    /// Group rows before sorting within each group.
+    #[arg(long, value_enum)]
+    group_by: Option<ReportGroupBy>,
+
+    /// Emit machine-readable JSON instead of Markdown.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ReportSort {
+    LastCommitDesc,
+    LastCommitAsc,
+    MsrvAsc,
+    MsrvDesc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ReportGroupBy {
+    Msrv,
+    Os,
+    Stale,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum RequirementFilter {
     Any,
@@ -203,13 +239,20 @@ pub enum ActivityFilter {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    let command = match cli.command {
+        Command::Report(args) => {
+            return report::run_report(&args.input, args.sort, args.group_by, args.json);
+        }
+        command => command,
+    };
+
     let github_token = std::env::var("GITHUB_TOKEN")
         .ok()
         .or_else(|| std::env::var("GH_TOKEN").ok());
     let crates_io = CratesIoClient::new()?;
     let github = GitHubClient::new(github_token)?;
 
-    match cli.command {
+    match command {
         Command::Resolve(args) => {
             let result = resolve_target(
                 &crates_io,
@@ -259,6 +302,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             if outcome.no_match && outcome.require_match {
                 std::process::exit(REQUIRED_MATCH_NOT_FOUND_EXIT_CODE);
             }
+        }
+        Command::Report(args) => {
+            report::run_report(&args.input, args.sort, args.group_by, args.json)?
         }
     }
 

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    future::Future,
+    io::IsTerminal,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -8,25 +8,27 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
 use futures::{StreamExt, stream};
+use indicatif::{ProgressBar, ProgressStyle};
 use semver::Version;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 
 use crate::{
-    cargo_evidence::{
-        ManifestEvidence, RecordedRelation, analyze_cargo_lock, analyze_cargo_manifests,
-        evaluate_cargo_requirement,
-    },
+    cargo_evidence::{ManifestEvidence, evaluate_cargo_requirement},
     cli::{ActivityFilter, DependencyKind, Discovery, OptionalFilter, RequirementFilter},
-    crates_io::{
-        CratesIoClient, DependencyDeclaration, REVERSE_DEPENDENCY_SCOPE, ReverseDependencyCandidate,
-    },
-    github::{
-        GitHubClient, GitHubHead, GitHubRepo, GitHubRepository, GitHubTreeEntry, parse_github_repo,
-    },
-    output::{csv_safe, write_csv, write_json},
+    crates_io::{CratesIoClient, REVERSE_DEPENDENCY_SCOPE, ReverseDependencyCandidate},
+    github::{GitHubClient, GitHubRepo, GitHubRepository, GitHubTreeEntry, parse_github_repo},
+    output::{write_csv, write_json},
     resolve::{ResolveOptions, resolve_target},
 };
+
+mod projection;
+mod repository;
+use projection::{
+    append_error, apply_tree_and_manifest, base_row, finalize_completeness, json_cell,
+    relation_confirms_dependency, relation_name, repository_row, sanitize_row,
+};
+use repository::inspect_repository;
 
 const REPOSITORY_MATCHED_FILE_LIMIT: usize = 2_000;
 const REPOSITORY_MATCHED_FILE_BYTE_BUDGET: u64 = 128 * 1024 * 1024;
@@ -182,6 +184,11 @@ pub struct CsvRow {
     pub manifest_paths_json: String,
     pub current_direct_status: String,
     pub current_direct_requirements_json: String,
+    pub msrv_effective: String,
+    pub msrv_source: String,
+    pub msrv_observations_json: String,
+    pub os_observed_targets_json: String,
+    pub os_has_unconditional_declaration: String,
     pub recorded_relation: String,
     pub shortest_dependency_depth: String,
     pub evidence_completeness: String,
@@ -239,6 +246,11 @@ impl CsvRow {
         "manifest_paths_json",
         "current_direct_status",
         "current_direct_requirements_json",
+        "msrv_effective",
+        "msrv_source",
+        "msrv_observations_json",
+        "os_observed_targets_json",
+        "os_has_unconditional_declaration",
         "recorded_relation",
         "shortest_dependency_depth",
         "evidence_completeness",
@@ -331,22 +343,6 @@ impl InspectionResult {
         self.file_limit_exceeded += other.file_limit_exceeded;
         self.byte_budget_exceeded += other.byte_budget_exceeded;
     }
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct PublishedDeclarationCell {
-    dependent_crate: String,
-    dependent_version: String,
-    dependent_version_id: u64,
-    dependent_downloads: u64,
-    dependency_alias: String,
-    dependency_package: String,
-    requirement: String,
-    kind: String,
-    optional: bool,
-    target: Option<String>,
-    registry: Option<String>,
-    enrichment_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -710,18 +706,38 @@ pub async fn scan(
     }
 
     let github_requests = Arc::new(Semaphore::new(options.jobs));
+    let progress = if std::io::stderr().is_terminal() {
+        let progress = ProgressBar::new(resolution.resolved.len() as u64);
+        let style = ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} repos {msg}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar());
+        progress.set_style(style);
+        progress
+    } else {
+        ProgressBar::hidden()
+    };
     let work = resolution.resolved.into_iter().map(|resolved| {
         let client = github.clone();
         let context = context.clone();
         let options = options.clone();
         let requests = Arc::clone(&github_requests);
-        async move { inspect_repository(&client, &context, resolved, &options, &requests).await }
+        let repository_name = resolved.repository.full_name.clone();
+        async move {
+            (
+                repository_name,
+                inspect_repository(&client, &context, resolved, &options, &requests).await,
+            )
+        }
     });
     let mut inspections = stream::iter(work).buffer_unordered(options.jobs);
     let mut aggregate = InspectionResult::default();
-    while let Some(inspection) = inspections.next().await {
+    while let Some((repository_name, inspection)) = inspections.next().await {
+        progress.set_message(repository_name);
+        progress.inc(1);
         aggregate.absorb(inspection);
     }
+    progress.finish_with_message("scan complete");
     rows.extend(aggregate.rows);
 
     summary.repositories_scanned = aggregate.scanned;
@@ -1068,865 +1084,6 @@ fn repository_resolution_budget(total: usize, maximum: Option<usize>) -> usize {
     })
 }
 
-async fn limited_github_request<T>(
-    request_permits: &Semaphore,
-    request: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    let _permit = request_permits
-        .acquire()
-        .await
-        .context("GitHub request limiter closed unexpectedly")?;
-    request.await
-}
-
-async fn inspect_repository(
-    github: &GitHubClient,
-    context: &RunContext,
-    resolved: ResolvedGroup,
-    options: &ScanOptions,
-    request_permits: &Semaphore,
-) -> InspectionResult {
-    let mut result = InspectionResult::default();
-    let repository = &resolved.repository;
-
-    if repository.fork && !options.include_forks {
-        result.filtered_fork = 1;
-        return result;
-    }
-    if repository.archived && options.exclude_archived {
-        result.filtered_archived = 1;
-        return result;
-    }
-
-    let head = match limited_github_request(request_permits, github.default_branch_head(repository))
-        .await
-    {
-        Ok(head) => head,
-        Err(error) => {
-            result.failed_repositories = 1;
-            let mut row = repository_row(context, &resolved.group, repository, None, None);
-            row.inventory_status = "failed".to_owned();
-            row.lock_status = "not_scanned".to_owned();
-            row.exact_resolution_status = "unknown".to_owned();
-            row.current_direct_status = "unknown".to_owned();
-            row.recorded_relation = "unknown".to_owned();
-            row.evidence_completeness = "failed".to_owned();
-            append_error(
-                &mut row,
-                "default_branch_head_failed",
-                &format!("{error:#}"),
-            );
-            result.rows.push(sanitize_row(row));
-            return result;
-        }
-    };
-
-    let stale = match activity_decision(
-        head.committed_at,
-        context.observed_at,
-        options.stale_after_days,
-        options.activity,
-        options.committed_since,
-        options.committed_before,
-    ) {
-        ActivityDecision::Keep { stale } => stale,
-        ActivityDecision::Filter => {
-            result.filtered_activity = 1;
-            return result;
-        }
-    };
-
-    let repo = repository.repo();
-    let tree = match limited_github_request(
-        request_permits,
-        github.recursive_tree(&repo, &head.tree_sha),
-    )
-    .await
-    {
-        Ok(tree) => tree,
-        Err(error) => {
-            result.failed_repositories = 1;
-            let mut row = repository_row(
-                context,
-                &resolved.group,
-                repository,
-                Some(&head),
-                Some(stale),
-            );
-            row.inventory_status = "failed".to_owned();
-            row.lock_status = "not_scanned".to_owned();
-            row.exact_resolution_status = "unknown".to_owned();
-            row.current_direct_status = "unknown".to_owned();
-            row.recorded_relation = "unknown".to_owned();
-            row.evidence_completeness = "failed".to_owned();
-            append_error(&mut row, "tree_fetch_failed", &format!("{error:#}"));
-            result.rows.push(sanitize_row(row));
-            return result;
-        }
-    };
-
-    result.scanned = 1;
-    let tree_truncated = tree.truncated;
-    let mut manifest_entries = Vec::new();
-    let mut lock_entries = Vec::new();
-    for entry in tree.tree {
-        if !entry.is_blob() {
-            continue;
-        }
-        match final_component(&entry.path) {
-            "Cargo.toml" => manifest_entries.push(entry),
-            "Cargo.lock" => lock_entries.push(entry),
-            _ => {}
-        }
-    }
-    manifest_entries.sort_by(|left, right| left.path.cmp(&right.path));
-    lock_entries.sort_by(|left, right| left.path.cmp(&right.path));
-    result.lockfiles_found = lock_entries.len();
-
-    let matched_file_count = manifest_entries.len().saturating_add(lock_entries.len());
-    result.matched_cargo_files = matched_file_count;
-    let selected_lock_count = lock_entries.len().min(REPOSITORY_MATCHED_FILE_LIMIT);
-    let selected_manifest_count = manifest_entries
-        .len()
-        .min(REPOSITORY_MATCHED_FILE_LIMIT.saturating_sub(selected_lock_count));
-    let file_limit_hit = matched_file_count > REPOSITORY_MATCHED_FILE_LIMIT;
-    result.file_limit_exceeded = usize::from(file_limit_hit);
-    let mut byte_budget = RepositoryByteBudget::new(REPOSITORY_MATCHED_FILE_BYTE_BUDGET);
-    let reserved_lock_bytes = reserved_lock_bytes(
-        &lock_entries,
-        selected_lock_count,
-        options.max_file_bytes,
-        byte_budget.limit,
-    );
-    let manifest_byte_ceiling = byte_budget.limit.saturating_sub(reserved_lock_bytes);
-    let manifest_scan = scan_manifests(
-        github,
-        &repo,
-        &manifest_entries,
-        &mut byte_budget,
-        ManifestScanConfig {
-            selected_count: selected_manifest_count,
-            target_crate: &context.target_crate,
-            target_version: &context.target_version,
-            max_file_bytes: options.max_file_bytes,
-            tree_complete: !tree_truncated,
-            byte_ceiling: manifest_byte_ceiling,
-            request_permits,
-            max_in_flight: options.jobs,
-        },
-    )
-    .await;
-
-    let enrichment_partial = resolved
-        .group
-        .published
-        .iter()
-        .any(|candidate| candidate.declaration_enrichment_error.is_some());
-    let repository_baseline_partial =
-        tree_truncated || !manifest_scan.complete || enrichment_partial;
-    let mut repository_became_partial = repository_baseline_partial || file_limit_hit;
-    let mut row_template = repository_row(
-        context,
-        &resolved.group,
-        repository,
-        Some(&head),
-        Some(stale),
-    );
-    apply_tree_and_manifest(
-        &mut row_template,
-        tree_truncated,
-        &manifest_scan,
-        enrichment_partial,
-    );
-
-    if lock_entries.is_empty() {
-        let mut row = row_template;
-        row.lock_status = if tree_truncated {
-            "unknown_truncated"
-        } else {
-            "not_found"
-        }
-        .to_owned();
-        row.exact_resolution_status = if tree_truncated {
-            "unknown"
-        } else {
-            "not_observed"
-        }
-        .to_owned();
-        row.recorded_relation = "unknown".to_owned();
-        finalize_completeness(&mut row, repository_baseline_partial);
-        result.rows.push(sanitize_row(row));
-    } else {
-        for (lock_index, entry) in lock_entries.into_iter().enumerate() {
-            let mut row = row_template.clone();
-            row.cargo_lock_path = entry.path.clone();
-            row.cargo_lock_blob_sha = entry.sha.clone();
-
-            if lock_index >= selected_lock_count {
-                row.lock_status = "repository_file_limit_exceeded".to_owned();
-                row.exact_resolution_status = "unknown".to_owned();
-                row.recorded_relation = "unknown".to_owned();
-                append_error(
-                    &mut row,
-                    "repository_matched_file_limit",
-                    &format!(
-                        "repository has {matched_file_count} matching Cargo files, exceeding the per-repository limit {REPOSITORY_MATCHED_FILE_LIMIT}"
-                    ),
-                );
-                repository_became_partial = true;
-                finalize_completeness(&mut row, true);
-                result.rows.push(sanitize_row(row));
-                continue;
-            }
-
-            if entry.mode == "120000" {
-                row.lock_status = "symlink_not_followed".to_owned();
-                row.exact_resolution_status = "unknown".to_owned();
-                row.recorded_relation = "unknown".to_owned();
-                append_error(
-                    &mut row,
-                    "lockfile_symlink",
-                    "Cargo.lock is a symbolic link; the immutable blob is the link target path",
-                );
-                repository_became_partial = true;
-                finalize_completeness(&mut row, true);
-                result.rows.push(sanitize_row(row));
-                continue;
-            }
-            if entry.size.is_some_and(|size| size > options.max_file_bytes) {
-                row.lock_status = "too_large".to_owned();
-                row.exact_resolution_status = "unknown".to_owned();
-                row.recorded_relation = "unknown".to_owned();
-                append_error(
-                    &mut row,
-                    "lockfile_too_large",
-                    &format!(
-                        "blob size {} exceeds --max-file-bytes {}",
-                        entry.size.unwrap_or_default(),
-                        options.max_file_bytes
-                    ),
-                );
-                repository_became_partial = true;
-                finalize_completeness(&mut row, true);
-                result.rows.push(sanitize_row(row));
-                continue;
-            }
-            let lock_byte_ceiling = byte_budget.limit;
-            if !byte_budget.can_fetch_below(entry.size, lock_byte_ceiling) {
-                row.lock_status = "repository_byte_budget_exceeded".to_owned();
-                row.exact_resolution_status = "unknown".to_owned();
-                row.recorded_relation = "unknown".to_owned();
-                append_error(
-                    &mut row,
-                    "repository_matched_file_byte_budget",
-                    &format!(
-                        "Cargo file download would exceed the per-repository {}-byte budget",
-                        byte_budget.limit
-                    ),
-                );
-                repository_became_partial = true;
-                finalize_completeness(&mut row, true);
-                result.rows.push(sanitize_row(row));
-                continue;
-            }
-
-            let max_bytes = options
-                .max_file_bytes
-                .min(byte_budget.remaining_below(lock_byte_ceiling));
-            let bytes = match limited_github_request(
-                request_permits,
-                github.blob_by_sha(&repo, &entry.sha, max_bytes),
-            )
-            .await
-            {
-                Ok(bytes) => {
-                    byte_budget.record(bytes.len());
-                    bytes
-                }
-                Err(error) => {
-                    row.lock_status = "fetch_failed".to_owned();
-                    row.exact_resolution_status = "unknown".to_owned();
-                    row.recorded_relation = "unknown".to_owned();
-                    append_error(&mut row, "lockfile_fetch_failed", &format!("{error:#}"));
-                    repository_became_partial = true;
-                    finalize_completeness(&mut row, true);
-                    result.rows.push(sanitize_row(row));
-                    continue;
-                }
-            };
-            let text = match String::from_utf8(bytes) {
-                Ok(text) => text,
-                Err(error) => {
-                    row.lock_status = "non_utf8".to_owned();
-                    row.exact_resolution_status = "unknown".to_owned();
-                    row.recorded_relation = "unknown".to_owned();
-                    append_error(&mut row, "lockfile_non_utf8", &error.to_string());
-                    repository_became_partial = true;
-                    finalize_completeness(&mut row, true);
-                    result.rows.push(sanitize_row(row));
-                    continue;
-                }
-            };
-
-            match analyze_cargo_lock(&text, &context.target_crate, &context.target_version) {
-                Ok(evidence) => {
-                    result.lockfiles_parsed += 1;
-                    result.exact_occurrences += evidence.exact_occurrences;
-                    if evidence.exact_occurrences > 0
-                        && relation_confirms_dependency(evidence.recorded_relation)
-                    {
-                        result.exact_confirmed_repositories = 1;
-                    }
-                    row.lock_status = "parsed".to_owned();
-                    row.resolved_target_versions_json = json_cell(&evidence.resolved_versions);
-                    row.resolved_target_sources_json = json_cell(&evidence.occurrences);
-                    row.exact_resolution_status = if evidence.exact_occurrences > 0 {
-                        "present"
-                    } else {
-                        "absent"
-                    }
-                    .to_owned();
-                    row.exact_occurrence_count = evidence.exact_occurrences;
-                    row.exact_crates_io_occurrence_count = evidence.exact_crates_io_occurrences;
-                    row.recorded_relation = relation_name(evidence.recorded_relation).to_owned();
-                    row.shortest_dependency_depth = evidence
-                        .shortest_depth
-                        .map(|depth| depth.to_string())
-                        .unwrap_or_default();
-
-                    let graph_partial =
-                        evidence.exact_occurrences > 0 && !evidence.graph_analysis_complete;
-                    if graph_partial {
-                        append_error(
-                            &mut row,
-                            "lock_graph_unclassified",
-                            evidence
-                                .graph_diagnostic
-                                .as_deref()
-                                .unwrap_or("lock graph could not be classified"),
-                        );
-                        repository_became_partial = true;
-                    }
-                    finalize_completeness(&mut row, repository_baseline_partial || graph_partial);
-                }
-                Err(error) => {
-                    row.lock_status = "parse_failed".to_owned();
-                    row.exact_resolution_status = "unknown".to_owned();
-                    row.recorded_relation = "unknown".to_owned();
-                    append_error(&mut row, "lockfile_parse_failed", &format!("{error:#}"));
-                    repository_became_partial = true;
-                    finalize_completeness(&mut row, true);
-                }
-            }
-            result.rows.push(sanitize_row(row));
-        }
-    }
-
-    result.matched_cargo_file_bytes_downloaded = byte_budget.consumed;
-    if byte_budget.limit_hit {
-        result.byte_budget_exceeded = 1;
-        repository_became_partial = true;
-    }
-    for row in &mut result.rows {
-        row.repository_matched_cargo_file_count = matched_file_count;
-        row.repository_matched_file_limit = REPOSITORY_MATCHED_FILE_LIMIT;
-        row.repository_matched_file_bytes_downloaded = byte_budget.consumed;
-        row.repository_matched_file_byte_budget = byte_budget.limit;
-    }
-    if repository_became_partial {
-        result.partial_repositories = 1;
-    }
-    result
-}
-
-#[derive(Debug)]
-enum CargoBlobFetch {
-    Symlink,
-    TooLarge,
-    ByteBudgetExceeded,
-    Failed(String),
-    Fetched(Vec<u8>),
-}
-
-struct CargoBlobFetchConfig<'a> {
-    selected_count: usize,
-    max_file_bytes: u64,
-    byte_ceiling: u64,
-    request_permits: &'a Semaphore,
-    max_in_flight: usize,
-}
-
-async fn fetch_cargo_blobs(
-    github: &GitHubClient,
-    repo: &GitHubRepo,
-    entries: &[GitHubTreeEntry],
-    byte_budget: &mut RepositoryByteBudget,
-    config: CargoBlobFetchConfig<'_>,
-) -> Vec<CargoBlobFetch> {
-    let selected_count = config.selected_count.min(entries.len());
-    let mut outcomes = Vec::with_capacity(selected_count);
-    outcomes.resize_with(selected_count, || None);
-    let mut cursor = 0usize;
-
-    while cursor < selected_count {
-        let mut reserved = 0u64;
-        let mut batch = Vec::new();
-        while cursor < selected_count && batch.len() < config.max_in_flight {
-            let entry = &entries[cursor];
-            if entry.mode == "120000" {
-                outcomes[cursor] = Some(CargoBlobFetch::Symlink);
-                cursor += 1;
-                continue;
-            }
-            if entry.size.is_some_and(|size| size > config.max_file_bytes) {
-                outcomes[cursor] = Some(CargoBlobFetch::TooLarge);
-                cursor += 1;
-                continue;
-            }
-
-            let available = config
-                .byte_ceiling
-                .min(byte_budget.limit)
-                .saturating_sub(byte_budget.consumed)
-                .saturating_sub(reserved);
-            match entry.size {
-                Some(size) if size <= available => {
-                    batch.push((cursor, entry, size));
-                    reserved = reserved.saturating_add(size);
-                    cursor += 1;
-                }
-                Some(_) if batch.is_empty() => {
-                    let admitted = byte_budget.can_fetch_below(entry.size, config.byte_ceiling);
-                    debug_assert!(!admitted);
-                    outcomes[cursor] = Some(CargoBlobFetch::ByteBudgetExceeded);
-                    cursor += 1;
-                }
-                Some(_) => break,
-                None if available == 0 && batch.is_empty() => {
-                    let admitted = byte_budget.can_fetch_below(None, config.byte_ceiling);
-                    debug_assert!(!admitted);
-                    outcomes[cursor] = Some(CargoBlobFetch::ByteBudgetExceeded);
-                    cursor += 1;
-                }
-                None if batch.is_empty() => {
-                    batch.push((cursor, entry, config.max_file_bytes.min(available)));
-                    cursor += 1;
-                    break;
-                }
-                None => break,
-            }
-        }
-
-        if batch.is_empty() {
-            continue;
-        }
-        let work = batch
-            .into_iter()
-            .map(|(position, entry, max_bytes)| async move {
-                let result = limited_github_request(
-                    config.request_permits,
-                    github.blob_by_sha(repo, &entry.sha, max_bytes),
-                )
-                .await;
-                (position, result)
-            });
-        let mut fetched = stream::iter(work)
-            .buffer_unordered(config.max_in_flight)
-            .collect::<Vec<_>>()
-            .await;
-        fetched.sort_by_key(|(position, _)| *position);
-        for (position, result) in fetched {
-            outcomes[position] = Some(match result {
-                Ok(bytes) => {
-                    byte_budget.record(bytes.len());
-                    CargoBlobFetch::Fetched(bytes)
-                }
-                Err(error) => CargoBlobFetch::Failed(format!("{error:#}")),
-            });
-        }
-    }
-
-    outcomes
-        .into_iter()
-        .map(|outcome| outcome.expect("every selected Cargo blob has an outcome"))
-        .collect()
-}
-
-async fn scan_manifests(
-    github: &GitHubClient,
-    repo: &GitHubRepo,
-    entries: &[GitHubTreeEntry],
-    byte_budget: &mut RepositoryByteBudget,
-    config: ManifestScanConfig<'_>,
-) -> ManifestScan {
-    let paths = entries.iter().map(|entry| entry.path.clone()).collect();
-    let mut manifests = Vec::new();
-    let mut diagnostics = Vec::new();
-    if entries.len() > config.selected_count {
-        diagnostics.push(format!(
-            "{} Cargo.toml files were not read because the repository matched-file limit is {}",
-            entries.len() - config.selected_count,
-            REPOSITORY_MATCHED_FILE_LIMIT
-        ));
-    }
-    let fetches = fetch_cargo_blobs(
-        github,
-        repo,
-        entries,
-        byte_budget,
-        CargoBlobFetchConfig {
-            selected_count: config.selected_count,
-            max_file_bytes: config.max_file_bytes,
-            byte_ceiling: config.byte_ceiling,
-            request_permits: config.request_permits,
-            max_in_flight: config.max_in_flight,
-        },
-    )
-    .await;
-    for (entry, fetch) in entries.iter().take(config.selected_count).zip(fetches) {
-        match fetch {
-            CargoBlobFetch::Symlink => diagnostics.push(format!(
-                "{}: symbolic-link Cargo.toml was not followed",
-                entry.path
-            )),
-            CargoBlobFetch::TooLarge => diagnostics.push(format!(
-                "{}: manifest size {} exceeds cap {}",
-                entry.path,
-                entry.size.unwrap_or_default(),
-                config.max_file_bytes
-            )),
-            CargoBlobFetch::ByteBudgetExceeded => diagnostics.push(format!(
-                "{}: manifest would exceed the per-repository {}-byte Cargo-file budget",
-                entry.path, byte_budget.limit
-            )),
-            CargoBlobFetch::Failed(error) => {
-                diagnostics.push(format!("{}: {error}", entry.path));
-            }
-            CargoBlobFetch::Fetched(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => manifests.push((entry.path.clone(), text)),
-                Err(error) => diagnostics.push(format!("{}: {error}", entry.path)),
-            },
-        }
-    }
-
-    let evidence = analyze_cargo_manifests(manifests, config.target_crate, config.target_version);
-    diagnostics.extend(evidence.diagnostics.iter().map(|diagnostic| {
-        format!(
-            "{}: {}: {}",
-            diagnostic.manifest_path, diagnostic.code, diagnostic.message
-        )
-    }));
-    let complete = config.tree_complete && diagnostics.is_empty() && evidence.analysis_complete;
-    ManifestScan {
-        evidence,
-        paths,
-        complete,
-        diagnostics,
-    }
-}
-
-fn apply_tree_and_manifest(
-    row: &mut CsvRow,
-    tree_truncated: bool,
-    manifest_scan: &ManifestScan,
-    enrichment_partial: bool,
-) {
-    row.tree_truncated = tree_truncated.to_string();
-    row.manifest_paths_json = json_cell(&manifest_scan.paths);
-    row.current_direct_requirements_json = json_cell(&manifest_scan.evidence.declarations);
-    row.current_direct_status = if !manifest_scan.evidence.declarations.is_empty() {
-        "present"
-    } else if manifest_scan.complete {
-        "absent"
-    } else {
-        "unknown"
-    }
-    .to_owned();
-
-    if tree_truncated {
-        append_error(
-            row,
-            "tree_truncated",
-            "GitHub recursive tree was truncated; file absence is not proven",
-        );
-    }
-    if !manifest_scan.complete {
-        append_error(
-            row,
-            "manifest_inventory_partial",
-            &manifest_scan.diagnostics.join(" | "),
-        );
-    }
-    if enrichment_partial {
-        append_error(
-            row,
-            "sparse_index_enrichment_partial",
-            "one or more published candidates use representative fallback data",
-        );
-    }
-}
-
-fn finalize_completeness(row: &mut CsvRow, partial: bool) {
-    if partial || !row.error_code.is_empty() {
-        row.inventory_status = "partial".to_owned();
-        row.evidence_completeness = "partial".to_owned();
-    } else {
-        row.inventory_status = "complete".to_owned();
-        row.evidence_completeness = "complete".to_owned();
-    }
-}
-
-fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
-    let mut declarations = group
-        .published
-        .iter()
-        .flat_map(|candidate| {
-            candidate
-                .declarations
-                .iter()
-                .map(|declaration| published_cell(candidate, declaration))
-        })
-        .collect::<Vec<_>>();
-    declarations.sort_by(|left, right| {
-        (
-            &left.dependent_crate,
-            &left.dependent_version,
-            &left.kind,
-            &left.dependency_alias,
-            &left.requirement,
-            &left.target,
-        )
-            .cmp(&(
-                &right.dependent_crate,
-                &right.dependent_version,
-                &right.kind,
-                &right.dependency_alias,
-                &right.requirement,
-                &right.target,
-            ))
-    });
-
-    let dependent_crates = group
-        .published
-        .iter()
-        .map(|candidate| candidate.dependent_name.clone())
-        .collect::<BTreeSet<_>>();
-    let dependent_versions = group
-        .published
-        .iter()
-        .map(|candidate| {
-            format!(
-                "{}@{}",
-                candidate.dependent_name, candidate.dependent_version
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    let kinds = declarations
-        .iter()
-        .map(|declaration| declaration.kind.clone())
-        .collect::<BTreeSet<_>>();
-    let targets = declarations
-        .iter()
-        .filter_map(|declaration| declaration.target.clone())
-        .collect::<BTreeSet<_>>();
-    let enrichment_unknown = group
-        .published
-        .iter()
-        .any(|candidate| candidate.declaration_enrichment_error.is_some());
-    let requirement_evaluations = declarations
-        .iter()
-        .map(|declaration| {
-            evaluate_cargo_requirement(&declaration.requirement, &context.target_version)
-        })
-        .collect::<Vec<_>>();
-    let accepts = tri_state(
-        requirement_evaluations
-            .iter()
-            .map(|evaluation| evaluation.accepts),
-        enrichment_unknown,
-    );
-    let exact_pin = tri_state(
-        requirement_evaluations
-            .iter()
-            .map(|evaluation| evaluation.explicit_exact_pin),
-        enrichment_unknown,
-    );
-    let observed_optional = declarations.iter().any(|declaration| declaration.optional);
-    let observed_required = declarations.iter().any(|declaration| !declaration.optional);
-    let optional_declarations = if declarations.is_empty()
-        || (enrichment_unknown && !(observed_optional && observed_required))
-    {
-        "unknown"
-    } else if observed_optional && !observed_required {
-        "all"
-    } else if observed_optional {
-        "mixed"
-    } else {
-        "none"
-    };
-
-    CsvRow {
-        observed_at_utc: context.observed_at.to_rfc3339(),
-        input_query: context.input_query.clone(),
-        target_crate: context.target_crate.clone(),
-        target_version: context.target_version.to_string(),
-        target_repository_url: context.target_repository_url.clone().unwrap_or_default(),
-        globally_exhaustive: context.globally_exhaustive,
-        candidate_scope: context.candidate_scope.clone(),
-        scan_policy_json: context.scan_policy_json.clone(),
-        candidate_sources_json: json_cell(&group.sources),
-        dependent_crates_json: json_cell(&dependent_crates),
-        dependent_versions_json: json_cell(&dependent_versions),
-        published_requirements_json: json_cell(&declarations),
-        dependency_kinds_json: json_cell(&kinds),
-        dependency_targets_json: json_cell(&targets),
-        optional_declarations: optional_declarations.to_owned(),
-        published_direct_status: if group.published.is_empty() {
-            "not_observed"
-        } else {
-            "present"
-        }
-        .to_owned(),
-        any_requirement_accepts: accepts,
-        any_exact_pin: exact_pin,
-        original_repository_urls_json: json_cell(&group.original_repository_urls),
-        repository_url: group
-            .original_repository_urls
-            .iter()
-            .next()
-            .cloned()
-            .unwrap_or_default(),
-        github_repository_id: String::new(),
-        github_full_name: group
-            .repository_hint
-            .as_ref()
-            .map(GitHubRepo::full_name)
-            .unwrap_or_default(),
-        default_branch: String::new(),
-        head_sha: String::new(),
-        tree_sha: String::new(),
-        head_committed_at: String::new(),
-        repo_pushed_at: String::new(),
-        archived: "unknown".to_owned(),
-        fork: "unknown".to_owned(),
-        disabled: "unknown".to_owned(),
-        stale: "unknown".to_owned(),
-        inventory_status: "unknown".to_owned(),
-        tree_truncated: "unknown".to_owned(),
-        repository_matched_cargo_file_count: 0,
-        repository_matched_file_limit: REPOSITORY_MATCHED_FILE_LIMIT,
-        repository_matched_file_bytes_downloaded: 0,
-        repository_matched_file_byte_budget: REPOSITORY_MATCHED_FILE_BYTE_BUDGET,
-        cargo_lock_path: String::new(),
-        cargo_lock_blob_sha: String::new(),
-        lock_status: "unknown".to_owned(),
-        resolved_target_versions_json: "[]".to_owned(),
-        resolved_target_sources_json: "[]".to_owned(),
-        exact_resolution_status: "unknown".to_owned(),
-        exact_occurrence_count: 0,
-        exact_crates_io_occurrence_count: 0,
-        manifest_paths_json: "[]".to_owned(),
-        current_direct_status: "unknown".to_owned(),
-        current_direct_requirements_json: "[]".to_owned(),
-        recorded_relation: "unknown".to_owned(),
-        shortest_dependency_depth: String::new(),
-        evidence_completeness: "unknown".to_owned(),
-        error_code: String::new(),
-        error_message: String::new(),
-    }
-}
-
-fn published_cell(
-    candidate: &ReverseDependencyCandidate,
-    declaration: &DependencyDeclaration,
-) -> PublishedDeclarationCell {
-    PublishedDeclarationCell {
-        dependent_crate: candidate.dependent_name.clone(),
-        dependent_version: candidate.dependent_version.clone(),
-        dependent_version_id: candidate.version_id,
-        dependent_downloads: candidate.dependent_downloads,
-        dependency_alias: declaration.dependency_name.clone(),
-        dependency_package: declaration.package_name.clone(),
-        requirement: declaration.req.clone(),
-        kind: declaration.kind.clone(),
-        optional: declaration.optional,
-        target: declaration.target.clone(),
-        registry: declaration.registry.clone(),
-        enrichment_error: candidate.declaration_enrichment_error.clone(),
-    }
-}
-
-fn repository_row(
-    context: &RunContext,
-    group: &CandidateGroup,
-    repository: &GitHubRepository,
-    head: Option<&GitHubHead>,
-    stale: Option<bool>,
-) -> CsvRow {
-    let mut row = base_row(context, group);
-    row.repository_url = repository.html_url.to_string();
-    row.github_repository_id = repository.id.to_string();
-    row.github_full_name = repository.full_name.clone();
-    row.default_branch = repository.default_branch.clone().unwrap_or_default();
-    row.repo_pushed_at = repository
-        .pushed_at
-        .map(|pushed| pushed.to_rfc3339())
-        .unwrap_or_default();
-    row.archived = repository.archived.to_string();
-    row.fork = repository.fork.to_string();
-    row.disabled = repository.disabled.to_string();
-    if let Some(head) = head {
-        row.head_sha = head.sha.clone();
-        row.tree_sha = head.tree_sha.clone();
-        row.head_committed_at = head.committed_at.to_rfc3339();
-    }
-    row.stale = stale
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
-    row
-}
-
-fn tri_state(
-    values: impl IntoIterator<Item = Option<bool>>,
-    force_unknown_if_no_match: bool,
-) -> String {
-    let mut saw_value = false;
-    let mut saw_unknown = false;
-    for value in values {
-        saw_value = true;
-        match value {
-            Some(true) => return "true".to_owned(),
-            Some(false) => {}
-            None => saw_unknown = true,
-        }
-    }
-    if force_unknown_if_no_match || !saw_value || saw_unknown {
-        "unknown"
-    } else {
-        "false"
-    }
-    .to_owned()
-}
-
-fn relation_name(relation: RecordedRelation) -> &'static str {
-    match relation {
-        RecordedRelation::Direct => "recorded_direct",
-        RecordedRelation::Transitive => "recorded_transitive",
-        RecordedRelation::DirectAndTransitive => "recorded_direct_and_transitive",
-        RecordedRelation::PresentUnclassified => "recorded_present_unclassified",
-        RecordedRelation::NotRecorded => "not_recorded",
-    }
-}
-
-fn relation_confirms_dependency(relation: RecordedRelation) -> bool {
-    matches!(
-        relation,
-        RecordedRelation::Direct
-            | RecordedRelation::Transitive
-            | RecordedRelation::DirectAndTransitive
-    )
-}
-
 fn reserved_lock_bytes(
     entries: &[GitHubTreeEntry],
     selected_count: usize,
@@ -1947,39 +1104,6 @@ fn final_component(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn json_cell<T: Serialize>(value: &T) -> String {
-    serde_json::to_string(value).unwrap_or_else(|error| {
-        serde_json::to_string(&format!("serialization error: {error}"))
-            .unwrap_or_else(|_| "\"serialization error\"".to_owned())
-    })
-}
-
-fn append_error(row: &mut CsvRow, code: &str, message: &str) {
-    if !row.error_code.is_empty() {
-        row.error_code.push(';');
-        row.error_message.push_str(" | ");
-    }
-    row.error_code.push_str(code);
-    row.error_message.push_str(message);
-}
-
-fn sanitize_row(mut row: CsvRow) -> CsvRow {
-    row.input_query = csv_safe(row.input_query);
-    row.target_crate = csv_safe(row.target_crate);
-    row.target_version = csv_safe(row.target_version);
-    row.target_repository_url = csv_safe(row.target_repository_url);
-    row.repository_url = csv_safe(row.repository_url);
-    row.github_full_name = csv_safe(row.github_full_name);
-    row.default_branch = csv_safe(row.default_branch);
-    row.head_sha = csv_safe(row.head_sha);
-    row.tree_sha = csv_safe(row.tree_sha);
-    row.cargo_lock_path = csv_safe(row.cargo_lock_path);
-    row.cargo_lock_blob_sha = csv_safe(row.cargo_lock_blob_sha);
-    row.error_code = csv_safe(row.error_code);
-    row.error_message = csv_safe(row.error_message);
-    row
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
@@ -1989,8 +1113,12 @@ mod tests {
         matchers::{method, path, query_param},
     };
 
+    use super::repository::{CargoBlobFetch, CargoBlobFetchConfig, fetch_cargo_blobs};
     use super::*;
-    use crate::crates_io::RepresentativeDependency;
+    use crate::{
+        cargo_evidence::RecordedRelation,
+        crates_io::{DependencyDeclaration, RepresentativeDependency},
+    };
 
     fn scan_options(requirement_filter: RequirementFilter) -> ScanOptions {
         ScanOptions {
