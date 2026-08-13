@@ -9,14 +9,6 @@ use serde_json::{Map, Value, json};
 
 use crate::cli::{ReportGroupBy, ReportSort};
 
-const REQUIRED_COLUMNS: &[&str] = &[
-    "github_full_name",
-    "head_committed_at",
-    "msrv_effective",
-    "os_observed_targets_json",
-    "stale",
-];
-
 pub fn run_report(
     input: &Path,
     sort: ReportSort,
@@ -44,7 +36,7 @@ pub fn run_report(
     }
 
     if json_output {
-        write_json(&headers, &groups, group_by);
+        write_json(&headers, &groups, group_by)?;
     } else {
         write_markdown(&groups, &columns, group_by);
     }
@@ -67,9 +59,6 @@ fn columns(headers: &StringRecord) -> Result<Columns> {
             .position(|header| header == name)
             .with_context(|| format!("CSV is missing required column `{name}`"))
     };
-    for name in REQUIRED_COLUMNS {
-        index(name)?;
-    }
     Ok(Columns {
         repository: index("github_full_name")?,
         commit: index("head_committed_at")?,
@@ -120,15 +109,14 @@ fn write_json(
     headers: &StringRecord,
     groups: &BTreeMap<String, Vec<StringRecord>>,
     group_by: Option<ReportGroupBy>,
-) {
+) -> Result<()> {
     if group_by.is_none() {
         let rows = groups.values().flatten().map(|row| json_row(headers, row));
         println!(
             "{}",
-            serde_json::to_string_pretty(&rows.collect::<Vec<_>>())
-                .unwrap_or_else(|_| "[]".to_owned())
+            serde_json::to_string_pretty(&rows.collect::<Vec<_>>())?
         );
-        return;
+        return Ok(());
     }
 
     let output = groups
@@ -140,10 +128,8 @@ fn write_json(
             })
         })
         .collect::<Vec<_>>();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&output).unwrap_or_else(|_| "[]".to_owned())
-    );
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
 }
 
 fn json_row(headers: &StringRecord, row: &StringRecord) -> Value {
@@ -159,15 +145,14 @@ fn write_markdown(
     columns: &Columns,
     group_by: Option<ReportGroupBy>,
 ) {
-    if let Some(group_by) = group_by {
+    if group_by.is_some() {
         for (key, rows) in groups {
-            println!("### {}\n", markdown_cell(group_label(group_by, key)));
+            println!("### {}\n", markdown_cell(group_label(key)));
             write_markdown_table(rows, columns);
             println!();
         }
     } else {
-        let rows = groups.values().flatten().cloned().collect::<Vec<_>>();
-        write_markdown_table(&rows, columns);
+        write_markdown_table(groups.get("").map(Vec::as_slice).unwrap_or(&[]), columns);
     }
 }
 
@@ -192,13 +177,11 @@ fn write_markdown_table(rows: &[StringRecord], columns: &Columns) {
     }
 }
 
-fn group_label(group: ReportGroupBy, key: &str) -> &str {
+fn group_label(key: &str) -> &str {
     if key.is_empty() {
         return "unknown";
     }
-    match group {
-        ReportGroupBy::Msrv | ReportGroupBy::Os | ReportGroupBy::Stale => key,
-    }
+    key
 }
 
 fn markdown_cell(value: &str) -> String {

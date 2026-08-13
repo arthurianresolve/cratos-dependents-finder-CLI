@@ -6,11 +6,11 @@ use tokio::sync::Semaphore;
 
 use crate::{
     cargo_evidence::{analyze_cargo_lock, analyze_cargo_manifests},
-    github::{GitHubClient, GitHubRepo, GitHubTree, GitHubTreeEntry},
+    github::{GitHubClient, GitHubHead, GitHubRepo, GitHubRepository, GitHubTree, GitHubTreeEntry},
 };
 
 use super::{
-    ActivityDecision, InspectionResult, ManifestScan, ManifestScanConfig,
+    ActivityDecision, CandidateGroup, CsvRow, InspectionResult, ManifestScan, ManifestScanConfig,
     REPOSITORY_MATCHED_FILE_BYTE_BUDGET, REPOSITORY_MATCHED_FILE_LIMIT, RepositoryByteBudget,
     ResolvedGroup, RunContext, ScanOptions, activity_decision, append_error,
     apply_tree_and_manifest, final_component, finalize_completeness, json_cell,
@@ -25,6 +25,33 @@ async fn limited_github_request<T>(
         .await
         .context("GitHub request limiter closed unexpectedly")?;
     request.await
+}
+
+fn failed_repository_row(
+    context: &RunContext,
+    group: &CandidateGroup,
+    repository: &GitHubRepository,
+    head: Option<&GitHubHead>,
+    stale: Option<bool>,
+    code: &str,
+    message: &str,
+) -> CsvRow {
+    let mut row = repository_row(context, group, repository, head, stale);
+    row.inventory_status = "failed".to_owned();
+    row.lock_status = "not_scanned".to_owned();
+    row.exact_resolution_status = "unknown".to_owned();
+    row.current_direct_status = "unknown".to_owned();
+    row.recorded_relation = "unknown".to_owned();
+    row.evidence_completeness = "failed".to_owned();
+    append_error(&mut row, code, message);
+    sanitize_row(row)
+}
+
+fn mark_lock_unclassified(row: &mut CsvRow, status: &str, code: &str, message: &str) {
+    row.lock_status = status.to_owned();
+    row.exact_resolution_status = "unknown".to_owned();
+    row.recorded_relation = "unknown".to_owned();
+    append_error(row, code, message);
 }
 
 struct RepositorySnapshot {
@@ -129,19 +156,15 @@ pub(super) async fn inspect_repository(
         Ok(head) => head,
         Err(error) => {
             result.failed_repositories = 1;
-            let mut row = repository_row(context, &resolved.group, repository, None, None);
-            row.inventory_status = "failed".to_owned();
-            row.lock_status = "not_scanned".to_owned();
-            row.exact_resolution_status = "unknown".to_owned();
-            row.current_direct_status = "unknown".to_owned();
-            row.recorded_relation = "unknown".to_owned();
-            row.evidence_completeness = "failed".to_owned();
-            append_error(
-                &mut row,
+            result.rows.push(failed_repository_row(
+                context,
+                &resolved.group,
+                repository,
+                None,
+                None,
                 "default_branch_head_failed",
                 &format!("{error:#}"),
-            );
-            result.rows.push(sanitize_row(row));
+            ));
             return result;
         }
     };
@@ -171,21 +194,15 @@ pub(super) async fn inspect_repository(
         Ok(tree) => tree,
         Err(error) => {
             result.failed_repositories = 1;
-            let mut row = repository_row(
+            result.rows.push(failed_repository_row(
                 context,
                 &resolved.group,
                 repository,
                 Some(&head),
                 Some(stale),
-            );
-            row.inventory_status = "failed".to_owned();
-            row.lock_status = "not_scanned".to_owned();
-            row.exact_resolution_status = "unknown".to_owned();
-            row.current_direct_status = "unknown".to_owned();
-            row.recorded_relation = "unknown".to_owned();
-            row.evidence_completeness = "failed".to_owned();
-            append_error(&mut row, "tree_fetch_failed", &format!("{error:#}"));
-            result.rows.push(sanitize_row(row));
+                "tree_fetch_failed",
+                &format!("{error:#}"),
+            ));
             return result;
         }
     };
@@ -252,11 +269,9 @@ pub(super) async fn inspect_repository(
             row.cargo_lock_blob_sha = entry.sha.clone();
 
             if lock_index >= selected_lock_count {
-                row.lock_status = "repository_file_limit_exceeded".to_owned();
-                row.exact_resolution_status = "unknown".to_owned();
-                row.recorded_relation = "unknown".to_owned();
-                append_error(
+                mark_lock_unclassified(
                     &mut row,
+                    "repository_file_limit_exceeded",
                     "repository_matched_file_limit",
                     &format!(
                         "repository has {matched_file_count} matching Cargo files, exceeding the per-repository limit {REPOSITORY_MATCHED_FILE_LIMIT}"
@@ -269,11 +284,9 @@ pub(super) async fn inspect_repository(
             }
 
             if entry.mode == "120000" {
-                row.lock_status = "symlink_not_followed".to_owned();
-                row.exact_resolution_status = "unknown".to_owned();
-                row.recorded_relation = "unknown".to_owned();
-                append_error(
+                mark_lock_unclassified(
                     &mut row,
+                    "symlink_not_followed",
                     "lockfile_symlink",
                     "Cargo.lock is a symbolic link; the immutable blob is the link target path",
                 );
@@ -283,11 +296,9 @@ pub(super) async fn inspect_repository(
                 continue;
             }
             if entry.size.is_some_and(|size| size > options.max_file_bytes) {
-                row.lock_status = "too_large".to_owned();
-                row.exact_resolution_status = "unknown".to_owned();
-                row.recorded_relation = "unknown".to_owned();
-                append_error(
+                mark_lock_unclassified(
                     &mut row,
+                    "too_large",
                     "lockfile_too_large",
                     &format!(
                         "blob size {} exceeds --max-file-bytes {}",
@@ -302,11 +313,9 @@ pub(super) async fn inspect_repository(
             }
             let lock_byte_ceiling = byte_budget.limit;
             if !byte_budget.can_fetch_below(entry.size, lock_byte_ceiling) {
-                row.lock_status = "repository_byte_budget_exceeded".to_owned();
-                row.exact_resolution_status = "unknown".to_owned();
-                row.recorded_relation = "unknown".to_owned();
-                append_error(
+                mark_lock_unclassified(
                     &mut row,
+                    "repository_byte_budget_exceeded",
                     "repository_matched_file_byte_budget",
                     &format!(
                         "Cargo file download would exceed the per-repository {}-byte budget",
@@ -333,10 +342,12 @@ pub(super) async fn inspect_repository(
                     bytes
                 }
                 Err(error) => {
-                    row.lock_status = "fetch_failed".to_owned();
-                    row.exact_resolution_status = "unknown".to_owned();
-                    row.recorded_relation = "unknown".to_owned();
-                    append_error(&mut row, "lockfile_fetch_failed", &format!("{error:#}"));
+                    mark_lock_unclassified(
+                        &mut row,
+                        "fetch_failed",
+                        "lockfile_fetch_failed",
+                        &format!("{error:#}"),
+                    );
                     repository_became_partial = true;
                     finalize_completeness(&mut row, true);
                     result.rows.push(sanitize_row(row));
@@ -346,10 +357,12 @@ pub(super) async fn inspect_repository(
             let text = match String::from_utf8(bytes) {
                 Ok(text) => text,
                 Err(error) => {
-                    row.lock_status = "non_utf8".to_owned();
-                    row.exact_resolution_status = "unknown".to_owned();
-                    row.recorded_relation = "unknown".to_owned();
-                    append_error(&mut row, "lockfile_non_utf8", &error.to_string());
+                    mark_lock_unclassified(
+                        &mut row,
+                        "non_utf8",
+                        "lockfile_non_utf8",
+                        &error.to_string(),
+                    );
                     repository_became_partial = true;
                     finalize_completeness(&mut row, true);
                     result.rows.push(sanitize_row(row));
@@ -399,10 +412,12 @@ pub(super) async fn inspect_repository(
                     finalize_completeness(&mut row, repository_baseline_partial || graph_partial);
                 }
                 Err(error) => {
-                    row.lock_status = "parse_failed".to_owned();
-                    row.exact_resolution_status = "unknown".to_owned();
-                    row.recorded_relation = "unknown".to_owned();
-                    append_error(&mut row, "lockfile_parse_failed", &format!("{error:#}"));
+                    mark_lock_unclassified(
+                        &mut row,
+                        "parse_failed",
+                        "lockfile_parse_failed",
+                        &format!("{error:#}"),
+                    );
                     repository_became_partial = true;
                     finalize_completeness(&mut row, true);
                 }
@@ -537,7 +552,12 @@ pub(super) async fn fetch_cargo_blobs(
 
     outcomes
         .into_iter()
-        .map(|outcome| outcome.expect("every selected Cargo blob has an outcome"))
+        .map(|outcome| match outcome {
+            Some(outcome) => outcome,
+            None => {
+                CargoBlobFetch::Failed("internal Cargo blob scheduling invariant failed".to_owned())
+            }
+        })
         .collect()
 }
 
