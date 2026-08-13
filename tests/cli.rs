@@ -81,12 +81,49 @@ fn bounded_integer_options_reject_zero() {
 }
 
 #[test]
+fn durable_job_contract_exposes_only_materialized_repository_inputs() {
+    cargo_bin_cmd!("crate-dependent-repos")
+        .args(["job", "submit", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--repositories"))
+        .stdout(predicate::str::contains("--policy-hash").not())
+        .stdout(predicate::str::contains("--no-crates-io").not())
+        .stdout(predicate::str::contains("--no-github-code-search").not());
+}
+
+#[test]
+fn distributed_policy_is_bound_to_merged_export() {
+    cargo_bin_cmd!("crate-dependent-repos")
+        .args(["job", "export", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--policy <TOML>"))
+        .stdout(predicate::str::contains("--policy-report <JSON>"))
+        .stdout(predicate::str::contains("--data-snapshot <JSON>"));
+}
+
+#[test]
 fn links_requires_an_exact_target_version() {
     cargo_bin_cmd!("crate-dependent-repos")
         .args(["links", "fs2"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--version <VERSION>"));
+}
+
+#[test]
+fn private_repository_opt_in_requires_a_github_credential() {
+    command_without_network()
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_APP_TOKEN")
+        .args(["resolve", "fs2", "--include-private"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "--include-private requires GITHUB_APP_TOKEN, GITHUB_TOKEN, or GH_TOKEN",
+        ));
 }
 
 #[test]

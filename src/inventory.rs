@@ -17,20 +17,22 @@ use crate::{
     cargo_evidence::ManifestEvidence,
     cli::{ActivityFilter, DependencyKind, Discovery, OptionalFilter, RequirementFilter},
     crates_io::{CratesIoClient, REVERSE_DEPENDENCY_SCOPE},
-    github::{GitHubClient, GitHubTreeEntry},
+    github::{GitHubClient, GitHubTreeEntry, RepositoryScope, RepositoryVisibility},
     output::{write_csv, write_json},
     resolve::{ResolveOptions, resolve_target},
 };
 
 mod discovery;
+mod evidence_adapter;
 mod projection;
 mod repository;
 use discovery::{
-    CandidateGroup, ResolvedGroup, add_github_code_candidates, add_published_candidate,
-    filter_candidate, resolve_repository_groups,
+    CandidateGroup, ResolvedGroup, add_credential_visible_candidates, add_github_code_candidates,
+    add_published_candidate, filter_candidate, resolve_repository_groups,
 };
 #[cfg(test)]
 use discovery::{github_code_queries, repository_resolution_budget};
+use evidence_adapter::build_evidence_bundle;
 #[cfg(test)]
 use projection::relation_confirms_dependency;
 use projection::{
@@ -42,6 +44,7 @@ use repository::inspect_repository;
 const REPOSITORY_MATCHED_FILE_LIMIT: usize = 2_000;
 const REPOSITORY_MATCHED_FILE_BYTE_BUDGET: u64 = 128 * 1024 * 1024;
 const REPOSITORY_RESOLUTION_OVERSCAN_FACTOR: usize = 4;
+const CREDENTIAL_VISIBLE_REPOSITORY_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug)]
 pub struct ScanOptions {
@@ -65,9 +68,14 @@ pub struct ScanOptions {
     pub max_file_bytes: u64,
     pub output: PathBuf,
     pub summary_json: Option<PathBuf>,
+    pub evidence_json: Option<PathBuf>,
+    pub policy_file: Option<PathBuf>,
+    pub policy_report: Option<PathBuf>,
+    pub data_snapshot: Option<PathBuf>,
     pub allow_partial: bool,
     pub require_match: bool,
     pub jobs: usize,
+    pub repository_scope: RepositoryScope,
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +84,7 @@ pub struct ScanOutcome {
     pub no_match: bool,
     pub allow_partial: bool,
     pub require_match: bool,
+    pub policy_exit_code: Option<i32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -86,6 +95,7 @@ pub struct ScanSummary {
     pub target_version: String,
     pub globally_exhaustive: bool,
     pub candidate_scope: String,
+    pub repository_scope: String,
     pub policy: ScanPolicy,
     pub candidate_limit_reached: bool,
     pub repository_limit_reached: bool,
@@ -98,6 +108,10 @@ pub struct ScanSummary {
     pub repositories_filtered_as_forks: usize,
     pub repositories_filtered_as_archived: usize,
     pub repositories_filtered_as_private: usize,
+    pub repositories_resolved_public: usize,
+    pub repositories_resolved_private: usize,
+    pub repositories_resolved_internal: usize,
+    pub repositories_resolved_visibility_unknown: usize,
     pub repositories_unsupported: usize,
     pub repositories_partial: usize,
     pub repositories_failed: usize,
@@ -113,6 +127,8 @@ pub struct ScanSummary {
     pub github_search_total_count: usize,
     pub github_search_incomplete: bool,
     pub github_search_private_results_discarded: usize,
+    pub credential_visible_repositories_returned: usize,
+    pub credential_visible_inventory_complete: Option<bool>,
     pub output_rows: usize,
     pub partial: bool,
     pub notes: Vec<String>,
@@ -120,6 +136,7 @@ pub struct ScanSummary {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ScanPolicy {
+    pub repository_scope: String,
     pub requirement_filter: String,
     pub discovery: String,
     pub dependency_kinds: Vec<String>,
@@ -152,6 +169,7 @@ pub struct CsvRow {
     pub target_repository_url: String,
     pub globally_exhaustive: bool,
     pub candidate_scope: String,
+    pub repository_scope: String,
     pub scan_policy_json: String,
     pub candidate_sources_json: String,
     pub dependent_crates_json: String,
@@ -166,6 +184,7 @@ pub struct CsvRow {
     pub original_repository_urls_json: String,
     pub repository_url: String,
     pub github_repository_id: String,
+    pub repository_visibility: String,
     pub github_full_name: String,
     pub default_branch: String,
     pub head_sha: String,
@@ -200,6 +219,13 @@ pub struct CsvRow {
     pub os_has_unconditional_declaration: String,
     pub recorded_relation: String,
     pub shortest_dependency_depth: String,
+    pub direct_relation_witness_json: String,
+    pub transitive_relation_witness_json: String,
+    pub evidence_strength: String,
+    pub inclusion_reasons_json: String,
+    pub scope_limitations_json: String,
+    pub cache_status: String,
+    pub reused_from_scan_id: String,
     pub evidence_completeness: String,
     pub error_code: String,
     pub error_message: String,
@@ -214,6 +240,7 @@ impl CsvRow {
         "target_repository_url",
         "globally_exhaustive",
         "candidate_scope",
+        "repository_scope",
         "scan_policy_json",
         "candidate_sources_json",
         "dependent_crates_json",
@@ -228,6 +255,7 @@ impl CsvRow {
         "original_repository_urls_json",
         "repository_url",
         "github_repository_id",
+        "repository_visibility",
         "github_full_name",
         "default_branch",
         "head_sha",
@@ -262,6 +290,13 @@ impl CsvRow {
         "os_has_unconditional_declaration",
         "recorded_relation",
         "shortest_dependency_depth",
+        "direct_relation_witness_json",
+        "transitive_relation_witness_json",
+        "evidence_strength",
+        "inclusion_reasons_json",
+        "scope_limitations_json",
+        "cache_status",
+        "reused_from_scan_id",
         "evidence_completeness",
         "error_code",
         "error_message",
@@ -277,6 +312,7 @@ struct RunContext {
     target_repository_url: Option<String>,
     globally_exhaustive: bool,
     candidate_scope: String,
+    repository_scope: RepositoryScope,
     scan_policy_json: String,
 }
 
@@ -509,8 +545,8 @@ fn activity_decision(
     }
 }
 
-fn candidate_scope(discovery: Discovery) -> String {
-    match discovery {
+fn candidate_scope(discovery: Discovery, repository_scope: RepositoryScope) -> String {
+    let base = match discovery {
         Discovery::CratesIo => REVERSE_DEPENDENCY_SCOPE.to_owned(),
         Discovery::GithubCode => {
             "bounded public GitHub REST code-search seeds verified against current default branches"
@@ -519,11 +555,17 @@ fn candidate_scope(discovery: Discovery) -> String {
         Discovery::Both => {
             format!("{REVERSE_DEPENDENCY_SCOPE}, plus bounded public GitHub REST code-search seeds")
         }
+    };
+    if repository_scope == RepositoryScope::AllVisible {
+        format!("{base}, plus bounded credential-visible GitHub repository inventory")
+    } else {
+        base
     }
 }
 
 fn scan_policy(options: &ScanOptions) -> ScanPolicy {
     ScanPolicy {
+        repository_scope: options.repository_scope.as_str().to_owned(),
         requirement_filter: requirement_filter_name(options.requirement_filter).to_owned(),
         discovery: discovery_name(options.discovery).to_owned(),
         dependency_kinds: options
@@ -626,6 +668,37 @@ fn output_paths_conflict(output: &Path, summary: &Path) -> Result<bool> {
     Ok(lexical_output_identity(output)? == lexical_output_identity(summary)?)
 }
 
+fn validate_distinct_outputs(options: &ScanOptions) -> Result<()> {
+    let mut paths = vec![("--output", options.output.as_path())];
+    for (label, path) in [
+        ("--summary-json", options.summary_json.as_deref()),
+        ("--evidence-json", options.evidence_json.as_deref()),
+        ("--policy-report", options.policy_report.as_deref()),
+    ] {
+        if let Some(path) = path {
+            if path == Path::new("-") {
+                bail!("{label} requires a file path");
+            }
+            paths.push((label, path));
+        }
+    }
+    for left in 0..paths.len() {
+        for right in (left + 1)..paths.len() {
+            if output_paths_conflict(paths[left].1, paths[right].1)? {
+                bail!(
+                    "{} and {} must refer to different files",
+                    paths[left].0,
+                    paths[right].0
+                );
+            }
+        }
+    }
+    if options.policy_file.is_some() != options.policy_report.is_some() {
+        bail!("--policy and --policy-report must be supplied together");
+    }
+    Ok(())
+}
+
 pub async fn scan(
     crates_io: &CratesIoClient,
     github: &GitHubClient,
@@ -642,9 +715,31 @@ pub async fn scan(
     {
         bail!("--output and --summary-json must refer to different files");
     }
+    validate_distinct_outputs(&options)?;
+    let organization_policy = if let Some(path) = options.policy_file.as_deref() {
+        if options.requirement_filter != RequirementFilter::Any {
+            bail!(
+                "--policy requires --requirement-filter any so collection cannot pre-filter policy evidence"
+            );
+        }
+        let input = std::fs::read_to_string(path)
+            .with_context(|| format!("reading policy {}", path.display()))?;
+        let policy = crate::policy::PolicyDocumentV1::from_toml(&input)
+            .with_context(|| format!("parsing policy {}", path.display()))?;
+        let diagnostics = policy.validate();
+        if !diagnostics.is_empty() {
+            bail!("invalid policy: {}", serde_json::to_string(&diagnostics)?);
+        }
+        Some(policy)
+    } else {
+        None
+    };
 
     let observed_at = Utc::now();
-    let candidate_scope = candidate_scope(options.discovery);
+    if options.repository_scope == RepositoryScope::AllVisible && !github.is_authenticated() {
+        bail!("--include-private requires GITHUB_APP_TOKEN, GITHUB_TOKEN, or GH_TOKEN");
+    }
+    let candidate_scope = candidate_scope(options.discovery, options.repository_scope);
     let policy = scan_policy(&options);
     let policy_json = json_cell(&policy);
     let resolution = resolve_target(
@@ -655,6 +750,7 @@ pub async fn scan(
             limit: 20,
             explicit_crate: options.explicit_crate.clone(),
             accept_closest: options.accept_closest,
+            repository_scope: options.repository_scope,
         },
     )
     .await?;
@@ -667,6 +763,7 @@ pub async fn scan(
         target_repository_url: resolution.repository().map(str::to_owned),
         globally_exhaustive: false,
         candidate_scope: candidate_scope.clone(),
+        repository_scope: options.repository_scope,
         scan_policy_json: policy_json,
     };
 
@@ -677,6 +774,7 @@ pub async fn scan(
         target_version: options.version.to_string(),
         globally_exhaustive: false,
         candidate_scope,
+        repository_scope: options.repository_scope.as_str().to_owned(),
         policy,
         notes: vec![
             "GitHub code search and dependents data are bounded and non-exhaustive.".to_owned(),
@@ -715,8 +813,19 @@ pub async fn scan(
             options.github_search_limit,
             &mut groups,
             &mut accounting.summary,
+            options.repository_scope,
         )
         .await?;
+    }
+
+    if options.repository_scope == RepositoryScope::AllVisible {
+        add_credential_visible_candidates(
+            github,
+            CREDENTIAL_VISIBLE_REPOSITORY_LIMIT,
+            &mut groups,
+            &mut accounting.summary,
+        )
+        .await;
     }
 
     accounting.summary.candidate_repositories = groups.len();
@@ -735,11 +844,33 @@ pub async fn scan(
         github_groups,
         options.jobs,
         options.max_repositories,
+        options.repository_scope,
     )
     .await;
     accounting.summary.repositories_filtered_as_private = resolution.filtered_private;
     accounting.summary.repository_limit_reached = resolution.limit_reached;
     accounting.summary.repository_resolution_budget_exhausted = resolution.budget_exhausted;
+    for resolved in &resolution.resolved {
+        match resolved.repository.effective_visibility() {
+            RepositoryVisibility::Public => accounting.summary.repositories_resolved_public += 1,
+            RepositoryVisibility::Private => {
+                accounting.summary.repositories_resolved_private += 1;
+            }
+            RepositoryVisibility::Internal => {
+                accounting.summary.repositories_resolved_internal += 1;
+            }
+            RepositoryVisibility::Unknown => {
+                accounting.summary.repositories_resolved_visibility_unknown += 1;
+                accounting.summary.partial = true;
+            }
+        }
+    }
+    if accounting.summary.repositories_resolved_visibility_unknown > 0 {
+        accounting.summary.notes.push(
+            "one or more GitHub repositories had unknown visibility; their evidence is partial"
+                .to_owned(),
+        );
+    }
     if resolution.budget_exhausted {
         accounting.summary.notes.push(format!(
             "repository resolution stopped after the bounded {}x redirect/private overscan budget before filling --max-repositories",
@@ -790,6 +921,36 @@ pub async fn scan(
     if let Some(path) = &options.summary_json {
         write_json(path, &summary)?;
     }
+    let policy_exit_code = if options.evidence_json.is_some() || organization_policy.is_some() {
+        let mut bundle = build_evidence_bundle(&summary, &rows)?;
+        if let Some(path) = options.data_snapshot.as_deref() {
+            crate::advisory::DataSnapshotV1::load(path)?.apply(&mut bundle);
+        }
+        if let Some(path) = &options.evidence_json {
+            write_json(path, &bundle)?;
+        }
+        if let Some(policy) = organization_policy.as_ref() {
+            let report = crate::policy::evaluate(
+                &bundle,
+                policy,
+                &crate::policy::EvaluationContext {
+                    evaluated_at: Utc::now(),
+                },
+            );
+            write_json(
+                options
+                    .policy_report
+                    .as_ref()
+                    .expect("validated policy report path"),
+                &report,
+            )?;
+            Some(report.exit_status.code())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     eprintln!(
         "scanned {} repositories; parsed {} lockfiles; confirmed {} repositories; partial={}",
         summary.repositories_scanned,
@@ -803,6 +964,7 @@ pub async fn scan(
         no_match: summary.repositories_exact_confirmed == 0,
         allow_partial: options.allow_partial,
         require_match: options.require_match,
+        policy_exit_code,
     })
 }
 
@@ -869,9 +1031,14 @@ mod tests {
             max_file_bytes: 10 * 1024 * 1024,
             output: PathBuf::from("-"),
             summary_json: None,
+            evidence_json: None,
+            policy_file: None,
+            policy_report: None,
+            data_snapshot: None,
             allow_partial: false,
             require_match: false,
             jobs: 1,
+            repository_scope: RepositoryScope::PublicOnly,
         }
     }
 
@@ -1008,6 +1175,7 @@ mod tests {
             target_repository_url: None,
             globally_exhaustive: false,
             candidate_scope: "test scope".to_owned(),
+            repository_scope: RepositoryScope::PublicOnly,
             scan_policy_json: "{}".to_owned(),
         };
         let row = base_row(&context, &group);
@@ -1039,6 +1207,7 @@ mod tests {
             target_repository_url: None,
             globally_exhaustive: false,
             candidate_scope: "test scope".to_owned(),
+            repository_scope: RepositoryScope::PublicOnly,
             scan_policy_json: "{}".to_owned(),
         };
         let row = base_row(&context, &group);
@@ -1086,8 +1255,19 @@ mod tests {
 
     #[test]
     fn code_search_seeds_are_explicitly_public() {
-        for (query, _, _) in github_code_queries("fs2", &Version::parse("0.4.3").unwrap()) {
+        for (query, _, _) in github_code_queries(
+            "fs2",
+            &Version::parse("0.4.3").unwrap(),
+            RepositoryScope::PublicOnly,
+        ) {
             assert!(query.contains("is:public"));
+        }
+        for (query, _, _) in github_code_queries(
+            "fs2",
+            &Version::parse("0.4.3").unwrap(),
+            RepositoryScope::AllVisible,
+        ) {
+            assert!(!query.contains("is:public"));
         }
     }
 
@@ -1127,6 +1307,7 @@ mod tests {
             10,
             &mut groups,
             &mut summary,
+            RepositoryScope::PublicOnly,
         )
         .await
         .unwrap();
@@ -1139,6 +1320,39 @@ mod tests {
                 .notes
                 .iter()
                 .any(|note| note.contains("github_rest_code_search_lock_seed"))
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn credential_visible_inventory_failures_are_partial() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user/repos"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "message": "Resource not accessible by integration"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let github = GitHubClient::with_api_base(
+            Some("test-token".to_owned()),
+            Url::parse(&format!("{}/", server.uri())).unwrap(),
+        )
+        .unwrap();
+        let mut groups = BTreeMap::from([("existing".to_owned(), CandidateGroup::default())]);
+        let mut summary = ScanSummary::default();
+
+        add_credential_visible_candidates(&github, 10, &mut groups, &mut summary).await;
+
+        assert!(groups.contains_key("existing"));
+        assert_eq!(summary.credential_visible_inventory_complete, Some(false));
+        assert!(summary.partial);
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note.contains("inventory failed"))
         );
         server.verify().await;
     }

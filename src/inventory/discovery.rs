@@ -8,7 +8,7 @@ use crate::{
     cargo_evidence::evaluate_cargo_requirement,
     cli::{DependencyKind, OptionalFilter, RequirementFilter},
     crates_io::ReverseDependencyCandidate,
-    github::{GitHubClient, GitHubRepo, GitHubRepository, parse_github_repo},
+    github::{GitHubClient, GitHubRepo, GitHubRepository, RepositoryScope, parse_github_repo},
 };
 
 use super::{REPOSITORY_RESOLUTION_OVERSCAN_FACTOR, ScanOptions, ScanSummary};
@@ -20,6 +20,7 @@ pub(super) struct CandidateGroup {
     pub(super) sources: BTreeSet<String>,
     pub(super) published: Vec<ReverseDependencyCandidate>,
     pub(super) unsupported_reason: Option<String>,
+    pub(super) known_repository: Option<GitHubRepository>,
 }
 
 impl CandidateGroup {
@@ -30,6 +31,7 @@ impl CandidateGroup {
         self.sources.extend(other.sources);
         self.published.extend(other.published);
         self.unsupported_reason = self.unsupported_reason.take().or(other.unsupported_reason);
+        self.known_repository = self.known_repository.take().or(other.known_repository);
     }
 }
 
@@ -46,6 +48,44 @@ pub(super) struct RepositoryResolution {
     pub(super) filtered_private: usize,
     pub(super) limit_reached: bool,
     pub(super) budget_exhausted: bool,
+}
+
+#[derive(Default)]
+struct ResolutionAccumulator {
+    by_id: HashMap<u64, ResolvedGroup>,
+    failures: Vec<(CandidateGroup, anyhow::Error)>,
+    private_ids: HashSet<u64>,
+    skipped_due_limit: bool,
+}
+
+impl ResolutionAccumulator {
+    fn record(
+        &mut self,
+        maximum: Option<usize>,
+        scope: RepositoryScope,
+        group: CandidateGroup,
+        result: Result<GitHubRepository>,
+    ) {
+        match result {
+            Ok(repository) if !scope.includes(repository.effective_visibility()) => {
+                self.private_ids.insert(repository.id);
+            }
+            Ok(repository) => {
+                if let Some(existing) = self.by_id.get_mut(&repository.id) {
+                    existing.group.merge(group);
+                } else if maximum.is_none_or(|maximum| self.by_id.len() < maximum) {
+                    self.by_id
+                        .insert(repository.id, ResolvedGroup { group, repository });
+                } else {
+                    self.skipped_due_limit = true;
+                }
+            }
+            Err(error) if maximum.is_none_or(|maximum| self.by_id.len() < maximum) => {
+                self.failures.push((group, error));
+            }
+            Err(_) => self.skipped_due_limit = true,
+        }
+    }
 }
 
 pub(super) fn filter_candidate(
@@ -144,11 +184,12 @@ pub(super) async fn add_github_code_candidates(
     limit: usize,
     groups: &mut BTreeMap<String, CandidateGroup>,
     summary: &mut ScanSummary,
+    scope: RepositoryScope,
 ) -> Result<()> {
     if !github.is_authenticated() {
-        bail!("--discovery github-code/both requires GITHUB_TOKEN or GH_TOKEN");
+        bail!("--discovery github-code/both requires GITHUB_APP_TOKEN, GITHUB_TOKEN, or GH_TOKEN");
     }
-    let queries = github_code_queries(target_crate, target_version);
+    let queries = github_code_queries(target_crate, target_version, scope);
 
     for (query, exact_name, source) in queries {
         let result = match github.search_code(&query, limit).await {
@@ -168,7 +209,7 @@ pub(super) async fn add_github_code_candidates(
             .saturating_add(result.total_count.min(usize::MAX as u64) as usize);
         summary.github_search_incomplete |= result.bounded();
         for item in result.items {
-            if item.repository.private {
+            if !scope.includes(item.repository.effective_visibility()) {
                 summary.github_search_private_results_discarded += 1;
                 continue;
             }
@@ -199,19 +240,63 @@ pub(super) async fn add_github_code_candidates(
 pub(super) fn github_code_queries(
     target_crate: &str,
     target_version: &Version,
+    scope: RepositoryScope,
 ) -> [(String, &'static str, &'static str); 2] {
+    let visibility = match scope {
+        RepositoryScope::PublicOnly => " is:public",
+        RepositoryScope::AllVisible => "",
+    };
     [
         (
-            format!("{target_crate} {target_version} filename:Cargo.lock is:public"),
+            format!("{target_crate} {target_version} filename:Cargo.lock{visibility}"),
             "Cargo.lock",
             "github_rest_code_search_lock_seed",
         ),
         (
-            format!("{target_crate} filename:Cargo.toml is:public"),
+            format!("{target_crate} filename:Cargo.toml{visibility}"),
             "Cargo.toml",
             "github_rest_code_search_manifest_seed",
         ),
     ]
+}
+
+pub(super) async fn add_credential_visible_candidates(
+    github: &GitHubClient,
+    limit: usize,
+    groups: &mut BTreeMap<String, CandidateGroup>,
+    summary: &mut ScanSummary,
+) {
+    match github.credential_visible_repositories(limit).await {
+        Ok(inventory) => {
+            summary.credential_visible_repositories_returned = inventory.items.len();
+            summary.credential_visible_inventory_complete = Some(inventory.complete);
+            if !inventory.complete {
+                summary.partial = true;
+                summary.notes.push(format!(
+                    "credential-visible GitHub repository inventory reached its {limit}-repository bound"
+                ));
+            }
+            for repository in inventory.items {
+                let key = format!("github:{}", repository.full_name.to_ascii_lowercase());
+                let repo = repository.repo();
+                let url = repository.html_url.to_string();
+                let group = groups.entry(key).or_default();
+                group.repository_hint = group.repository_hint.take().or(Some(repo));
+                group.original_repository_urls.insert(url);
+                group
+                    .sources
+                    .insert("github_credential_visible_repository_inventory".to_owned());
+                group.known_repository = group.known_repository.take().or(Some(repository));
+            }
+        }
+        Err(error) => {
+            summary.credential_visible_inventory_complete = Some(false);
+            summary.partial = true;
+            summary.notes.push(format!(
+                "credential-visible GitHub repository inventory failed; retained other candidate sources: {error:#}"
+            ));
+        }
+    }
 }
 
 pub(super) async fn resolve_repository_groups(
@@ -219,6 +304,7 @@ pub(super) async fn resolve_repository_groups(
     groups: Vec<CandidateGroup>,
     jobs: usize,
     maximum: Option<usize>,
+    scope: RepositoryScope,
 ) -> RepositoryResolution {
     let total = groups.len();
     let resolution_budget = repository_resolution_budget(total, maximum);
@@ -227,40 +313,32 @@ pub(super) async fn resolve_repository_groups(
             .into_iter()
             .take(resolution_budget)
             .enumerate()
-            .map(|(position, group)| {
+            .map(|(position, mut group)| {
                 let client = github.clone();
                 async move {
-                    let repository = match group.repository_hint.as_ref() {
-                        Some(repo) => client.repository(repo).await,
-                        None => Err(anyhow::anyhow!(
-                            "candidate group has no GitHub repository hint"
-                        )),
+                    let repository = match group.known_repository.take() {
+                        Some(repository) => Ok(repository),
+                        None => match group.repository_hint.as_ref() {
+                            Some(repo) => client.repository(repo).await,
+                            None => Err(anyhow::anyhow!(
+                                "candidate group has no GitHub repository hint"
+                            )),
+                        },
                     };
                     (position, group, repository)
                 }
             });
-    let mut by_id = HashMap::<u64, ResolvedGroup>::new();
-    let mut failures = Vec::new();
-    let mut private_ids = HashSet::new();
+    let mut resolution = ResolutionAccumulator::default();
     let mut considered = 0usize;
-    let mut skipped_due_limit = false;
 
     if maximum.is_none() {
         let mut results = stream::iter(work).buffer_unordered(jobs);
         while let Some((_, group, result)) = results.next().await {
             considered += 1;
-            record_repository_resolution(
-                &mut by_id,
-                &mut failures,
-                &mut private_ids,
-                &mut skipped_due_limit,
-                maximum,
-                group,
-                result,
-            );
+            resolution.record(maximum, scope, group, result);
         }
     } else {
-        while maximum.is_none_or(|maximum| by_id.len() < maximum) {
+        while maximum.is_none_or(|maximum| resolution.by_id.len() < maximum) {
             let batch = work.by_ref().take(jobs).collect::<Vec<_>>();
             if batch.is_empty() {
                 break;
@@ -273,22 +351,14 @@ pub(super) async fn resolve_repository_groups(
             results.sort_by_key(|(position, _, _)| *position);
 
             for (_, group, result) in results {
-                record_repository_resolution(
-                    &mut by_id,
-                    &mut failures,
-                    &mut private_ids,
-                    &mut skipped_due_limit,
-                    maximum,
-                    group,
-                    result,
-                );
+                resolution.record(maximum, scope, group, result);
             }
         }
     }
 
-    let mut resolved = by_id.into_values().collect::<Vec<_>>();
+    let mut resolved = resolution.by_id.into_values().collect::<Vec<_>>();
     resolved.sort_by(|left, right| left.repository.full_name.cmp(&right.repository.full_name));
-    let limit_reached = maximum.is_some() && (considered < total || skipped_due_limit);
+    let limit_reached = maximum.is_some() && (considered < total || resolution.skipped_due_limit);
     let budget_exhausted = maximum.is_some_and(|maximum| {
         maximum > 0
             && resolved.len() < maximum
@@ -297,39 +367,10 @@ pub(super) async fn resolve_repository_groups(
     });
     RepositoryResolution {
         resolved,
-        failures,
-        filtered_private: private_ids.len(),
+        failures: resolution.failures,
+        filtered_private: resolution.private_ids.len(),
         limit_reached,
         budget_exhausted,
-    }
-}
-
-fn record_repository_resolution(
-    by_id: &mut HashMap<u64, ResolvedGroup>,
-    failures: &mut Vec<(CandidateGroup, anyhow::Error)>,
-    private_ids: &mut HashSet<u64>,
-    skipped_due_limit: &mut bool,
-    maximum: Option<usize>,
-    group: CandidateGroup,
-    result: Result<GitHubRepository>,
-) {
-    match result {
-        Ok(repository) if repository.private => {
-            private_ids.insert(repository.id);
-        }
-        Ok(repository) => {
-            if let Some(existing) = by_id.get_mut(&repository.id) {
-                existing.group.merge(group);
-            } else if maximum.is_none_or(|maximum| by_id.len() < maximum) {
-                by_id.insert(repository.id, ResolvedGroup { group, repository });
-            } else {
-                *skipped_due_limit = true;
-            }
-        }
-        Err(error) if maximum.is_none_or(|maximum| by_id.len() < maximum) => {
-            failures.push((group, error));
-        }
-        Err(_) => *skipped_due_limit = true,
     }
 }
 

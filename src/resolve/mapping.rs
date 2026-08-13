@@ -6,7 +6,7 @@ use crate::{
     crates_io::{CratesIoClient, canonical_crate_name},
     github::{
         GitHubClient, GitHubRepo, GitHubRepository, GitHubSearchResult, GitHubTreeEntry,
-        parse_github_repo,
+        RepositoryScope, parse_github_repo,
     },
     model::{CrateSummary, ResolutionResult},
 };
@@ -21,6 +21,7 @@ pub(super) async fn resolve_repository(
     input: &str,
     repo: &GitHubRepo,
     limit: usize,
+    scope: RepositoryScope,
 ) -> Result<ResolutionResult> {
     let repository = github.repository(repo).await.with_context(|| {
         format!(
@@ -28,7 +29,7 @@ pub(super) async fn resolve_repository(
             repo.full_name()
         )
     })?;
-    ensure_public_repository(&repository)?;
+    ensure_repository_in_scope(&repository, scope)?;
     let canonical_repo = repository.repo();
     let terms = search_terms(&repository.name);
     let mut candidates = search_candidates(crates_io, &terms, limit.max(100))
@@ -100,9 +101,12 @@ pub(super) async fn resolve_repository(
     })
 }
 
-pub(super) fn ensure_public_repository(repository: &GitHubRepository) -> Result<()> {
-    if repository.private {
-        bail!("private GitHub repositories are outside this public inventory's scope");
+pub(super) fn ensure_repository_in_scope(
+    repository: &GitHubRepository,
+    scope: RepositoryScope,
+) -> Result<()> {
+    if !scope.includes(repository.effective_visibility()) {
+        bail!("private or internal GitHub repositories require explicit --include-private opt-in");
     }
     Ok(())
 }
@@ -110,21 +114,26 @@ pub(super) fn ensure_public_repository(repository: &GitHubRepository) -> Result<
 pub(super) fn exact_named_repositories<'a>(
     query: &str,
     repositories: &'a [GitHubRepository],
+    scope: RepositoryScope,
 ) -> Vec<&'a GitHubRepository> {
     repositories
         .iter()
-        .filter(|repository| !repository.private && repository.name.eq_ignore_ascii_case(query))
+        .filter(|repository| {
+            scope.includes(repository.effective_visibility())
+                && repository.name.eq_ignore_ascii_case(query)
+        })
         .collect()
 }
 
 pub(super) fn unique_unbounded_exact_repository<'a>(
     query: &str,
     matches: &'a GitHubSearchResult<GitHubRepository>,
+    scope: RepositoryScope,
 ) -> Option<&'a GitHubRepository> {
     if matches.bounded() {
         return None;
     }
-    let exact = exact_named_repositories(query, &matches.items);
+    let exact = exact_named_repositories(query, &matches.items, scope);
     (exact.len() == 1).then_some(exact[0])
 }
 

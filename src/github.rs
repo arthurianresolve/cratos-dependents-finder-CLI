@@ -1,4 +1,14 @@
-use std::{error::Error as StdError, fmt, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error as StdError,
+    fmt,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
@@ -26,6 +36,64 @@ const JSON_BLOB_OVERHEAD: u64 = 64 * 1024;
 const RESPONSE_PREALLOC_LIMIT: u64 = 1024 * 1024;
 const REST_SEARCH_LIMIT: usize = 1_000;
 const REST_SEARCH_PAGE_SIZE: usize = 100;
+
+/// Resolve GitHub credentials without exposing their source or value. A
+/// broker-minted GitHub App installation token takes precedence over PATs.
+pub fn preferred_token_from_environment() -> Option<String> {
+    ["GITHUB_APP_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
+        .into_iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+        })
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryScope {
+    #[default]
+    PublicOnly,
+    AllVisible,
+}
+
+impl RepositoryScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PublicOnly => "public_only",
+            Self::AllVisible => "all_visible",
+        }
+    }
+
+    pub fn includes(self, visibility: RepositoryVisibility) -> bool {
+        match self {
+            Self::PublicOnly => visibility == RepositoryVisibility::Public,
+            Self::AllVisible => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryVisibility {
+    Public,
+    Private,
+    Internal,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl RepositoryVisibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+            Self::Internal => "internal",
+            Self::Unknown => "unknown",
+        }
+    }
+}
 
 /// An owner/name pair identifying a repository on github.com.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -264,6 +332,8 @@ pub struct GitHubRepository {
     #[serde(default)]
     pub private: bool,
     #[serde(default)]
+    pub visibility: RepositoryVisibility,
+    #[serde(default)]
     pub pushed_at: Option<DateTime<Utc>>,
 }
 
@@ -272,6 +342,14 @@ impl GitHubRepository {
         GitHubRepo {
             owner: self.owner.login.clone(),
             name: self.name.clone(),
+        }
+    }
+
+    pub fn effective_visibility(&self) -> RepositoryVisibility {
+        match (self.visibility, self.private) {
+            (RepositoryVisibility::Unknown, true) => RepositoryVisibility::Private,
+            (RepositoryVisibility::Unknown, false) => RepositoryVisibility::Public,
+            (visibility, _) => visibility,
         }
     }
 }
@@ -286,6 +364,18 @@ pub struct GitHubRepositorySummary {
     pub fork: bool,
     #[serde(default)]
     pub private: bool,
+    #[serde(default)]
+    pub visibility: RepositoryVisibility,
+}
+
+impl GitHubRepositorySummary {
+    pub fn effective_visibility(&self) -> RepositoryVisibility {
+        match (self.visibility, self.private) {
+            (RepositoryVisibility::Unknown, true) => RepositoryVisibility::Private,
+            (RepositoryVisibility::Unknown, false) => RepositoryVisibility::Public,
+            (visibility, _) => visibility,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -360,6 +450,12 @@ impl<T> GitHubSearchResult<T> {
     pub fn bounded(&self) -> bool {
         self.total_count > self.items.len() as u64 || self.incomplete_results
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GitHubRepositoryInventory {
+    pub items: Vec<GitHubRepository>,
+    pub complete: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -444,6 +540,19 @@ pub struct GitHubClient {
     client: Client,
     api_base: Url,
     token: Option<Arc<str>>,
+    usage: Arc<GitHubUsageCounters>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GitHubUsage {
+    pub requests: u64,
+    pub downloaded_bytes: u64,
+}
+
+#[derive(Default)]
+struct GitHubUsageCounters {
+    requests: AtomicU64,
+    downloaded_bytes: AtomicU64,
 }
 
 impl GitHubClient {
@@ -455,6 +564,7 @@ impl GitHubClient {
     }
 
     pub(crate) fn with_api_base(token: Option<String>, api_base: Url) -> Result<Self> {
+        crate::install_rustls_crypto_provider();
         ensure!(
             !api_base.cannot_be_a_base(),
             "GitHub API base URL cannot be a base URL"
@@ -497,7 +607,15 @@ impl GitHubClient {
             client,
             api_base,
             token,
+            usage: Arc::new(GitHubUsageCounters::default()),
         })
+    }
+
+    pub fn usage(&self) -> GitHubUsage {
+        GitHubUsage {
+            requests: self.usage.requests.load(Ordering::Relaxed),
+            downloaded_bytes: self.usage.downloaded_bytes.load(Ordering::Relaxed),
+        }
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -596,11 +714,13 @@ impl GitHubClient {
         let declared_json_envelope = content_type
             .as_deref()
             .is_some_and(is_json_envelope_content_type);
-        let body = read_limited(response, encoded_blob_limit(max_bytes))
-            .await
-            .with_context(|| {
-                format!("GitHub blob {blob_sha} for {repo} exceeds the download cap")
-            })?;
+        let body = read_limited(
+            response,
+            encoded_blob_limit(max_bytes),
+            &self.usage.downloaded_bytes,
+        )
+        .await
+        .with_context(|| format!("GitHub blob {blob_sha} for {repo} exceeds the download cap"))?;
 
         let looks_like_json = body
             .iter()
@@ -668,6 +788,17 @@ impl GitHubClient {
         name: &str,
         limit: usize,
     ) -> Result<GitHubSearchResult<GitHubRepository>> {
+        self.search_repositories_by_name_in_scope(name, limit, RepositoryScope::PublicOnly)
+            .await
+    }
+
+    /// Search repository names within the explicitly selected visibility scope.
+    pub async fn search_repositories_by_name_in_scope(
+        &self,
+        name: &str,
+        limit: usize,
+        scope: RepositoryScope,
+    ) -> Result<GitHubSearchResult<GitHubRepository>> {
         let name = name.trim();
         ensure!(
             !name.is_empty(),
@@ -677,13 +808,70 @@ impl GitHubClient {
             !name.chars().any(char::is_control),
             "GitHub repository search name contains a control character"
         );
-        let mut result: GitHubSearchResult<GitHubRepository> = self
-            .search("repositories", &format!("{name} in:name is:public"), limit)
-            .await?;
-        // Keep the public-only boundary even if a future API behavior change or
-        // an intermediary ignores the visibility qualifier.
-        result.items.retain(|repository| !repository.private);
+        ensure!(
+            scope == RepositoryScope::PublicOnly || self.is_authenticated(),
+            "private GitHub repository search requires authentication"
+        );
+        let query = match scope {
+            RepositoryScope::PublicOnly => format!("{name} in:name is:public"),
+            RepositoryScope::AllVisible => format!("{name} in:name"),
+        };
+        let mut result: GitHubSearchResult<GitHubRepository> =
+            self.search("repositories", &query, limit).await?;
+        result
+            .items
+            .retain(|repository| scope.includes(repository.effective_visibility()));
         Ok(result)
+    }
+
+    /// Enumerate repositories visible to the authenticated identity. Reaching
+    /// `limit` is intentionally reported as incomplete.
+    pub async fn credential_visible_repositories(
+        &self,
+        limit: usize,
+    ) -> Result<GitHubRepositoryInventory> {
+        ensure!(
+            self.is_authenticated(),
+            "private GitHub repository inventory requires authentication"
+        );
+        ensure!(
+            limit > 0,
+            "GitHub repository inventory limit must be positive"
+        );
+
+        let mut by_id = HashMap::with_capacity(limit.min(REST_SEARCH_PAGE_SIZE));
+        let mut raw_count = 0usize;
+        let mut page = 1usize;
+        let mut complete = false;
+        while raw_count < limit {
+            let page_size = (limit - raw_count).min(REST_SEARCH_PAGE_SIZE);
+            let mut url = self.endpoint(["user", "repos"])?;
+            url.query_pairs_mut()
+                .append_pair("visibility", "all")
+                .append_pair("affiliation", "owner,collaborator,organization_member")
+                .append_pair("sort", "full_name")
+                .append_pair("direction", "asc")
+                .append_pair("per_page", &page_size.to_string())
+                .append_pair("page", &page.to_string());
+            let repositories: Vec<GitHubRepository> = self
+                .get_json(url)
+                .await
+                .context("GitHub credential-visible repository inventory failed")?;
+            let returned = repositories.len();
+            raw_count = raw_count.saturating_add(returned);
+            for repository in repositories {
+                by_id.entry(repository.id).or_insert(repository);
+            }
+            if returned < page_size {
+                complete = true;
+                break;
+            }
+            page += 1;
+        }
+
+        let mut items = by_id.into_values().collect::<Vec<_>>();
+        items.sort_by(|left, right| left.full_name.cmp(&right.full_name));
+        Ok(GitHubRepositoryInventory { items, complete })
     }
 
     async fn search<T>(
@@ -744,7 +932,7 @@ impl GitHubClient {
     async fn get_json<T: DeserializeOwned>(&self, url: Url) -> Result<T> {
         let path = url.path().to_owned();
         let response = self.send_get(url, JSON_MEDIA_TYPE).await?;
-        let body = read_limited(response, JSON_RESPONSE_LIMIT)
+        let body = read_limited(response, JSON_RESPONSE_LIMIT, &self.usage.downloaded_bytes)
             .await
             .with_context(|| format!("failed to read bounded GitHub JSON response for {path}"))?;
         serde_json::from_slice(&body)
@@ -753,6 +941,7 @@ impl GitHubClient {
 
     async fn send_get(&self, url: Url, accept: &'static str) -> Result<Response> {
         for attempt in 0..MAX_ATTEMPTS {
+            self.usage.requests.fetch_add(1, Ordering::Relaxed);
             let response = match self
                 .client
                 .get(url.clone())
@@ -794,7 +983,7 @@ impl GitHubClient {
     async fn api_error(&self, mut response: Response) -> GitHubApiError {
         let status = response.status();
         let rate_limit = GitHubRateLimit::from_headers(response.headers());
-        let body = read_error_body(&mut response).await;
+        let body = read_error_body(&mut response, &self.usage.downloaded_bytes).await;
         let envelope = serde_json::from_slice::<ApiErrorResponse>(&body).ok();
         let raw_message = envelope
             .as_ref()
@@ -955,7 +1144,11 @@ fn text_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
     headers.get(name)?.to_str().ok().map(str::to_owned)
 }
 
-async fn read_limited(mut response: Response, max_bytes: u64) -> Result<Vec<u8>> {
+async fn read_limited(
+    mut response: Response,
+    max_bytes: u64,
+    downloaded_bytes: &AtomicU64,
+) -> Result<Vec<u8>> {
     let declared_length = response.content_length();
     if let Some(length) = declared_length {
         ensure!(
@@ -973,6 +1166,7 @@ async fn read_limited(mut response: Response, max_bytes: u64) -> Result<Vec<u8>>
         .await
         .context("failed while reading GitHub response")?
     {
+        downloaded_bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
         received = received.saturating_add(chunk.len() as u64);
         ensure!(
             received <= max_bytes,
@@ -983,11 +1177,12 @@ async fn read_limited(mut response: Response, max_bytes: u64) -> Result<Vec<u8>>
     Ok(body)
 }
 
-async fn read_error_body(response: &mut Response) -> Vec<u8> {
+async fn read_error_body(response: &mut Response, downloaded_bytes: &AtomicU64) -> Vec<u8> {
     let mut body = Vec::new();
     while body.len() < ERROR_BODY_LIMIT as usize {
         match response.chunk().await {
             Ok(Some(chunk)) => {
+                downloaded_bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 let remaining = ERROR_BODY_LIMIT as usize - body.len();
                 body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
             }
@@ -1403,6 +1598,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_visible_name_search_requires_authentication_and_retains_private_results() {
+        let server = MockServer::start().await;
+        let unauthenticated = test_client(&server, None)
+            .search_repositories_by_name_in_scope("widget", 2, RepositoryScope::AllVisible)
+            .await
+            .unwrap_err();
+        assert!(
+            unauthenticated
+                .to_string()
+                .contains("requires authentication")
+        );
+
+        let mut private = repository_json("acme", "widget", 42);
+        private["private"] = json!(true);
+        private["visibility"] = json!("private");
+        Mock::given(method("GET"))
+            .and(path("/search/repositories"))
+            .and(query_param("q", "widget in:name"))
+            .and(query_param("per_page", "2"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total_count": 1,
+                "incomplete_results": false,
+                "items": [private]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = test_client(&server, Some("token".to_owned()))
+            .search_repositories_by_name_in_scope("widget", 2, RepositoryScope::AllVisible)
+            .await
+            .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].effective_visibility(),
+            RepositoryVisibility::Private
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn keeps_the_search_page_size_fixed_across_pages() {
         let server = MockServer::start().await;
         let first_page = (1..=100)
@@ -1435,6 +1672,45 @@ mod tests {
         assert_eq!(result.items.len(), 150);
         assert_eq!(result.items[0].id, 1);
         assert_eq!(result.items[149].id, 150);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn enumerates_visible_repositories_and_deduplicates_by_id() {
+        let server = MockServer::start().await;
+        let mut private = repository_json("acme", "private", 2);
+        private["private"] = json!(true);
+        private["visibility"] = json!("private");
+        Mock::given(method("GET"))
+            .and(path("/user/repos"))
+            .and(query_param("visibility", "all"))
+            .and(query_param(
+                "affiliation",
+                "owner,collaborator,organization_member",
+            ))
+            .and(query_param("per_page", "10"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                repository_json("acme", "public", 1),
+                private,
+                repository_json("renamed", "public", 1)
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let inventory = test_client(&server, Some("token".to_owned()))
+            .credential_visible_repositories(10)
+            .await
+            .unwrap();
+        assert!(inventory.complete);
+        assert_eq!(inventory.items.len(), 2);
+        assert!(
+            inventory
+                .items
+                .iter()
+                .any(|repo| repo.effective_visibility() == RepositoryVisibility::Private)
+        );
         server.verify().await;
     }
 

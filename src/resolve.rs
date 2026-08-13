@@ -5,7 +5,10 @@ use strsim::jaro_winkler;
 
 use crate::{
     crates_io::{CratesIoClient, canonical_crate_name},
-    github::{GitHubClient, GitHubRepo, github_url_has_disallowed_components, parse_github_repo},
+    github::{
+        GitHubClient, GitHubRepo, RepositoryScope, github_url_has_disallowed_components,
+        parse_github_repo,
+    },
     model::{CrateSummary, RankedCrate, ResolutionResult},
 };
 
@@ -20,6 +23,7 @@ pub struct ResolveOptions {
     pub limit: usize,
     pub explicit_crate: Option<String>,
     pub accept_closest: bool,
+    pub repository_scope: RepositoryScope,
 }
 
 pub async fn resolve_target(
@@ -30,6 +34,9 @@ pub async fn resolve_target(
 ) -> Result<ResolutionResult> {
     let query = query.trim();
     validate_query(query)?;
+    if options.repository_scope == RepositoryScope::AllVisible && !github.is_authenticated() {
+        bail!("private GitHub repository resolution requires authentication");
+    }
 
     if let Some(explicit) = options.explicit_crate.as_deref() {
         let selected = crates_io
@@ -40,7 +47,15 @@ pub async fn resolve_target(
     }
 
     if let Some(repo) = parse_github_repo(query) {
-        return resolve_repository(crates_io, github, query, &repo, options.limit).await;
+        return resolve_repository(
+            crates_io,
+            github,
+            query,
+            &repo,
+            options.limit,
+            options.repository_scope,
+        )
+        .await;
     }
 
     if let Some(exact) = crates_io.lookup_exact(query).await? {
@@ -48,7 +63,10 @@ pub async fn resolve_target(
     }
 
     let mut diagnostics = Vec::new();
-    let repository_matches = match github.search_repositories_by_name(query, 10).await {
+    let repository_matches = match github
+        .search_repositories_by_name_in_scope(query, 10, options.repository_scope)
+        .await
+    {
         Ok(matches) => {
             if matches.bounded() {
                 diagnostics.push(format!(
@@ -68,10 +86,22 @@ pub async fn resolve_target(
     };
 
     if let Some(matches) = &repository_matches {
-        let exact_repositories = exact_named_repositories(query, &matches.items);
-        if let Some(exact_repository) = unique_unbounded_exact_repository(query, matches) {
+        let exact_repositories =
+            exact_named_repositories(query, &matches.items, options.repository_scope);
+        if let Some(exact_repository) =
+            unique_unbounded_exact_repository(query, matches, options.repository_scope)
+        {
             let repo = exact_repository.repo();
-            match resolve_repository(crates_io, github, query, &repo, options.limit).await {
+            match resolve_repository(
+                crates_io,
+                github,
+                query,
+                &repo,
+                options.limit,
+                options.repository_scope,
+            )
+            .await
+            {
                 Ok(mut resolution)
                     if resolution.selected.is_some() || !resolution.alternatives.is_empty() =>
                 {
@@ -99,12 +129,12 @@ pub async fn resolve_target(
             }
         } else if !exact_repositories.is_empty() && matches.bounded() {
             diagnostics.push(format!(
-                "the bounded GitHub result page contained {} exact public repository-name match(es), so uniqueness was not established; use owner/repo or explicitly accept a closest crate",
+                "the bounded GitHub result page contained {} exact in-scope repository-name match(es), so uniqueness was not established; use owner/repo or explicitly accept a closest crate",
                 exact_repositories.len()
             ));
         } else if exact_repositories.len() > 1 {
             diagnostics.push(format!(
-                "{} public GitHub repositories in the bounded result set have this exact name; use owner/repo to disambiguate",
+                "{} in-scope GitHub repositories in the bounded result set have this exact name; use owner/repo to disambiguate",
                 exact_repositories.len()
             ));
         }
@@ -323,7 +353,7 @@ fn exact_result(input: &str, selected: CrateSummary, method: &str) -> Resolution
 mod tests {
     use serde_json::json;
 
-    use super::mapping::{ensure_public_repository, package_name_from_manifest};
+    use super::mapping::{ensure_repository_in_scope, package_name_from_manifest};
     use super::*;
     use crate::github::{GitHubRepository, GitHubSearchResult};
 
@@ -435,8 +465,10 @@ version = "1.0.0"
     #[test]
     fn private_repository_resolution_is_outside_public_scope() {
         let repository = github_repository("acme", "widget", true);
-        let error = ensure_public_repository(&repository).unwrap_err();
-        assert!(error.to_string().contains("outside this public inventory"));
+        let error =
+            ensure_repository_in_scope(&repository, RepositoryScope::PublicOnly).unwrap_err();
+        assert!(error.to_string().contains("--include-private"));
+        assert!(ensure_repository_in_scope(&repository, RepositoryScope::AllVisible).is_ok());
     }
 
     #[test]
@@ -447,7 +479,10 @@ version = "1.0.0"
             incomplete_results: false,
             items: vec![repository.clone()],
         };
-        assert!(unique_unbounded_exact_repository("widget", &bounded).is_none());
+        assert!(
+            unique_unbounded_exact_repository("widget", &bounded, RepositoryScope::PublicOnly)
+                .is_none()
+        );
 
         let complete = GitHubSearchResult {
             total_count: 1,
@@ -455,7 +490,7 @@ version = "1.0.0"
             items: vec![repository],
         };
         assert_eq!(
-            unique_unbounded_exact_repository("widget", &complete)
+            unique_unbounded_exact_repository("widget", &complete, RepositoryScope::PublicOnly,)
                 .map(|item| item.full_name.as_str()),
             Some("acme/widget")
         );

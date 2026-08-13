@@ -166,6 +166,7 @@ impl CratesIoClient {
         api_request_interval: Duration,
         reverse_dependencies_per_page: usize,
     ) -> Result<Self> {
+        crate::install_rustls_crypto_provider();
         ensure!(
             (1..=REVERSE_DEPENDENCIES_PER_PAGE).contains(&reverse_dependencies_per_page),
             "reverse-dependency page size must be between 1 and 100"

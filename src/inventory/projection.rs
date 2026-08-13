@@ -8,6 +8,7 @@ use crate::{
         evaluate_cargo_requirement,
     },
     crates_io::{DependencyDeclaration, ReverseDependencyCandidate},
+    evidence::EvidenceStrengthV1,
     github::{GitHubHead, GitHubRepo, GitHubRepository},
     output::csv_safe,
 };
@@ -29,6 +30,10 @@ pub(super) struct RepositoryEvidence<'a> {
     pub(super) enrichment_partial: bool,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keeping parsed lock evidence inline avoids a heap allocation per lockfile"
+)]
 pub(super) enum LockEvidence {
     Unclassified {
         status: &'static str,
@@ -106,6 +111,14 @@ pub(super) fn apply_tree_and_manifest(
         } else {
             os_support.has_unconditional_declaration.to_string()
         };
+    row.evidence_strength = if !manifest_scan.evidence.declarations.is_empty() {
+        "current_direct_declaration"
+    } else if row.published_direct_status == "present" {
+        "published_direct_declaration"
+    } else {
+        "discovery_only"
+    }
+    .to_owned();
 
     if tree_truncated {
         append_error(
@@ -170,6 +183,14 @@ pub(super) fn project_lock_evidence(
             }
         }
         LockEvidence::Parsed(evidence) => {
+            row.direct_relation_witness_json = json_cell(&evidence.direct_witness);
+            row.transitive_relation_witness_json = json_cell(&evidence.transitive_witness);
+            row.evidence_strength = evidence_strength_name(EvidenceStrengthV1::classify(
+                Some(&evidence),
+                row.current_direct_status == "present",
+                row.published_direct_status == "present",
+            ))
+            .to_owned();
             row.lock_status = "parsed".to_owned();
             row.resolved_target_versions_json = json_cell(&evidence.resolved_versions);
             row.resolved_target_sources_json = json_cell(&evidence.occurrences);
@@ -218,6 +239,30 @@ pub(super) fn finalize_completeness(row: &mut CsvRow, partial: bool) {
         row.inventory_status = "complete".to_owned();
         row.evidence_completeness = "complete".to_owned();
     }
+    let mut reasons = Vec::new();
+    if row.published_direct_status == "present" {
+        reasons.push("published_direct_declaration");
+    }
+    if row.current_direct_status == "present" {
+        reasons.push("current_direct_declaration");
+    }
+    if row.exact_occurrence_count > 0 {
+        reasons.push("exact_lockfile_occurrence");
+    }
+    if matches!(
+        row.recorded_relation.as_str(),
+        "recorded_direct" | "recorded_transitive" | "recorded_direct_and_transitive"
+    ) {
+        reasons.push("recorded_dependency_path");
+    }
+    row.inclusion_reasons_json = json_cell(&reasons);
+    let limitations = row
+        .error_code
+        .split(';')
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .collect::<Vec<_>>();
+    row.scope_limitations_json = json_cell(&limitations);
 }
 
 pub(super) fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
@@ -317,6 +362,7 @@ pub(super) fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
         target_repository_url: context.target_repository_url.clone().unwrap_or_default(),
         globally_exhaustive: context.globally_exhaustive,
         candidate_scope: context.candidate_scope.clone(),
+        repository_scope: context.repository_scope.as_str().to_owned(),
         scan_policy_json: context.scan_policy_json.clone(),
         candidate_sources_json: json_cell(&group.sources),
         dependent_crates_json: json_cell(&dependent_crates),
@@ -341,6 +387,7 @@ pub(super) fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
             .cloned()
             .unwrap_or_default(),
         github_repository_id: String::new(),
+        repository_visibility: "unknown".to_owned(),
         github_full_name: group
             .repository_hint
             .as_ref()
@@ -379,6 +426,18 @@ pub(super) fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
         os_has_unconditional_declaration: "unknown".to_owned(),
         recorded_relation: "unknown".to_owned(),
         shortest_dependency_depth: String::new(),
+        direct_relation_witness_json: "null".to_owned(),
+        transitive_relation_witness_json: "null".to_owned(),
+        evidence_strength: if group.published.is_empty() {
+            "discovery_only"
+        } else {
+            "published_direct_declaration"
+        }
+        .to_owned(),
+        inclusion_reasons_json: "[]".to_owned(),
+        scope_limitations_json: "[]".to_owned(),
+        cache_status: "cold".to_owned(),
+        reused_from_scan_id: String::new(),
         evidence_completeness: "unknown".to_owned(),
         error_code: String::new(),
         error_message: String::new(),
@@ -415,6 +474,7 @@ pub(super) fn repository_row(
     let mut row = base_row(context, group);
     row.repository_url = repository.html_url.to_string();
     row.github_repository_id = repository.id.to_string();
+    row.repository_visibility = repository.effective_visibility().as_str().to_owned();
     row.github_full_name = repository.full_name.clone();
     row.default_branch = repository.default_branch.clone().unwrap_or_default();
     row.repo_pushed_at = repository
@@ -474,6 +534,16 @@ pub(super) fn relation_confirms_dependency(relation: RecordedRelation) -> bool {
             | RecordedRelation::Transitive
             | RecordedRelation::DirectAndTransitive
     )
+}
+
+fn evidence_strength_name(strength: EvidenceStrengthV1) -> &'static str {
+    match strength {
+        EvidenceStrengthV1::VerifiedExactGraph => "verified_exact_graph",
+        EvidenceStrengthV1::ExactPresentUnclassified => "exact_present_unclassified",
+        EvidenceStrengthV1::CurrentDirectDeclaration => "current_direct_declaration",
+        EvidenceStrengthV1::PublishedDirectDeclaration => "published_direct_declaration",
+        EvidenceStrengthV1::DiscoveryOnly => "discovery_only",
+    }
 }
 
 pub(super) fn json_cell<T: Serialize>(value: &T) -> String {

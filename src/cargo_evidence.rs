@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 mod lock;
 mod manifest;
 
-pub use lock::{CargoLockEvidence, RecordedRelation, ResolvedOccurrence, analyze_cargo_lock};
+pub use lock::{
+    CargoLockEvidence, DependencyWitnessV1, PackageIdentityV1, RecordedRelation,
+    ResolvedOccurrence, analyze_cargo_lock, analyze_cargo_lock_with_packages,
+};
 pub use manifest::analyze_cargo_manifests;
 
 /// Cargo dependency-table classification.
@@ -439,6 +442,14 @@ mod tests {
         format!("version = 3\n\n{packages}")
     }
 
+    fn witness_names(witness: &DependencyWitnessV1) -> Vec<&str> {
+        witness
+            .packages
+            .iter()
+            .map(|package| package.name.as_str())
+            .collect()
+    }
+
     #[test]
     fn reports_all_versions_sources_and_exact_crates_io_occurrences() {
         let text = lockfile(&format!(
@@ -501,6 +512,11 @@ source = "{CRATES_IO}"
         assert_eq!(evidence.recorded_relation, RecordedRelation::Direct);
         assert_eq!(evidence.shortest_depth, Some(1));
         assert!(evidence.graph_analysis_complete);
+        assert_eq!(
+            witness_names(evidence.direct_witness.as_ref().unwrap()),
+            vec!["app", "fs2"]
+        );
+        assert!(evidence.transitive_witness.is_none());
     }
 
     #[test]
@@ -527,6 +543,10 @@ source = "{CRATES_IO}"
         let evidence = analyze_cargo_lock(&text, "fs2", &version("0.4.3")).unwrap();
         assert_eq!(evidence.recorded_relation, RecordedRelation::Transitive);
         assert_eq!(evidence.shortest_depth, Some(2));
+        assert_eq!(
+            witness_names(evidence.transitive_witness.as_ref().unwrap()),
+            vec!["app", "bridge", "fs2"]
+        );
     }
 
     #[test]
@@ -556,6 +576,47 @@ source = "{CRATES_IO}"
             RecordedRelation::DirectAndTransitive
         );
         assert_eq!(evidence.shortest_depth, Some(1));
+        assert_eq!(
+            witness_names(evidence.direct_witness.as_ref().unwrap()),
+            vec!["app", "fs2"]
+        );
+        assert_eq!(
+            witness_names(evidence.transitive_witness.as_ref().unwrap()),
+            vec!["app", "bridge", "fs2"]
+        );
+    }
+
+    #[test]
+    fn chooses_a_deterministic_shortest_transitive_witness() {
+        let text = lockfile(&format!(
+            r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["z-bridge", "a-bridge"]
+
+[[package]]
+name = "z-bridge"
+version = "1.0.0"
+dependencies = ["fs2"]
+
+[[package]]
+name = "a-bridge"
+version = "1.0.0"
+dependencies = ["fs2"]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "{CRATES_IO}"
+"#
+        ));
+
+        let evidence = analyze_cargo_lock(&text, "fs2", &version("0.4.3")).unwrap();
+        assert_eq!(
+            witness_names(evidence.transitive_witness.as_ref().unwrap()),
+            vec!["app", "a-bridge", "fs2"]
+        );
     }
 
     #[test]

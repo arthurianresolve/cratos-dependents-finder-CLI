@@ -12,7 +12,7 @@ use wiremock::{
 use crate::{
     cli::{ActivityFilter, DependencyKind, Discovery, OptionalFilter, RequirementFilter},
     crates_io::{CratesIoClient, sparse_index_path},
-    github::GitHubClient,
+    github::{GitHubClient, RepositoryScope},
     inventory::{ScanOptions, scan},
 };
 
@@ -99,9 +99,14 @@ source = "{CRATES_IO_SOURCE}"
             max_file_bytes: 1024 * 1024,
             output: csv_path.clone(),
             summary_json: Some(summary_path.clone()),
+            evidence_json: None,
+            policy_file: None,
+            policy_report: None,
+            data_snapshot: None,
             allow_partial: false,
             require_match: true,
             jobs: 2,
+            repository_scope: RepositoryScope::PublicOnly,
         },
     )
     .await
