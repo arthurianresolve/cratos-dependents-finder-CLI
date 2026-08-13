@@ -72,6 +72,24 @@ fn invalid_semver_is_rejected_before_network_access() {
 }
 
 #[test]
+fn range_scan_rejects_exact_evidence_outputs_before_network_access() {
+    command_without_network()
+        .args([
+            "scan",
+            "fs2",
+            "--version-range",
+            "^0.4",
+            "--evidence-json",
+            "evidence.json",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "--version-range currently supports CSV and summary output only",
+        ));
+}
+
+#[test]
 fn bounded_integer_options_reject_zero() {
     cargo_bin_cmd!("crate-dependent-repos")
         .args(["--jobs", "0", "resolve", "fs2"])

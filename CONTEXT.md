@@ -12,6 +12,8 @@ policy decisions, and operational health as separate facts.
   analyzer versions. Standalone candidate discovery is recorded separately.
 - **Candidate**: a crate or repository found by crates.io metadata or bounded
   GitHub discovery. A candidate is not yet a confirmed dependent.
+- **Target selector**: either one exact package version or a Cargo requirement
+  whose evidence remains bound to concrete published and lockfile versions.
 - **Repository snapshot**: a canonical GitHub repository ID plus immutable
   default-branch head, tree, and blob identities used for analysis.
 - **Evidence bundle**: the canonical, versioned JSON record from which CSV,
@@ -45,3 +47,5 @@ policy decisions, and operational health as separate facts.
    metrics and non-tenant operational logs.
 7. Versioned evidence, policy, event, and protocol records are additive and
    reject unsupported major schema versions.
+8. Range inventory never fans out repository work per matching release and does
+   not reinterpret exact evidence or distributed-job protocols.

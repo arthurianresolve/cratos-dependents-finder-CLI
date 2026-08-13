@@ -2,12 +2,13 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    hash::Hash,
     str::FromStr,
 };
 
 use anyhow::{Context, Result};
 use cargo_lock::{Lockfile, Package};
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
 /// A package entry for the requested crate in a `Cargo.lock` file.
@@ -84,6 +85,54 @@ pub struct CargoLockEvidence {
     pub package_inventory_diagnostic: Option<String>,
 }
 
+/// Graph evidence for one concrete package identity selected by a range.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MatchingResolutionEvidenceV1 {
+    pub package: PackageIdentityV1,
+    pub occurrences: usize,
+    pub recorded_relation: RecordedRelation,
+    pub shortest_depth: Option<usize>,
+    #[serde(default)]
+    pub direct_witness: Option<DependencyWitnessV1>,
+    #[serde(default)]
+    pub transitive_witness: Option<DependencyWitnessV1>,
+    pub graph_analysis_complete: bool,
+    pub graph_diagnostic: Option<String>,
+}
+
+/// Lockfile evidence for every concrete target version matching a requirement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CargoLockRangeEvidence {
+    pub target_name: String,
+    pub target_requirement: String,
+    pub lockfile_version: u32,
+    /// Every package entry with `name == target_name`, including non-matches.
+    pub occurrences: Vec<ResolvedOccurrence>,
+    pub resolved_versions: Vec<Version>,
+    pub matching_occurrences: Vec<ResolvedOccurrence>,
+    pub matching_versions: Vec<Version>,
+    pub matching_occurrence_count: usize,
+    pub crates_io_occurrences: usize,
+    pub matching_crates_io_occurrences: usize,
+    /// Per-source concrete resolution evidence collected during the same graph walk.
+    pub matching_resolutions: Vec<MatchingResolutionEvidenceV1>,
+    pub recorded_relation: RecordedRelation,
+    pub shortest_depth: Option<usize>,
+    #[serde(default)]
+    pub direct_witness: Option<DependencyWitnessV1>,
+    #[serde(default)]
+    pub transitive_witness: Option<DependencyWitnessV1>,
+    pub graph_root_count: usize,
+    pub graph_analysis_complete: bool,
+    pub graph_diagnostic: Option<String>,
+    #[serde(default)]
+    pub reachable_packages: Vec<PackageIdentityV1>,
+    #[serde(default)]
+    pub package_inventory_complete: bool,
+    #[serde(default)]
+    pub package_inventory_diagnostic: Option<String>,
+}
+
 /// Parse and analyze a `Cargo.lock` file without conflating package presence
 /// with graph reachability.
 pub fn analyze_cargo_lock(
@@ -102,6 +151,25 @@ pub fn analyze_cargo_lock_with_packages(
     target_version: &Version,
 ) -> Result<CargoLockEvidence> {
     analyze_cargo_lock_internal(lock_text, target_name, target_version, true)
+}
+
+/// Parse lock evidence for every concrete target version matching a Cargo
+/// requirement. The dependency graph is constructed and traversed once.
+pub fn analyze_cargo_lock_range(
+    lock_text: &str,
+    target_name: &str,
+    target_requirement: &VersionReq,
+) -> Result<CargoLockRangeEvidence> {
+    analyze_cargo_lock_range_internal(lock_text, target_name, target_requirement, false)
+}
+
+/// Range-aware lock analysis with the complete root-reachable package inventory.
+pub fn analyze_cargo_lock_range_with_packages(
+    lock_text: &str,
+    target_name: &str,
+    target_requirement: &VersionReq,
+) -> Result<CargoLockRangeEvidence> {
+    analyze_cargo_lock_range_internal(lock_text, target_name, target_requirement, true)
 }
 
 fn analyze_cargo_lock_internal(
@@ -141,12 +209,15 @@ fn analyze_cargo_lock_internal(
         .filter(|occurrence| occurrence.version == *target_version && occurrence.is_crates_io)
         .count();
 
+    let is_target = |package: &Package| {
+        package.name.as_str() == target_name && package.version == *target_version
+    };
     let relation = classify_recorded_relation(
         &lockfile,
-        target_name,
-        target_version,
+        &is_target,
         exact_occurrences,
         collect_packages,
+        false,
     );
 
     Ok(CargoLockEvidence {
@@ -171,6 +242,84 @@ fn analyze_cargo_lock_internal(
     })
 }
 
+fn analyze_cargo_lock_range_internal(
+    lock_text: &str,
+    target_name: &str,
+    target_requirement: &VersionReq,
+    collect_packages: bool,
+) -> Result<CargoLockRangeEvidence> {
+    let lockfile = Lockfile::from_str(lock_text).context("failed to parse Cargo.lock")?;
+    let mut occurrences = lockfile
+        .packages
+        .iter()
+        .chain(lockfile.root.iter())
+        .filter(|package| package.name.as_str() == target_name)
+        .map(resolved_occurrence)
+        .collect::<Vec<_>>();
+    occurrences
+        .sort_by(|left, right| (&left.version, &left.source).cmp(&(&right.version, &right.source)));
+
+    let resolved_versions = unique_versions(&occurrences);
+    let matching_occurrences = occurrences
+        .iter()
+        .filter(|occurrence| target_requirement.matches(&occurrence.version))
+        .cloned()
+        .collect::<Vec<_>>();
+    let matching_versions = unique_versions(&matching_occurrences);
+    let crates_io_occurrences = occurrences
+        .iter()
+        .filter(|occurrence| occurrence.is_crates_io)
+        .count();
+    let matching_crates_io_occurrences = matching_occurrences
+        .iter()
+        .filter(|occurrence| occurrence.is_crates_io)
+        .count();
+    let matching_occurrence_count = matching_occurrences.len();
+    let is_target = |package: &Package| {
+        package.name.as_str() == target_name && target_requirement.matches(&package.version)
+    };
+    let relation = classify_recorded_relation(
+        &lockfile,
+        &is_target,
+        matching_occurrence_count,
+        collect_packages,
+        true,
+    );
+
+    Ok(CargoLockRangeEvidence {
+        target_name: target_name.to_owned(),
+        target_requirement: target_requirement.to_string(),
+        lockfile_version: u32::from(lockfile.version),
+        occurrences,
+        resolved_versions,
+        matching_occurrences,
+        matching_versions,
+        matching_occurrence_count,
+        crates_io_occurrences,
+        matching_crates_io_occurrences,
+        matching_resolutions: relation.matching_resolutions,
+        recorded_relation: relation.relation,
+        shortest_depth: relation.shortest_depth,
+        direct_witness: relation.direct_witness,
+        transitive_witness: relation.transitive_witness,
+        graph_root_count: relation.root_count,
+        graph_analysis_complete: relation.complete,
+        graph_diagnostic: relation.diagnostic,
+        reachable_packages: relation.reachable_packages,
+        package_inventory_complete: relation.package_inventory_complete,
+        package_inventory_diagnostic: relation.package_inventory_diagnostic,
+    })
+}
+
+fn unique_versions(occurrences: &[ResolvedOccurrence]) -> Vec<Version> {
+    occurrences
+        .iter()
+        .map(|occurrence| occurrence.version.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn resolved_occurrence(package: &Package) -> ResolvedOccurrence {
     ResolvedOccurrence {
         version: package.version.clone(),
@@ -193,16 +342,28 @@ struct RelationAnalysis {
     reachable_packages: Vec<PackageIdentityV1>,
     package_inventory_complete: bool,
     package_inventory_diagnostic: Option<String>,
+    matching_resolutions: Vec<MatchingResolutionEvidenceV1>,
 }
 
-fn classify_recorded_relation(
+#[derive(Default)]
+struct ResolutionPathAnalysis {
+    occurrences: usize,
+    shortest_depth: Option<usize>,
+    direct_witness: Option<DependencyWitnessV1>,
+    transitive_witness: Option<DependencyWitnessV1>,
+}
+
+fn classify_recorded_relation<TargetMatches>(
     lockfile: &Lockfile,
-    target_name: &str,
-    target_version: &Version,
-    exact_occurrences: usize,
+    target_matches: &TargetMatches,
+    matching_occurrences: usize,
     collect_packages: bool,
-) -> RelationAnalysis {
-    if exact_occurrences == 0 && !collect_packages {
+    collect_matching_resolutions: bool,
+) -> RelationAnalysis
+where
+    TargetMatches: Fn(&Package) -> bool,
+{
+    if matching_occurrences == 0 && !collect_packages {
         return RelationAnalysis {
             relation: RecordedRelation::NotRecorded,
             shortest_depth: None,
@@ -214,24 +375,39 @@ fn classify_recorded_relation(
             reachable_packages: Vec::new(),
             package_inventory_complete: false,
             package_inventory_diagnostic: None,
+            matching_resolutions: Vec::new(),
         };
     }
+
+    let matching_identities = if collect_matching_resolutions {
+        matching_identity_counts(lockfile, target_matches)
+    } else {
+        std::collections::BTreeMap::new()
+    };
 
     // cargo-lock's dependency-tree implementation intentionally models
     // `packages` and not the separate legacy `[root]` field. Reporting a
     // relation from that incomplete graph would be stronger than the evidence.
     if lockfile.root.is_some() {
+        // Range absence is conclusive from the parsed package entries even
+        // when the optional reachability inventory cannot be completed. Exact
+        // analysis deliberately preserves the V1 behavior for this case.
+        let range_absence = collect_matching_resolutions && matching_occurrences == 0;
         return RelationAnalysis {
-            relation: RecordedRelation::PresentUnclassified,
+            relation: if range_absence {
+                RecordedRelation::NotRecorded
+            } else {
+                RecordedRelation::PresentUnclassified
+            },
             shortest_depth: None,
             direct_witness: None,
             transitive_witness: None,
             root_count: 1,
-            complete: false,
-            diagnostic: Some(
+            complete: range_absence,
+            diagnostic: (!range_absence).then(|| {
                 "legacy Cargo.lock root is not represented by cargo-lock's dependency tree"
-                    .to_owned(),
-            ),
+                    .to_owned()
+            }),
             reachable_packages: if collect_packages {
                 lockfile
                     .packages
@@ -247,24 +423,43 @@ fn classify_recorded_relation(
             package_inventory_diagnostic: collect_packages.then(|| {
                 "legacy Cargo.lock roots prevent complete package reachability analysis".to_owned()
             }),
+            matching_resolutions: unclassified_resolutions(
+                matching_identities,
+                false,
+                Some(
+                    "legacy Cargo.lock root is not represented by cargo-lock's dependency tree"
+                        .to_owned(),
+                ),
+            ),
         };
     }
 
     let tree = match lockfile.dependency_tree() {
         Ok(tree) => tree,
         Err(error) => {
+            let range_absence = collect_matching_resolutions && matching_occurrences == 0;
             return RelationAnalysis {
-                relation: RecordedRelation::PresentUnclassified,
+                relation: if range_absence {
+                    RecordedRelation::NotRecorded
+                } else {
+                    RecordedRelation::PresentUnclassified
+                },
                 shortest_depth: None,
                 direct_witness: None,
                 transitive_witness: None,
                 root_count: 0,
-                complete: false,
-                diagnostic: Some(format!("could not construct dependency tree: {error}")),
+                complete: range_absence,
+                diagnostic: (!range_absence)
+                    .then(|| format!("could not construct dependency tree: {error}")),
                 reachable_packages: Vec::new(),
                 package_inventory_complete: false,
                 package_inventory_diagnostic: collect_packages
                     .then(|| format!("could not construct package inventory: {error}")),
+                matching_resolutions: unclassified_resolutions(
+                    matching_identities,
+                    false,
+                    Some(format!("could not construct dependency tree: {error}")),
+                ),
             };
         }
     };
@@ -282,7 +477,7 @@ fn classify_recorded_relation(
         } else {
             (Vec::new(), false, None)
         };
-    if exact_occurrences == 0 {
+    if matching_occurrences == 0 {
         return RelationAnalysis {
             relation: RecordedRelation::NotRecorded,
             shortest_depth: None,
@@ -294,11 +489,24 @@ fn classify_recorded_relation(
             reachable_packages,
             package_inventory_complete,
             package_inventory_diagnostic,
+            matching_resolutions: Vec::new(),
         };
     }
     let mut direct_witness = None;
     let mut transitive_witness = None;
     let mut shortest_depth = None;
+    let mut resolution_paths = matching_identities
+        .into_iter()
+        .map(|(package, occurrences)| {
+            (
+                package,
+                ResolutionPathAnalysis {
+                    occurrences,
+                    ..ResolutionPathAnalysis::default()
+                },
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
 
     for root in &roots {
         let mut visited = HashSet::new();
@@ -308,11 +516,21 @@ fn classify_recorded_relation(
         queue.push_back((*root, 0_usize));
 
         while let Some((node, depth)) = queue.pop_front() {
-            if is_exact_target(&graph[node], target_name, target_version) {
+            if target_matches(&graph[node]) {
                 shortest_depth = minimum_depth(shortest_depth, depth);
-                // A target which is itself a graph root is not its own direct
-                // dependency, and is therefore left unclassified.
-                continue;
+                if collect_matching_resolutions {
+                    let path = resolution_paths
+                        .entry(identities[&node].clone())
+                        .or_default();
+                    path.shortest_depth = minimum_depth(path.shortest_depth, depth);
+                }
+                // For an exact selector, a target which is itself a graph root
+                // is not its own dependency and remains unclassified. Range
+                // analysis continues so another matching concrete version
+                // below it can retain its own path.
+                if !collect_matching_resolutions {
+                    continue;
+                }
             }
 
             let mut dependencies = graph
@@ -322,18 +540,38 @@ fn classify_recorded_relation(
 
             for dependency in dependencies {
                 let dependency_depth = depth + 1;
-                if is_exact_target(&graph[dependency], target_name, target_version) {
+                if target_matches(&graph[dependency]) {
+                    if collect_matching_resolutions
+                        && predecessor_path_contains(dependency, node, &predecessor)
+                    {
+                        continue;
+                    }
                     shortest_depth = minimum_depth(shortest_depth, dependency_depth);
                     let witness =
                         dependency_witness(&identities, *root, node, dependency, &predecessor);
                     if dependency_depth == 1 {
-                        retain_shortest_witness(&mut direct_witness, witness);
+                        retain_shortest_witness(&mut direct_witness, witness.clone());
                     } else {
-                        retain_shortest_witness(&mut transitive_witness, witness);
+                        retain_shortest_witness(&mut transitive_witness, witness.clone());
                     }
-                    // Do not traverse through the requested package. This both
-                    // avoids cycle-derived claims and keeps the relation about
-                    // paths ending at the requested package.
+                    if collect_matching_resolutions {
+                        let path = resolution_paths
+                            .entry(identities[&dependency].clone())
+                            .or_default();
+                        path.shortest_depth = minimum_depth(path.shortest_depth, dependency_depth);
+                        if dependency_depth == 1 {
+                            retain_shortest_witness(&mut path.direct_witness, witness);
+                        } else {
+                            retain_shortest_witness(&mut path.transitive_witness, witness);
+                        }
+                    }
+                    if collect_matching_resolutions && visited.insert(dependency) {
+                        predecessor.insert(dependency, node);
+                        queue.push_back((dependency, dependency_depth));
+                    }
+                    // Exact analysis does not traverse through the requested
+                    // package. Range analysis may continue to another concrete
+                    // matching version; the visited set still prevents cycles.
                     continue;
                 }
 
@@ -345,21 +583,28 @@ fn classify_recorded_relation(
         }
     }
 
-    let relation = match (direct_witness.is_some(), transitive_witness.is_some()) {
-        (true, true) => RecordedRelation::DirectAndTransitive,
-        (true, false) => RecordedRelation::Direct,
-        (false, true) => RecordedRelation::Transitive,
-        (false, false) => RecordedRelation::PresentUnclassified,
-    };
-    let diagnostic = (relation == RecordedRelation::PresentUnclassified).then(|| {
-        if shortest_depth == Some(0) {
-            "the target package is itself a dependency-tree root".to_owned()
-        } else if roots.is_empty() {
-            "the dependency tree has no roots from which to classify the target".to_owned()
-        } else {
-            "the target package is not reachable from a dependency-tree root".to_owned()
-        }
-    });
+    let relation = relation_from_witnesses(&direct_witness, &transitive_witness);
+    let diagnostic = relation_diagnostic(relation, shortest_depth, roots.is_empty());
+    let matching_resolutions = resolution_paths
+        .into_iter()
+        .map(|(package, path)| {
+            let relation = relation_from_witnesses(&path.direct_witness, &path.transitive_witness);
+            MatchingResolutionEvidenceV1 {
+                package,
+                occurrences: path.occurrences,
+                recorded_relation: relation,
+                shortest_depth: path.shortest_depth,
+                direct_witness: path.direct_witness,
+                transitive_witness: path.transitive_witness,
+                graph_analysis_complete: true,
+                graph_diagnostic: relation_diagnostic(
+                    relation,
+                    path.shortest_depth,
+                    roots.is_empty(),
+                ),
+            }
+        })
+        .collect();
 
     RelationAnalysis {
         relation,
@@ -372,7 +617,94 @@ fn classify_recorded_relation(
         reachable_packages,
         package_inventory_complete,
         package_inventory_diagnostic,
+        matching_resolutions,
     }
+}
+
+fn predecessor_path_contains<Node>(
+    candidate: Node,
+    mut node: Node,
+    predecessor: &HashMap<Node, Node>,
+) -> bool
+where
+    Node: Copy + Eq + Hash,
+{
+    loop {
+        if node == candidate {
+            return true;
+        }
+        let Some(parent) = predecessor.get(&node).copied() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+fn matching_identity_counts<TargetMatches>(
+    lockfile: &Lockfile,
+    target_matches: &TargetMatches,
+) -> std::collections::BTreeMap<PackageIdentityV1, usize>
+where
+    TargetMatches: Fn(&Package) -> bool,
+{
+    let mut matches = std::collections::BTreeMap::new();
+    for package in lockfile
+        .packages
+        .iter()
+        .chain(lockfile.root.iter())
+        .filter(|package| target_matches(package))
+    {
+        *matches.entry(package_identity(package)).or_insert(0) += 1;
+    }
+    matches
+}
+
+fn unclassified_resolutions(
+    matches: std::collections::BTreeMap<PackageIdentityV1, usize>,
+    graph_analysis_complete: bool,
+    diagnostic: Option<String>,
+) -> Vec<MatchingResolutionEvidenceV1> {
+    matches
+        .into_iter()
+        .map(|(package, occurrences)| MatchingResolutionEvidenceV1 {
+            package,
+            occurrences,
+            recorded_relation: RecordedRelation::PresentUnclassified,
+            shortest_depth: None,
+            direct_witness: None,
+            transitive_witness: None,
+            graph_analysis_complete,
+            graph_diagnostic: diagnostic.clone(),
+        })
+        .collect()
+}
+
+fn relation_from_witnesses(
+    direct: &Option<DependencyWitnessV1>,
+    transitive: &Option<DependencyWitnessV1>,
+) -> RecordedRelation {
+    match (direct.is_some(), transitive.is_some()) {
+        (true, true) => RecordedRelation::DirectAndTransitive,
+        (true, false) => RecordedRelation::Direct,
+        (false, true) => RecordedRelation::Transitive,
+        (false, false) => RecordedRelation::PresentUnclassified,
+    }
+}
+
+fn relation_diagnostic(
+    relation: RecordedRelation,
+    shortest_depth: Option<usize>,
+    roots_empty: bool,
+) -> Option<String> {
+    (relation == RecordedRelation::PresentUnclassified).then(|| {
+        if shortest_depth == Some(0) {
+            "the target package is itself a dependency-tree root".to_owned()
+        } else if roots_empty {
+            "the dependency tree has no roots from which to classify the target".to_owned()
+        } else {
+            "the target package is not reachable from a dependency-tree root".to_owned()
+        }
+    })
 }
 
 fn reachable_package_inventory(
@@ -452,10 +784,6 @@ fn retain_shortest_witness(
     if replace {
         *current = Some(candidate);
     }
-}
-
-fn is_exact_target(package: &Package, target_name: &str, target_version: &Version) -> bool {
-    package.name.as_str() == target_name && package.version == *target_version
 }
 
 fn minimum_depth(current: Option<usize>, candidate: usize) -> Option<usize> {

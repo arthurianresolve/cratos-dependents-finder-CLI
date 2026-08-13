@@ -7,7 +7,13 @@ use csv::{Reader, StringRecord};
 use semver::Version;
 use serde_json::{Map, Value, json};
 
-use crate::cli::{ReportGroupBy, ReportSort};
+use crate::{
+    cli::{ReportGroupBy, ReportSort},
+    inventory::csv_schema::{
+        CURRENT_DIRECT_STATUS, GITHUB_FULL_NAME, HEAD_COMMITTED_AT, MSRV_EFFECTIVE, MSRV_SOURCE,
+        OS_HAS_UNCONDITIONAL_DECLARATION, OS_OBSERVED_TARGETS_JSON, STALE,
+    },
+};
 
 pub fn run_report(
     input: &Path,
@@ -15,14 +21,11 @@ pub fn run_report(
     group_by: Option<ReportGroupBy>,
     json_output: bool,
 ) -> Result<()> {
-    let mut reader = Reader::from_path(input)
-        .with_context(|| format!("opening report input {}", input.display()))?;
-    let headers = reader.headers().context("reading CSV headers")?.clone();
-    let columns = columns(&headers)?;
-    let rows = reader
-        .records()
-        .collect::<csv::Result<Vec<_>>>()
-        .context("reading report CSV rows")?;
+    let ReportInput {
+        headers,
+        columns,
+        rows,
+    } = read_report_input(input)?;
 
     let mut groups = BTreeMap::<String, Vec<StringRecord>>::new();
     for row in rows {
@@ -43,12 +46,42 @@ pub fn run_report(
     Ok(())
 }
 
+struct ReportInput {
+    headers: StringRecord,
+    columns: Columns,
+    rows: Vec<StringRecord>,
+}
+
+fn read_report_input(input: &Path) -> Result<ReportInput> {
+    let mut reader = Reader::from_path(input)
+        .with_context(|| format!("opening report input {}", input.display()))?;
+    let headers = reader.headers().context("reading CSV headers")?.clone();
+    let columns = columns(&headers)?;
+    let rows = reader
+        .records()
+        .collect::<csv::Result<Vec<_>>>()
+        .context("reading report CSV rows")?;
+    Ok(ReportInput {
+        headers,
+        columns,
+        rows,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn validate_report_input(input: &Path) -> Result<()> {
+    read_report_input(input).map(drop)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Columns {
     repository: usize,
     commit: usize,
     msrv: usize,
+    msrv_source: usize,
     os: usize,
+    os_unconditional: usize,
+    current_direct: usize,
     stale: usize,
 }
 
@@ -60,11 +93,14 @@ fn columns(headers: &StringRecord) -> Result<Columns> {
             .with_context(|| format!("CSV is missing required column `{name}`"))
     };
     Ok(Columns {
-        repository: index("github_full_name")?,
-        commit: index("head_committed_at")?,
-        msrv: index("msrv_effective")?,
-        os: index("os_observed_targets_json")?,
-        stale: index("stale")?,
+        repository: index(GITHUB_FULL_NAME)?,
+        commit: index(HEAD_COMMITTED_AT)?,
+        msrv: index(MSRV_EFFECTIVE)?,
+        msrv_source: index(MSRV_SOURCE)?,
+        os: index(OS_OBSERVED_TARGETS_JSON)?,
+        os_unconditional: index(OS_HAS_UNCONDITIONAL_DECLARATION)?,
+        current_direct: index(CURRENT_DIRECT_STATUS)?,
+        stale: index(STALE)?,
     })
 }
 
@@ -86,9 +122,47 @@ fn compare_rows(
 
 fn group_value(group: ReportGroupBy, row: &StringRecord, columns: &Columns) -> String {
     match group {
-        ReportGroupBy::Msrv => value(row, columns.msrv).to_owned(),
-        ReportGroupBy::Os => value(row, columns.os).to_owned(),
+        ReportGroupBy::Msrv => msrv_display(row, columns),
+        ReportGroupBy::Os => dependency_targeting(row, columns),
         ReportGroupBy::Stale => value(row, columns.stale).to_owned(),
+    }
+}
+
+fn msrv_display(row: &StringRecord, columns: &Columns) -> String {
+    let msrv = value(row, columns.msrv);
+    if msrv.is_empty() || msrv == "not_declared" {
+        return "not declared".to_owned();
+    }
+
+    match value(row, columns.msrv_source) {
+        "package_field" => format!("{msrv} (package field)"),
+        "workspace_inherited" => format!("{msrv} (workspace inherited)"),
+        "not_declared" | "" => format!("{msrv} (source unknown)"),
+        source => format!("{msrv} ({})", source.replace('_', " ")),
+    }
+}
+
+fn dependency_targeting(row: &StringRecord, columns: &Columns) -> String {
+    match value(row, columns.current_direct) {
+        "absent" => return "no direct declaration".to_owned(),
+        "present" => {}
+        _ => return "unknown".to_owned(),
+    }
+
+    let Ok(mut targets) = serde_json::from_str::<Vec<String>>(value(row, columns.os)) else {
+        return "unknown (invalid target data)".to_owned();
+    };
+    targets.sort();
+    targets.dedup();
+    let targets = targets.join(", ");
+
+    match (value(row, columns.os_unconditional), targets.is_empty()) {
+        ("true", true) => "unconditional".to_owned(),
+        ("true", false) => format!("unconditional; also target_os: {targets}"),
+        ("false", true) => "conditional (no target_os value observed)".to_owned(),
+        ("false", false) => format!("target_os: {targets}"),
+        (_, true) => "unknown".to_owned(),
+        (_, false) => format!("target_os: {targets}; unconditional status unknown"),
     }
 }
 
@@ -157,7 +231,7 @@ fn write_markdown(
 }
 
 fn write_markdown_table(rows: &[StringRecord], columns: &Columns) {
-    println!("| Repository | Last Commit | MSRV | OS | Stale |");
+    println!("| Repository | Last Commit | MSRV | Dependency targeting | Stale |");
     println!("|---|---|---|---|---|");
     for row in rows {
         let commit = value(row, columns.commit);
@@ -170,8 +244,8 @@ fn write_markdown_table(rows: &[StringRecord], columns: &Columns) {
             "| `{}` | {} | {} | {} | {} |",
             markdown_cell(value(row, columns.repository)),
             markdown_cell(if commit.is_empty() { "-" } else { commit }),
-            markdown_cell(value(row, columns.msrv)),
-            markdown_cell(value(row, columns.os)),
+            markdown_cell(&msrv_display(row, columns)),
+            markdown_cell(&dependency_targeting(row, columns)),
             markdown_cell(value(row, columns.stale)),
         );
     }
@@ -197,13 +271,35 @@ mod tests {
 
     fn test_columns() -> Columns {
         columns(&StringRecord::from(vec![
-            "github_full_name",
-            "head_committed_at",
-            "msrv_effective",
-            "os_observed_targets_json",
-            "stale",
+            GITHUB_FULL_NAME,
+            HEAD_COMMITTED_AT,
+            MSRV_EFFECTIVE,
+            MSRV_SOURCE,
+            OS_OBSERVED_TARGETS_JSON,
+            OS_HAS_UNCONDITIONAL_DECLARATION,
+            CURRENT_DIRECT_STATUS,
+            STALE,
         ]))
         .unwrap()
+    }
+
+    fn test_row(
+        msrv: &str,
+        msrv_source: &str,
+        targets: &str,
+        unconditional: &str,
+        current_direct: &str,
+    ) -> StringRecord {
+        StringRecord::from(vec![
+            "acme/widget",
+            "2026-08-13T00:00:00Z",
+            msrv,
+            msrv_source,
+            targets,
+            unconditional,
+            current_direct,
+            "false",
+        ])
     }
 
     #[test]
@@ -215,19 +311,56 @@ mod tests {
     #[test]
     fn groups_rows_by_selected_column() {
         let columns = test_columns();
-        let row = StringRecord::from(vec![
-            "acme/widget",
-            "2026-08-13T00:00:00Z",
+        let row = test_row(
             "1.70.0",
+            "workspace_inherited",
             "[\"windows\"]",
             "false",
-        ]);
-        assert_eq!(group_value(ReportGroupBy::Msrv, &row, &columns), "1.70.0");
+            "present",
+        );
+        assert_eq!(
+            group_value(ReportGroupBy::Msrv, &row, &columns),
+            "1.70.0 (workspace inherited)"
+        );
         assert_eq!(
             group_value(ReportGroupBy::Os, &row, &columns),
-            "[\"windows\"]"
+            "target_os: windows"
         );
         assert_eq!(group_value(ReportGroupBy::Stale, &row, &columns), "false");
+    }
+
+    #[test]
+    fn describes_unconditional_and_targeted_direct_declarations() {
+        let columns = test_columns();
+        let row = test_row(
+            "not_declared",
+            "not_declared",
+            "[\"windows\",\"linux\",\"linux\"]",
+            "true",
+            "present",
+        );
+
+        assert_eq!(msrv_display(&row, &columns), "not declared");
+        assert_eq!(
+            dependency_targeting(&row, &columns),
+            "unconditional; also target_os: linux, windows"
+        );
+    }
+
+    #[test]
+    fn distinguishes_absent_and_unclassified_targeting() {
+        let columns = test_columns();
+        let absent = test_row("", "", "[]", "false", "absent");
+        let conditional = test_row("", "", "[]", "false", "present");
+
+        assert_eq!(
+            dependency_targeting(&absent, &columns),
+            "no direct declaration"
+        );
+        assert_eq!(
+            dependency_targeting(&conditional, &columns),
+            "conditional (no target_os value observed)"
+        );
     }
 
     #[test]

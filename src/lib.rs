@@ -20,6 +20,7 @@ pub mod repository_analyzer;
 pub mod resolve;
 pub mod secure_cache;
 pub mod telemetry;
+pub mod version_selector;
 
 #[cfg(test)]
 mod scan_acceptance;

@@ -24,14 +24,11 @@ pub fn csv_safe(value: impl Into<String>) -> String {
 pub fn write_csv<T: Serialize>(path: &Path, headers: &[&str], rows: &[T]) -> Result<()> {
     write_output(path, |output| {
         let mut writer = csv::WriterBuilder::new()
-            .has_headers(!rows.is_empty())
+            .has_headers(false)
             .from_writer(output);
-        if rows.is_empty() {
-            writer.write_record(headers)?;
-        } else {
-            for row in rows {
-                writer.serialize(row)?;
-            }
+        writer.write_record(headers)?;
+        for row in rows {
+            writer.serialize(row)?;
         }
         writer.flush()?;
         Ok(())
@@ -80,6 +77,12 @@ fn write_output(path: &Path, write: impl FnOnce(&mut dyn Write) -> Result<()>) -
 mod tests {
     use super::*;
 
+    #[derive(Serialize)]
+    struct TestRow<'a> {
+        one: &'a str,
+        two: &'a str,
+    }
+
     #[test]
     fn protects_spreadsheet_formula_prefixes() {
         assert_eq!(csv_safe("=cmd|' /C calc'!A0"), "'=cmd|' /C calc'!A0");
@@ -97,6 +100,32 @@ mod tests {
         let rows: Vec<serde_json::Value> = Vec::new();
         write_csv(&path, &["one", "two"], &rows).unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), "one,two\n");
+    }
+
+    #[test]
+    fn empty_and_nonempty_csv_use_the_same_explicit_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_path = dir.path().join("empty.csv");
+        let populated_path = dir.path().join("populated.csv");
+        let empty: Vec<TestRow<'_>> = Vec::new();
+        let populated = [TestRow {
+            one: "first",
+            two: "second",
+        }];
+
+        write_csv(&empty_path, &["one", "two"], &empty).unwrap();
+        write_csv(&populated_path, &["one", "two"], &populated).unwrap();
+
+        let mut empty_reader = csv::Reader::from_path(empty_path).unwrap();
+        let mut populated_reader = csv::Reader::from_path(populated_path).unwrap();
+        assert_eq!(
+            empty_reader.headers().unwrap(),
+            populated_reader.headers().unwrap()
+        );
+        assert_eq!(
+            populated_reader.records().next().unwrap().unwrap(),
+            csv::StringRecord::from(vec!["first", "second"])
+        );
     }
 
     #[test]

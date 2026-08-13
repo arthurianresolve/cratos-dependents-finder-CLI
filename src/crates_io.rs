@@ -27,6 +27,8 @@ const USER_AGENT: &str = concat!(
 mod catalog;
 mod reverse;
 
+pub use catalog::CrateVersionCatalog;
+
 /// Scope of crates.io's reverse-dependency endpoint as currently implemented.
 ///
 /// The endpoint is not a historical list of every published dependent release.

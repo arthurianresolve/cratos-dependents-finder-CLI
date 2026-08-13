@@ -16,10 +16,14 @@ mod lock;
 mod manifest;
 
 pub use lock::{
-    CargoLockEvidence, DependencyWitnessV1, PackageIdentityV1, RecordedRelation,
-    ResolvedOccurrence, analyze_cargo_lock, analyze_cargo_lock_with_packages,
+    CargoLockEvidence, CargoLockRangeEvidence, DependencyWitnessV1, MatchingResolutionEvidenceV1,
+    PackageIdentityV1, RecordedRelation, ResolvedOccurrence, analyze_cargo_lock,
+    analyze_cargo_lock_range, analyze_cargo_lock_range_with_packages,
+    analyze_cargo_lock_with_packages,
 };
-pub use manifest::analyze_cargo_manifests;
+pub use manifest::{analyze_cargo_manifests, analyze_cargo_manifests_for_range};
+
+use crate::version_selector::PublishedVersionV1;
 
 /// Cargo dependency-table classification.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -110,6 +114,44 @@ pub struct ManifestEvidence {
     pub effective_msrv: Option<String>,
     pub effective_msrv_source: MsrvSource,
 }
+
+/// A direct declaration evaluated against a target version requirement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RangeDirectDeclaration {
+    pub manifest_path: String,
+    pub package_name: Option<String>,
+    pub alias: String,
+    pub dependency_package: String,
+    pub kind: DependencyKind,
+    pub target: Option<String>,
+    pub requirement: Option<String>,
+    pub requirement_intersects: Option<bool>,
+    pub intersection_witness: Option<PublishedVersionV1>,
+    pub explicit_exact_pin: Option<Version>,
+    pub exact_pin_matches_selector: Option<bool>,
+    pub requirement_error: Option<String>,
+    pub optional: bool,
+    pub git: Option<String>,
+    pub path: Option<String>,
+    pub registry: Option<String>,
+    pub workspace_inherited: bool,
+    pub workspace_manifest_path: Option<String>,
+}
+
+/// Direct-declaration evidence evaluated over a complete published-version universe.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RangeManifestEvidence {
+    pub target_name: String,
+    pub target_requirement: String,
+    pub manifests_supplied: usize,
+    pub manifests_parsed: usize,
+    pub declarations: Vec<RangeDirectDeclaration>,
+    pub diagnostics: Vec<ManifestDiagnostic>,
+    pub analysis_complete: bool,
+    pub msrv_observations: Vec<MsrvObservation>,
+    pub effective_msrv: Option<String>,
+    pub effective_msrv_source: MsrvSource,
+}
 /// The result of parsing and evaluating one Cargo version requirement.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequirementEvaluation {
@@ -174,11 +216,22 @@ pub fn evaluate_cargo_requirement(requirement: &str, version: &Version) -> Requi
 
 /// Aggregate OS selectors from direct dependency declarations.
 pub fn aggregate_os_support(declarations: &[DirectDeclaration]) -> OsSupport {
+    aggregate_os_support_from_targets(
+        declarations
+            .iter()
+            .map(|declaration| declaration.target.as_deref()),
+    )
+}
+
+/// Aggregate target-OS selectors without coupling callers to a declaration projection.
+pub fn aggregate_os_support_from_targets<'a>(
+    targets: impl IntoIterator<Item = Option<&'a str>>,
+) -> OsSupport {
     let mut observed_targets = BTreeSet::new();
     let mut has_unconditional_declaration = false;
 
-    for declaration in declarations {
-        match declaration.target.as_deref() {
+    for target in targets {
+        match target {
             None => has_unconditional_declaration = true,
             Some(target) => {
                 for capture in OS_PATTERN.captures_iter(target) {
@@ -639,6 +692,311 @@ source = "{CRATES_IO}"
         assert_eq!(evidence.recorded_relation, RecordedRelation::NotRecorded);
         assert_eq!(evidence.exact_occurrences, 0);
         assert_eq!(evidence.resolved_versions, vec![version("0.5.0")]);
+    }
+
+    #[test]
+    fn range_analysis_classifies_concrete_versions_in_one_graph() {
+        let text = lockfile(&format!(
+            r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["bridge", "fs2 0.4.3"]
+
+[[package]]
+name = "bridge"
+version = "1.0.0"
+dependencies = ["fs2 0.4.4"]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "{CRATES_IO}"
+
+[[package]]
+name = "fs2"
+version = "0.4.4"
+source = "registry+https://example.invalid/index"
+
+[[package]]
+name = "fs2"
+version = "0.5.0"
+source = "{CRATES_IO}"
+"#
+        ));
+        let requirement = VersionReq::parse("^0.4").unwrap();
+        let evidence = analyze_cargo_lock_range(&text, "fs2", &requirement).unwrap();
+
+        assert_eq!(evidence.matching_occurrence_count, 2);
+        assert_eq!(
+            evidence.matching_versions,
+            vec![version("0.4.3"), version("0.4.4")]
+        );
+        assert_eq!(evidence.matching_crates_io_occurrences, 1);
+        assert_eq!(
+            evidence.recorded_relation,
+            RecordedRelation::DirectAndTransitive
+        );
+        assert_eq!(evidence.matching_resolutions.len(), 2);
+        assert_eq!(
+            evidence.matching_resolutions[0].recorded_relation,
+            RecordedRelation::Direct
+        );
+        assert_eq!(
+            evidence.matching_resolutions[1].recorded_relation,
+            RecordedRelation::Transitive
+        );
+        assert_eq!(
+            evidence.direct_witness.as_ref().unwrap().packages.last(),
+            Some(&PackageIdentityV1 {
+                name: "fs2".to_owned(),
+                version: version("0.4.3"),
+                source: Some(CRATES_IO.to_owned()),
+            })
+        );
+        assert_eq!(
+            evidence
+                .transitive_witness
+                .as_ref()
+                .unwrap()
+                .packages
+                .last()
+                .unwrap()
+                .version,
+            version("0.4.4")
+        );
+    }
+
+    #[test]
+    fn range_analysis_traverses_through_one_match_to_another_concrete_match() {
+        let text = lockfile(&format!(
+            r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["fs2 0.4.3"]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "{CRATES_IO}"
+dependencies = ["fs2 0.4.4"]
+
+[[package]]
+name = "fs2"
+version = "0.4.4"
+source = "registry+https://example.invalid/index"
+"#
+        ));
+        let evidence =
+            analyze_cargo_lock_range(&text, "fs2", &VersionReq::parse("^0.4").unwrap()).unwrap();
+
+        assert_eq!(
+            evidence.recorded_relation,
+            RecordedRelation::DirectAndTransitive
+        );
+        assert_eq!(
+            evidence.matching_resolutions[0].recorded_relation,
+            RecordedRelation::Direct
+        );
+        assert_eq!(
+            evidence.matching_resolutions[1].recorded_relation,
+            RecordedRelation::Transitive
+        );
+    }
+
+    #[test]
+    fn range_analysis_does_not_create_a_witness_from_a_cycle() {
+        let text = lockfile(&format!(
+            r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["fs2"]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "{CRATES_IO}"
+dependencies = ["bridge"]
+
+[[package]]
+name = "bridge"
+version = "1.0.0"
+dependencies = ["fs2"]
+"#
+        ));
+        let evidence =
+            analyze_cargo_lock_range(&text, "fs2", &VersionReq::parse("^0.4").unwrap()).unwrap();
+
+        assert_eq!(evidence.recorded_relation, RecordedRelation::Direct);
+        assert!(evidence.transitive_witness.is_none());
+        assert_eq!(
+            evidence.matching_resolutions[0].recorded_relation,
+            RecordedRelation::Direct
+        );
+    }
+
+    #[test]
+    fn zero_range_matches_stay_not_recorded_when_package_inventory_is_incomplete() {
+        let legacy = format!(
+            r#"
+[root]
+name = "app"
+version = "0.1.0"
+dependencies = ["fs2 0.5.0 ({CRATES_IO})"]
+
+[[package]]
+name = "fs2"
+version = "0.5.0"
+source = "{CRATES_IO}"
+"#
+        );
+        let requirement = VersionReq::parse("^0.4").unwrap();
+        let evidence =
+            analyze_cargo_lock_range_with_packages(&legacy, "fs2", &requirement).unwrap();
+        assert_eq!(evidence.recorded_relation, RecordedRelation::NotRecorded);
+        assert!(evidence.graph_analysis_complete);
+        assert!(!evidence.package_inventory_complete);
+
+        let invalid_graph = lockfile(&format!(
+            r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["missing 1.0.0"]
+
+[[package]]
+name = "fs2"
+version = "0.5.0"
+source = "{CRATES_IO}"
+"#
+        ));
+        let evidence =
+            analyze_cargo_lock_range_with_packages(&invalid_graph, "fs2", &requirement).unwrap();
+        assert_eq!(evidence.recorded_relation, RecordedRelation::NotRecorded);
+        assert!(evidence.graph_analysis_complete);
+        assert!(!evidence.package_inventory_complete);
+    }
+
+    #[test]
+    fn package_inventory_preserves_exact_v1_unclassified_failures() {
+        let legacy = format!(
+            r#"
+[root]
+name = "app"
+version = "0.1.0"
+dependencies = ["fs2 0.5.0 ({CRATES_IO})"]
+
+[[package]]
+name = "fs2"
+version = "0.5.0"
+source = "{CRATES_IO}"
+"#
+        );
+        let evidence = analyze_cargo_lock_with_packages(&legacy, "fs2", &version("0.4.3")).unwrap();
+        assert_eq!(
+            evidence.recorded_relation,
+            RecordedRelation::PresentUnclassified
+        );
+        assert!(!evidence.graph_analysis_complete);
+
+        let invalid_graph = lockfile(&format!(
+            r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["missing 1.0.0"]
+
+[[package]]
+name = "fs2"
+version = "0.5.0"
+source = "{CRATES_IO}"
+"#
+        ));
+        let evidence =
+            analyze_cargo_lock_with_packages(&invalid_graph, "fs2", &version("0.4.3")).unwrap();
+        assert_eq!(
+            evidence.recorded_relation,
+            RecordedRelation::PresentUnclassified
+        );
+        assert!(!evidence.graph_analysis_complete);
+    }
+
+    #[test]
+    fn range_analysis_keeps_root_only_presence_unclassified() {
+        let text = lockfile(&format!(
+            r#"
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "{CRATES_IO}"
+"#
+        ));
+        let evidence =
+            analyze_cargo_lock_range(&text, "fs2", &VersionReq::parse("^0.4").unwrap()).unwrap();
+
+        assert_eq!(
+            evidence.recorded_relation,
+            RecordedRelation::PresentUnclassified
+        );
+        assert_eq!(evidence.shortest_depth, Some(0));
+        assert_eq!(
+            evidence.matching_resolutions[0].recorded_relation,
+            RecordedRelation::PresentUnclassified
+        );
+        assert_eq!(evidence.matching_resolutions[0].shortest_depth, Some(0));
+    }
+
+    #[test]
+    fn range_analysis_does_not_overstate_legacy_root_graphs() {
+        let text = format!(
+            r#"
+[root]
+name = "app"
+version = "0.1.0"
+dependencies = ["fs2 0.4.3 ({CRATES_IO})"]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "{CRATES_IO}"
+"#
+        );
+        let evidence =
+            analyze_cargo_lock_range(&text, "fs2", &VersionReq::parse("^0.4").unwrap()).unwrap();
+
+        assert_eq!(
+            evidence.recorded_relation,
+            RecordedRelation::PresentUnclassified
+        );
+        assert!(!evidence.graph_analysis_complete);
+        assert_eq!(evidence.matching_resolutions.len(), 1);
+        assert!(!evidence.matching_resolutions[0].graph_analysis_complete);
+    }
+
+    #[test]
+    fn range_refactor_preserves_exact_evidence_serialization() {
+        let text = lockfile(&format!(
+            r#"
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["fs2"]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "{CRATES_IO}"
+"#
+        ));
+        let evidence = analyze_cargo_lock(&text, "fs2", &version("0.4.3")).unwrap();
+        let serialized = serde_json::to_value(&evidence).unwrap();
+
+        assert_eq!(serialized["target_version"], "0.4.3");
+        assert_eq!(serialized["exact_occurrences"], 1);
+        assert_eq!(serialized["recorded_relation"], "direct");
+        assert!(serialized.get("matching_versions").is_none());
     }
 
     #[test]

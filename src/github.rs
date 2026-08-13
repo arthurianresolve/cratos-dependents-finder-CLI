@@ -22,6 +22,12 @@ use reqwest::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::Url;
 
+mod tree_inventory;
+
+pub use tree_inventory::{
+    GitHubTreeInventory, GitHubTreeInventoryLimitation, GitHubTreeInventoryLimits,
+};
+
 const GITHUB_API_BASE: &str = "https://api.github.com/";
 const GITHUB_API_VERSION: &str = "2026-03-10";
 const JSON_MEDIA_TYPE: &str = "application/vnd.github+json";
@@ -412,6 +418,10 @@ pub struct GitHubTreeEntry {
 impl GitHubTreeEntry {
     pub fn is_blob(&self) -> bool {
         self.kind == "blob"
+    }
+
+    fn is_tree(&self) -> bool {
+        self.kind == "tree"
     }
 }
 
@@ -930,13 +940,19 @@ impl GitHubClient {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, url: Url) -> Result<T> {
+        Ok(self.get_json_with_size(url).await?.0)
+    }
+
+    async fn get_json_with_size<T: DeserializeOwned>(&self, url: Url) -> Result<(T, u64)> {
         let path = url.path().to_owned();
         let response = self.send_get(url, JSON_MEDIA_TYPE).await?;
         let body = read_limited(response, JSON_RESPONSE_LIMIT, &self.usage.downloaded_bytes)
             .await
             .with_context(|| format!("failed to read bounded GitHub JSON response for {path}"))?;
-        serde_json::from_slice(&body)
-            .with_context(|| format!("GitHub returned invalid JSON for {path}"))
+        let json_bytes = body.len() as u64;
+        let value = serde_json::from_slice(&body)
+            .with_context(|| format!("GitHub returned invalid JSON for {path}"))?;
+        Ok((value, json_bytes))
     }
 
     async fn send_get(&self, url: Url, accept: &'static str) -> Result<Response> {
@@ -1262,7 +1278,7 @@ mod tests {
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path, query_param},
+        matchers::{header, method, path, query_param, query_param_is_missing},
     };
 
     fn test_client(server: &MockServer, token: Option<String>) -> GitHubClient {
@@ -1461,6 +1477,306 @@ mod tests {
         assert!(tree.truncated);
         assert_eq!(tree.tree.len(), 1);
         assert!(tree.tree[0].is_blob());
+    }
+
+    #[tokio::test]
+    async fn tree_inventory_keeps_the_one_request_fast_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/git/trees/root"))
+            .and(query_param("recursive", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sha": "root",
+                "truncated": false,
+                "tree": [{
+                    "path": "Cargo.toml",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": "manifest",
+                    "size": 123
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server, None);
+        let inventory = client
+            .tree_inventory(
+                &GitHubRepo::new("acme", "widget").unwrap(),
+                "root",
+                GitHubTreeInventoryLimits::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(inventory.complete);
+        assert!(!inventory.initial_response_truncated);
+        assert_eq!(inventory.requests, 1);
+        assert_eq!(client.usage().requests, 1);
+    }
+
+    #[tokio::test]
+    async fn tree_inventory_recovers_truncated_subtrees_without_recursive_queries() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/git/trees/root"))
+            .and(query_param("recursive", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sha": "root",
+                "truncated": true,
+                "tree": [{
+                    "path": "Cargo.toml",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": "manifest",
+                    "size": 123
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/git/trees/root"))
+            .and(query_param_is_missing("recursive"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sha": "root",
+                "truncated": false,
+                "tree": [
+                    {
+                        "path": "Cargo.toml",
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": "manifest",
+                        "size": 123
+                    },
+                    {
+                        "path": "crates",
+                        "mode": "040000",
+                        "type": "tree",
+                        "sha": "crates-tree"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/git/trees/crates-tree"))
+            .and(query_param("recursive", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sha": "crates-tree",
+                "truncated": false,
+                "tree": [{
+                    "path": "Cargo.lock",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": "lock",
+                    "size": 456
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server, None);
+        let inventory = client
+            .tree_inventory(
+                &GitHubRepo::new("acme", "widget").unwrap(),
+                "root",
+                GitHubTreeInventoryLimits::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let paths = inventory
+            .tree
+            .iter()
+            .filter(|entry| entry.is_blob())
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(inventory.complete);
+        assert!(inventory.initial_response_truncated);
+        assert_eq!(inventory.requests, 3);
+        assert_eq!(paths, ["Cargo.toml", "crates/Cargo.lock"]);
+    }
+
+    #[tokio::test]
+    async fn tree_inventory_direct_splits_a_recursively_truncated_child() {
+        let server = MockServer::start().await;
+        mount_truncated_root_with_child(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/git/trees/child"))
+            .and(query_param("recursive", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sha": "child",
+                "truncated": true,
+                "tree": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/git/trees/child"))
+            .and(query_param_is_missing("recursive"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sha": "child",
+                "truncated": false,
+                "tree": [{
+                    "path": "Cargo.lock",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": "lock",
+                    "size": 456
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server, None);
+        let inventory = client
+            .tree_inventory(
+                &GitHubRepo::new("acme", "widget").unwrap(),
+                "root",
+                GitHubTreeInventoryLimits::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(inventory.initial_response_truncated);
+        assert!(inventory.complete);
+        assert_eq!(inventory.requests, 4);
+        assert!(
+            inventory
+                .tree
+                .iter()
+                .any(|entry| entry.path == "nested/Cargo.lock")
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_inventory_request_cap_preserves_observed_entries_as_partial() {
+        let server = MockServer::start().await;
+        mount_truncated_root_with_child(&server).await;
+
+        let client = test_client(&server, None);
+        let inventory = client
+            .tree_inventory(
+                &GitHubRepo::new("acme", "widget").unwrap(),
+                "root",
+                GitHubTreeInventoryLimits {
+                    max_requests: 2,
+                    ..GitHubTreeInventoryLimits::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!inventory.complete);
+        assert_eq!(inventory.requests, 2);
+        assert!(
+            inventory
+                .tree
+                .iter()
+                .any(|entry| entry.path == "Cargo.toml")
+        );
+        assert!(
+            inventory
+                .limitations
+                .iter()
+                .any(|item| item.code == "github_tree_recovery_request_limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_inventory_subtree_failure_preserves_observed_entries_as_partial() {
+        let server = MockServer::start().await;
+        mount_truncated_root_with_child(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/git/trees/child"))
+            .and(query_param("recursive", "1"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "message": "not found"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server, None);
+        let inventory = client
+            .tree_inventory(
+                &GitHubRepo::new("acme", "widget").unwrap(),
+                "root",
+                GitHubTreeInventoryLimits::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!inventory.complete);
+        assert_eq!(inventory.requests, 3);
+        assert!(
+            inventory
+                .tree
+                .iter()
+                .any(|entry| entry.path == "Cargo.toml")
+        );
+        assert!(
+            inventory
+                .limitations
+                .iter()
+                .any(|item| item.code == "github_subtree_fetch_failed")
+        );
+    }
+
+    async fn mount_truncated_root_with_child(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/git/trees/root"))
+            .and(query_param("recursive", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sha": "root",
+                "truncated": true,
+                "tree": [{
+                    "path": "Cargo.toml",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": "manifest",
+                    "size": 123
+                }]
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget/git/trees/root"))
+            .and(query_param_is_missing("recursive"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sha": "root",
+                "truncated": false,
+                "tree": [
+                    {
+                        "path": "Cargo.toml",
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": "manifest",
+                        "size": 123
+                    },
+                    {
+                        "path": "nested",
+                        "mode": "040000",
+                        "type": "tree",
+                        "sha": "child"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
     }
 
     #[tokio::test]

@@ -1,17 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use anyhow::{Result, bail};
-use futures::{StreamExt, stream};
-use semver::Version;
-
 use crate::{
     cargo_evidence::evaluate_cargo_requirement,
     cli::{DependencyKind, OptionalFilter, RequirementFilter},
-    crates_io::ReverseDependencyCandidate,
+    crates_io::{CrateVersionCatalog, ReverseDependencyCandidate},
     github::{GitHubClient, GitHubRepo, GitHubRepository, RepositoryScope, parse_github_repo},
+    version_selector::{VersionSelector, evaluate_requirement_intersection},
 };
+use anyhow::{Result, bail};
+use futures::{StreamExt, stream};
 
-use super::{REPOSITORY_RESOLUTION_OVERSCAN_FACTOR, ScanOptions, ScanSummary};
+use super::{
+    REPOSITORY_RESOLUTION_OVERSCAN_FACTOR, RangeRequirementCache, ScanOptions, ScanSummary,
+};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct CandidateGroup {
@@ -91,6 +92,8 @@ impl ResolutionAccumulator {
 pub(super) fn filter_candidate(
     mut candidate: ReverseDependencyCandidate,
     options: &ScanOptions,
+    catalog: Option<&CrateVersionCatalog>,
+    range_cache: Option<&RangeRequirementCache>,
 ) -> Option<ReverseDependencyCandidate> {
     if candidate.dependent_yanked {
         return None;
@@ -105,17 +108,48 @@ pub(super) fn filter_candidate(
         return enrichment_unknown.then_some(candidate);
     }
 
-    let requirement_matches = match options.requirement_filter {
-        RequirementFilter::Any => true,
-        RequirementFilter::Accepts => candidate.declarations.iter().any(|declaration| {
-            evaluate_cargo_requirement(&declaration.req, &options.version).accepts == Some(true)
-        }),
-        RequirementFilter::Exact => candidate.declarations.iter().any(|declaration| {
-            evaluate_cargo_requirement(&declaration.req, &options.version).explicit_exact_pin
-                == Some(true)
-        }),
+    let mut requirement_unknown = false;
+    let requirement_matches = match (&options.version_selector, options.requirement_filter) {
+        (_, RequirementFilter::Any) => true,
+        (VersionSelector::Exact(version), RequirementFilter::Accepts) => {
+            candidate.declarations.iter().any(|declaration| {
+                evaluate_cargo_requirement(&declaration.req, version).accepts == Some(true)
+            })
+        }
+        (VersionSelector::Exact(version), RequirementFilter::Exact) => {
+            candidate.declarations.iter().any(|declaration| {
+                evaluate_cargo_requirement(&declaration.req, version).explicit_exact_pin
+                    == Some(true)
+            })
+        }
+        (selector @ VersionSelector::Range(_), filter) => {
+            let published = catalog
+                .expect("range scans fetch the version catalog before discovery")
+                .versions
+                .as_slice();
+            candidate.declarations.iter().any(|declaration| {
+                let evaluation = if let Some(cache) = range_cache {
+                    cache.evaluate(&declaration.req, selector, published)
+                } else {
+                    evaluate_requirement_intersection(&declaration.req, selector, published)
+                };
+                let matches = match filter {
+                    RequirementFilter::Accepts => evaluation.intersects,
+                    RequirementFilter::Exact => {
+                        if evaluation.error.is_some() {
+                            None
+                        } else {
+                            Some(evaluation.pin_matches_selector == Some(true))
+                        }
+                    }
+                    RequirementFilter::Any => Some(true),
+                };
+                requirement_unknown |= matches.is_none();
+                matches == Some(true)
+            })
+        }
     };
-    (requirement_matches || enrichment_unknown).then_some(candidate)
+    (requirement_matches || requirement_unknown || enrichment_unknown).then_some(candidate)
 }
 
 fn dependency_kind_selected(kind: &str, selected: &[DependencyKind]) -> bool {
@@ -180,7 +214,7 @@ pub(super) fn add_published_candidate(
 pub(super) async fn add_github_code_candidates(
     github: &GitHubClient,
     target_crate: &str,
-    target_version: &Version,
+    target_selector: &VersionSelector,
     limit: usize,
     groups: &mut BTreeMap<String, CandidateGroup>,
     summary: &mut ScanSummary,
@@ -189,7 +223,7 @@ pub(super) async fn add_github_code_candidates(
     if !github.is_authenticated() {
         bail!("--discovery github-code/both requires GITHUB_APP_TOKEN, GITHUB_TOKEN, or GH_TOKEN");
     }
-    let queries = github_code_queries(target_crate, target_version, scope);
+    let queries = github_code_queries(target_crate, target_selector, scope);
 
     for (query, exact_name, source) in queries {
         let result = match github.search_code(&query, limit).await {
@@ -239,16 +273,20 @@ pub(super) async fn add_github_code_candidates(
 
 pub(super) fn github_code_queries(
     target_crate: &str,
-    target_version: &Version,
+    target_selector: &VersionSelector,
     scope: RepositoryScope,
 ) -> [(String, &'static str, &'static str); 2] {
     let visibility = match scope {
         RepositoryScope::PublicOnly => " is:public",
         RepositoryScope::AllVisible => "",
     };
+    let lock_terms = match target_selector {
+        VersionSelector::Exact(version) => format!("{target_crate} {version}"),
+        VersionSelector::Range(_) => target_crate.to_owned(),
+    };
     [
         (
-            format!("{target_crate} {target_version} filename:Cargo.lock{visibility}"),
+            format!("{lock_terms} filename:Cargo.lock{visibility}"),
             "Cargo.lock",
             "github_rest_code_search_lock_seed",
         ),

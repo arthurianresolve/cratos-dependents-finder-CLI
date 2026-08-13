@@ -4,17 +4,18 @@ use serde::Serialize;
 
 use crate::{
     cargo_evidence::{
-        CargoLockEvidence, MsrvSource, RecordedRelation, aggregate_os_support,
-        evaluate_cargo_requirement,
+        CargoLockEvidence, CargoLockRangeEvidence, MsrvSource, RecordedRelation,
+        aggregate_os_support, aggregate_os_support_from_targets, evaluate_cargo_requirement,
     },
     crates_io::{DependencyDeclaration, ReverseDependencyCandidate},
     evidence::EvidenceStrengthV1,
     github::{GitHubHead, GitHubRepo, GitHubRepository},
     output::csv_safe,
+    version_selector::VersionSelector,
 };
 
 use super::{
-    CandidateGroup, CsvRow, ManifestScan, REPOSITORY_MATCHED_FILE_BYTE_BUDGET,
+    CandidateGroup, CsvRow, ManifestAnalysis, ManifestScan, REPOSITORY_MATCHED_FILE_BYTE_BUDGET,
     REPOSITORY_MATCHED_FILE_LIMIT, RunContext,
 };
 
@@ -26,14 +27,11 @@ use super::{
 /// per-lockfile clones.
 pub(super) struct RepositoryEvidence<'a> {
     pub(super) tree_truncated: bool,
+    pub(super) tree_inventory_complete: bool,
     pub(super) manifest_scan: &'a ManifestScan,
     pub(super) enrichment_partial: bool,
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "keeping parsed lock evidence inline avoids a heap allocation per lockfile"
-)]
 pub(super) enum LockEvidence {
     Unclassified {
         status: &'static str,
@@ -41,12 +39,14 @@ pub(super) enum LockEvidence {
         message: String,
     },
     Parsed(CargoLockEvidence),
+    ParsedRange(CargoLockRangeEvidence),
 }
 
 #[derive(Default)]
 pub(super) struct LockProjection {
     pub(super) parsed: bool,
     pub(super) exact_occurrences: usize,
+    pub(super) matching_occurrences: usize,
     pub(super) confirmed: bool,
     pub(super) partial: bool,
 }
@@ -65,18 +65,56 @@ struct PublishedDeclarationCell {
     target: Option<String>,
     registry: Option<String>,
     enrichment_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requirement_intersects: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intersection_witness: Option<crate::version_selector::PublishedVersionV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exact_pin_matches_selector: Option<bool>,
 }
 
 pub(super) fn apply_tree_and_manifest(
     row: &mut CsvRow,
     tree_truncated: bool,
+    tree_inventory_complete: bool,
     manifest_scan: &ManifestScan,
     enrichment_partial: bool,
 ) {
     row.tree_truncated = tree_truncated.to_string();
+    row.tree_inventory_complete = tree_inventory_complete.to_string();
     row.manifest_paths_json = json_cell(&manifest_scan.paths);
-    row.current_direct_requirements_json = json_cell(&manifest_scan.evidence.declarations);
-    row.current_direct_status = if !manifest_scan.evidence.declarations.is_empty() {
+    let (
+        declarations_present,
+        declarations_json,
+        effective_msrv,
+        effective_msrv_source,
+        msrv_observations_json,
+        os_support,
+    ) = match &manifest_scan.evidence {
+        ManifestAnalysis::Exact(evidence) => (
+            !evidence.declarations.is_empty(),
+            json_cell(&evidence.declarations),
+            evidence.effective_msrv.clone(),
+            evidence.effective_msrv_source,
+            json_cell(&evidence.msrv_observations),
+            aggregate_os_support(&evidence.declarations),
+        ),
+        ManifestAnalysis::Range(evidence) => (
+            !evidence.declarations.is_empty(),
+            json_cell(&evidence.declarations),
+            evidence.effective_msrv.clone(),
+            evidence.effective_msrv_source,
+            json_cell(&evidence.msrv_observations),
+            aggregate_os_support_from_targets(
+                evidence
+                    .declarations
+                    .iter()
+                    .map(|declaration| declaration.target.as_deref()),
+            ),
+        ),
+    };
+    row.current_direct_requirements_json = declarations_json;
+    row.current_direct_status = if declarations_present {
         "present"
     } else if manifest_scan.complete {
         "absent"
@@ -85,33 +123,25 @@ pub(super) fn apply_tree_and_manifest(
     }
     .to_owned();
 
-    row.msrv_effective = manifest_scan
-        .evidence
-        .effective_msrv
-        .clone()
+    row.msrv_effective = effective_msrv
         .or_else(|| manifest_scan.complete.then(|| "not_declared".to_owned()))
         .unwrap_or_else(|| "unknown".to_owned());
-    row.msrv_source = match (
-        manifest_scan.evidence.effective_msrv_source,
-        manifest_scan.complete,
-    ) {
+    row.msrv_source = match (effective_msrv_source, manifest_scan.complete) {
         (MsrvSource::PackageField, _) => "package_field",
         (MsrvSource::WorkspaceInherited, _) => "workspace_inherited",
         (MsrvSource::NotDeclared, true) => "not_declared",
         (MsrvSource::NotDeclared, false) => "unknown",
     }
     .to_owned();
-    row.msrv_observations_json = json_cell(&manifest_scan.evidence.msrv_observations);
+    row.msrv_observations_json = msrv_observations_json;
 
-    let os_support = aggregate_os_support(&manifest_scan.evidence.declarations);
     row.os_observed_targets_json = json_cell(&os_support.observed_targets);
-    row.os_has_unconditional_declaration =
-        if manifest_scan.evidence.declarations.is_empty() && !manifest_scan.complete {
-            "unknown".to_owned()
-        } else {
-            os_support.has_unconditional_declaration.to_string()
-        };
-    row.evidence_strength = if !manifest_scan.evidence.declarations.is_empty() {
+    row.os_has_unconditional_declaration = if !declarations_present && !manifest_scan.complete {
+        "unknown".to_owned()
+    } else {
+        os_support.has_unconditional_declaration.to_string()
+    };
+    row.evidence_strength = if declarations_present {
         "current_direct_declaration"
     } else if row.published_direct_status == "present" {
         "published_direct_declaration"
@@ -120,11 +150,11 @@ pub(super) fn apply_tree_and_manifest(
     }
     .to_owned();
 
-    if tree_truncated {
+    if !tree_inventory_complete {
         append_error(
             row,
-            "tree_truncated",
-            "GitHub recursive tree was truncated; file absence is not proven",
+            "tree_inventory_incomplete",
+            "GitHub tree inventory was incomplete; file absence is not proven",
         );
     }
     if !manifest_scan.complete {
@@ -155,6 +185,7 @@ pub(super) fn repository_row_for_evidence(
     apply_tree_and_manifest(
         &mut row,
         evidence.tree_truncated,
+        evidence.tree_inventory_complete,
         evidence.manifest_scan,
         evidence.enrichment_partial,
     );
@@ -173,8 +204,10 @@ pub(super) fn project_lock_evidence(
             message,
         } => {
             row.lock_status = status.to_owned();
-            row.exact_resolution_status = "unknown".to_owned();
-            row.recorded_relation = "unknown".to_owned();
+            row.exact_resolution_status = exact_only_state(row, "unknown").to_owned();
+            row.matching_resolution_status = "unknown".to_owned();
+            row.recorded_relation = exact_only_state(row, "unknown").to_owned();
+            row.matching_recorded_relation = "unknown".to_owned();
             append_error(row, code, &message);
             finalize_completeness(row, true);
             LockProjection {
@@ -203,6 +236,18 @@ pub(super) fn project_lock_evidence(
             row.exact_occurrence_count = evidence.exact_occurrences;
             row.exact_crates_io_occurrence_count = evidence.exact_crates_io_occurrences;
             row.recorded_relation = relation_name(evidence.recorded_relation).to_owned();
+            row.matching_resolution_status = row.exact_resolution_status.clone();
+            row.matching_occurrence_count = evidence.exact_occurrences;
+            row.matching_crates_io_occurrence_count = evidence.exact_crates_io_occurrences;
+            row.matching_resolved_versions_json = if evidence.exact_occurrences > 0 {
+                json_cell(std::slice::from_ref(&evidence.target_version))
+            } else {
+                "[]".to_owned()
+            };
+            row.matching_recorded_relation = row.recorded_relation.clone();
+            row.matching_direct_relation_witness_json = row.direct_relation_witness_json.clone();
+            row.matching_transitive_relation_witness_json =
+                row.transitive_relation_witness_json.clone();
             row.shortest_dependency_depth = evidence
                 .shortest_depth
                 .map(|depth| depth.to_string())
@@ -223,9 +268,71 @@ pub(super) fn project_lock_evidence(
             LockProjection {
                 parsed: true,
                 exact_occurrences: evidence.exact_occurrences,
+                matching_occurrences: evidence.exact_occurrences,
                 confirmed: evidence.exact_occurrences > 0
                     && relation_confirms_dependency(evidence.recorded_relation),
                 partial: graph_partial,
+            }
+        }
+        LockEvidence::ParsedRange(evidence) => {
+            row.lock_status = "parsed".to_owned();
+            row.resolved_target_versions_json = json_cell(&evidence.resolved_versions);
+            row.resolved_target_sources_json = json_cell(&evidence.occurrences);
+            row.exact_resolution_status = "not_applicable".to_owned();
+            row.exact_occurrence_count = 0;
+            row.exact_crates_io_occurrence_count = 0;
+            row.matching_resolution_status = if evidence.matching_occurrence_count > 0 {
+                "present"
+            } else {
+                "absent"
+            }
+            .to_owned();
+            row.matching_occurrence_count = evidence.matching_occurrence_count;
+            row.matching_crates_io_occurrence_count = evidence.matching_crates_io_occurrences;
+            row.matching_resolved_versions_json = json_cell(&evidence.matching_versions);
+            row.range_matching_resolutions_json = json_cell(&evidence.matching_resolutions);
+            row.recorded_relation = "not_applicable".to_owned();
+            row.matching_recorded_relation = relation_name(evidence.recorded_relation).to_owned();
+            row.shortest_dependency_depth.clear();
+            row.direct_relation_witness_json = "null".to_owned();
+            row.transitive_relation_witness_json = "null".to_owned();
+            row.matching_direct_relation_witness_json = json_cell(&evidence.direct_witness);
+            row.matching_transitive_relation_witness_json = json_cell(&evidence.transitive_witness);
+            row.evidence_strength = if evidence.matching_occurrence_count > 0
+                && relation_confirms_dependency(evidence.recorded_relation)
+            {
+                "verified_matching_graph"
+            } else if evidence.matching_occurrence_count > 0 {
+                "matching_present_unclassified"
+            } else if row.current_direct_status == "present" {
+                "current_direct_declaration"
+            } else if row.published_direct_status == "present" {
+                "published_direct_declaration"
+            } else {
+                "discovery_only"
+            }
+            .to_owned();
+
+            let graph_partial =
+                evidence.matching_occurrence_count > 0 && !evidence.graph_analysis_complete;
+            if graph_partial {
+                append_error(
+                    row,
+                    "lock_graph_unclassified",
+                    evidence
+                        .graph_diagnostic
+                        .as_deref()
+                        .unwrap_or("lock graph could not be classified"),
+                );
+            }
+            finalize_completeness(row, repository_baseline_partial || graph_partial);
+            LockProjection {
+                parsed: true,
+                matching_occurrences: evidence.matching_occurrence_count,
+                confirmed: evidence.matching_occurrence_count > 0
+                    && relation_confirms_dependency(evidence.recorded_relation),
+                partial: graph_partial,
+                ..LockProjection::default()
             }
         }
     }
@@ -249,8 +356,16 @@ pub(super) fn finalize_completeness(row: &mut CsvRow, partial: bool) {
     if row.exact_occurrence_count > 0 {
         reasons.push("exact_lockfile_occurrence");
     }
+    if row.target_selector_kind == "range" && row.matching_occurrence_count > 0 {
+        reasons.push("matching_lockfile_occurrence");
+    }
+    let selected_relation = if row.target_selector_kind == "range" {
+        row.matching_recorded_relation.as_str()
+    } else {
+        row.recorded_relation.as_str()
+    };
     if matches!(
-        row.recorded_relation.as_str(),
+        selected_relation,
         "recorded_direct" | "recorded_transitive" | "recorded_direct_and_transitive"
     ) {
         reasons.push("recorded_dependency_path");
@@ -273,7 +388,7 @@ pub(super) fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
             candidate
                 .declarations
                 .iter()
-                .map(|declaration| published_cell(candidate, declaration))
+                .map(|declaration| published_cell(context, candidate, declaration))
         })
         .collect::<Vec<_>>();
     declarations.sort_by(|left, right| {
@@ -322,24 +437,41 @@ pub(super) fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
         .published
         .iter()
         .any(|candidate| candidate.declaration_enrichment_error.is_some());
-    let requirement_evaluations = declarations
-        .iter()
-        .map(|declaration| {
-            evaluate_cargo_requirement(&declaration.requirement, &context.target_version)
-        })
-        .collect::<Vec<_>>();
-    let accepts = tri_state(
-        requirement_evaluations
-            .iter()
-            .map(|evaluation| evaluation.accepts),
-        enrichment_unknown,
-    );
-    let exact_pin = tri_state(
-        requirement_evaluations
-            .iter()
-            .map(|evaluation| evaluation.explicit_exact_pin),
-        enrichment_unknown,
-    );
+    let (accepts, exact_pin, intersects, pin_matches_selector) = match &context.version_selector {
+        VersionSelector::Exact(version) => {
+            let evaluations = declarations
+                .iter()
+                .map(|declaration| evaluate_cargo_requirement(&declaration.requirement, version))
+                .collect::<Vec<_>>();
+            let accepts = tri_state(
+                evaluations.iter().map(|evaluation| evaluation.accepts),
+                enrichment_unknown,
+            );
+            let exact_pin = tri_state(
+                evaluations
+                    .iter()
+                    .map(|evaluation| evaluation.explicit_exact_pin),
+                enrichment_unknown,
+            );
+            (accepts.clone(), exact_pin.clone(), accepts, exact_pin)
+        }
+        VersionSelector::Range(_) => (
+            "not_applicable".to_owned(),
+            "not_applicable".to_owned(),
+            tri_state(
+                declarations
+                    .iter()
+                    .map(|declaration| declaration.requirement_intersects),
+                enrichment_unknown,
+            ),
+            tri_state(
+                declarations
+                    .iter()
+                    .map(|declaration| declaration.exact_pin_matches_selector),
+                enrichment_unknown,
+            ),
+        ),
+    };
     let observed_optional = declarations.iter().any(|declaration| declaration.optional);
     let observed_required = declarations.iter().any(|declaration| !declaration.optional);
     let optional_declarations = if declarations.is_empty()
@@ -358,7 +490,10 @@ pub(super) fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
         observed_at_utc: context.observed_at.to_rfc3339(),
         input_query: context.input_query.clone(),
         target_crate: context.target_crate.clone(),
-        target_version: context.target_version.to_string(),
+        target_version: context
+            .exact_version()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
         target_repository_url: context.target_repository_url.clone().unwrap_or_default(),
         globally_exhaustive: context.globally_exhaustive,
         candidate_scope: context.candidate_scope.clone(),
@@ -413,7 +548,11 @@ pub(super) fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
         lock_status: "unknown".to_owned(),
         resolved_target_versions_json: "[]".to_owned(),
         resolved_target_sources_json: "[]".to_owned(),
-        exact_resolution_status: "unknown".to_owned(),
+        exact_resolution_status: exact_only_state_for_selector(
+            &context.version_selector,
+            "unknown",
+        )
+        .to_owned(),
         exact_occurrence_count: 0,
         exact_crates_io_occurrence_count: 0,
         manifest_paths_json: "[]".to_owned(),
@@ -424,7 +563,8 @@ pub(super) fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
         msrv_observations_json: "[]".to_owned(),
         os_observed_targets_json: "[]".to_owned(),
         os_has_unconditional_declaration: "unknown".to_owned(),
-        recorded_relation: "unknown".to_owned(),
+        recorded_relation: exact_only_state_for_selector(&context.version_selector, "unknown")
+            .to_owned(),
         shortest_dependency_depth: String::new(),
         direct_relation_witness_json: "null".to_owned(),
         transitive_relation_witness_json: "null".to_owned(),
@@ -441,13 +581,57 @@ pub(super) fn base_row(context: &RunContext, group: &CandidateGroup) -> CsvRow {
         evidence_completeness: "unknown".to_owned(),
         error_code: String::new(),
         error_message: String::new(),
+        csv_schema_version: crate::inventory::csv_schema::CSV_SCHEMA_VERSION,
+        target_selector_kind: match context.version_selector.kind() {
+            crate::version_selector::VersionSelectorKind::Exact => "exact",
+            crate::version_selector::VersionSelectorKind::Range => "range",
+        }
+        .to_owned(),
+        target_version_requirement: context.version_selector.canonical_spec(),
+        target_version_catalog_sha256: context
+            .version_catalog
+            .as_deref()
+            .map(|catalog| catalog.sha256.clone())
+            .unwrap_or_default(),
+        tree_inventory_complete: "unknown".to_owned(),
+        any_requirement_intersects: intersects,
+        any_exact_pin_matches_selector: pin_matches_selector,
+        matching_resolution_status: "unknown".to_owned(),
+        matching_occurrence_count: 0,
+        matching_crates_io_occurrence_count: 0,
+        matching_resolved_versions_json: "[]".to_owned(),
+        range_matching_resolutions_json: "[]".to_owned(),
+        matching_recorded_relation: "unknown".to_owned(),
+        matching_direct_relation_witness_json: "null".to_owned(),
+        matching_transitive_relation_witness_json: "null".to_owned(),
+    }
+}
+
+fn exact_only_state<'a>(row: &CsvRow, exact_state: &'a str) -> &'a str {
+    if row.target_selector_kind == "range" {
+        "not_applicable"
+    } else {
+        exact_state
+    }
+}
+
+fn exact_only_state_for_selector<'a>(selector: &VersionSelector, exact_state: &'a str) -> &'a str {
+    if matches!(selector, VersionSelector::Range(_)) {
+        "not_applicable"
+    } else {
+        exact_state
     }
 }
 
 fn published_cell(
+    context: &RunContext,
     candidate: &ReverseDependencyCandidate,
     declaration: &DependencyDeclaration,
 ) -> PublishedDeclarationCell {
+    let range_evaluation = match &context.version_selector {
+        VersionSelector::Exact(_) => None,
+        VersionSelector::Range(_) => Some(context.evaluate_range_requirement(&declaration.req)),
+    };
     PublishedDeclarationCell {
         dependent_crate: candidate.dependent_name.clone(),
         dependent_version: candidate.dependent_version.clone(),
@@ -461,6 +645,19 @@ fn published_cell(
         target: declaration.target.clone(),
         registry: declaration.registry.clone(),
         enrichment_error: candidate.declaration_enrichment_error.clone(),
+        requirement_intersects: range_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.intersects),
+        intersection_witness: range_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.witness.clone()),
+        exact_pin_matches_selector: range_evaluation.and_then(|evaluation| {
+            if evaluation.error.is_some() {
+                None
+            } else {
+                Some(evaluation.pin_matches_selector == Some(true))
+            }
+        }),
     }
 }
 
@@ -546,7 +743,7 @@ fn evidence_strength_name(strength: EvidenceStrengthV1) -> &'static str {
     }
 }
 
-pub(super) fn json_cell<T: Serialize>(value: &T) -> String {
+pub(super) fn json_cell<T: Serialize + ?Sized>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|error| {
         serde_json::to_string(&format!("serialization error: {error}"))
             .unwrap_or_else(|_| "\"serialization error\"".to_owned())
@@ -566,6 +763,7 @@ pub(super) fn sanitize_row(mut row: CsvRow) -> CsvRow {
     row.input_query = csv_safe(row.input_query);
     row.target_crate = csv_safe(row.target_crate);
     row.target_version = csv_safe(row.target_version);
+    row.target_version_requirement = csv_safe(row.target_version_requirement);
     row.target_repository_url = csv_safe(row.target_repository_url);
     row.repository_url = csv_safe(row.repository_url);
     row.github_full_name = csv_safe(row.github_full_name);
@@ -579,4 +777,41 @@ pub(super) fn sanitize_row(mut row: CsvRow) -> CsvRow {
     row.error_code = csv_safe(row.error_code);
     row.error_message = csv_safe(row.error_message);
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cargo_evidence::{ManifestEvidence, MsrvSource};
+    use semver::Version;
+
+    #[test]
+    fn recovered_initial_truncation_is_not_projected_as_partial() {
+        let manifest_scan = ManifestScan {
+            evidence: ManifestAnalysis::Exact(ManifestEvidence {
+                target_name: "fs2".to_owned(),
+                target_version: Version::new(0, 4, 3),
+                manifests_supplied: 0,
+                manifests_parsed: 0,
+                declarations: Vec::new(),
+                diagnostics: Vec::new(),
+                analysis_complete: true,
+                msrv_observations: Vec::new(),
+                effective_msrv: None,
+                effective_msrv_source: MsrvSource::NotDeclared,
+            }),
+            paths: Vec::new(),
+            complete: true,
+            diagnostics: Vec::new(),
+        };
+        let mut row = CsvRow::default();
+
+        apply_tree_and_manifest(&mut row, true, true, &manifest_scan, false);
+        finalize_completeness(&mut row, false);
+
+        assert_eq!(row.tree_truncated, "true");
+        assert_eq!(row.tree_inventory_complete, "true");
+        assert_eq!(row.inventory_status, "complete");
+        assert!(row.error_code.is_empty());
+    }
 }

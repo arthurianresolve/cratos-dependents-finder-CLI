@@ -24,7 +24,7 @@ use crate::{
     },
     github::{
         GitHubClient, GitHubHead, GitHubRepo, GitHubRepository, GitHubTreeEntry,
-        RepositoryVisibility,
+        GitHubTreeInventoryLimits, RepositoryVisibility,
     },
     secure_cache::sha256_hex,
 };
@@ -35,7 +35,7 @@ const DEFAULT_REPOSITORY_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Bump when repository analysis semantics or the derived evidence schema
 /// changes. This value is part of every durable reuse fingerprint.
-pub const REPOSITORY_ANALYZER_VERSION: &str = "cargo-repository-v1";
+pub const REPOSITORY_ANALYZER_VERSION: &str = "cargo-repository-v2";
 const EVIDENCE_PROFILE: &str = "cargo-evidence-v1-full-graph-msrv-targets";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +44,9 @@ pub struct RepositoryAnalyzerBounds {
     pub file_bytes: u64,
     pub repository_bytes: u64,
     pub concurrent_requests: usize,
+    pub tree_request_limit: usize,
+    pub tree_entry_limit: usize,
+    pub tree_depth_limit: usize,
 }
 
 /// The current canonical repository identity and immutable default-branch
@@ -60,6 +63,9 @@ struct SemanticBounds {
     file_limit: usize,
     file_bytes: u64,
     repository_bytes: u64,
+    tree_request_limit: usize,
+    tree_entry_limit: usize,
+    tree_depth_limit: usize,
 }
 
 #[derive(Serialize)]
@@ -70,11 +76,15 @@ struct TargetFingerprint<'a> {
 
 impl Default for RepositoryAnalyzerBounds {
     fn default() -> Self {
+        let tree = GitHubTreeInventoryLimits::default();
         Self {
             file_limit: DEFAULT_FILE_LIMIT,
             file_bytes: DEFAULT_FILE_BYTES,
             repository_bytes: DEFAULT_REPOSITORY_BYTES,
             concurrent_requests: 4,
+            tree_request_limit: tree.max_requests,
+            tree_entry_limit: tree.max_entries,
+            tree_depth_limit: tree.max_depth,
         }
     }
 }
@@ -93,6 +103,18 @@ impl RepositoryAnalyzerBounds {
         ensure!(
             self.concurrent_requests > 0,
             "repository request concurrency must be positive"
+        );
+        ensure!(
+            self.tree_request_limit > 0,
+            "Git tree request limit must be positive"
+        );
+        ensure!(
+            self.tree_entry_limit > 0,
+            "Git tree entry limit must be positive"
+        );
+        ensure!(
+            self.tree_depth_limit > 0,
+            "Git tree depth limit must be positive"
         );
         Ok(self)
     }
@@ -156,7 +178,22 @@ pub async fn analyze_repository_snapshot(
     let repository = &snapshot.repository;
     let head = &snapshot.head;
     let repo = repository.repo();
-    let tree = github.recursive_tree(&repo, &head.tree_sha).await?;
+    let tree = github
+        .tree_inventory(
+            &repo,
+            &head.tree_sha,
+            GitHubTreeInventoryLimits {
+                max_requests: bounds.tree_request_limit,
+                max_entries: bounds.tree_entry_limit,
+                max_depth: bounds.tree_depth_limit,
+                max_in_flight: bounds.concurrent_requests,
+                ..GitHubTreeInventoryLimits::default()
+            },
+            None,
+        )
+        .await?;
+    let tree_complete = tree.complete;
+    let tree_limitations = tree.limitations;
 
     let mut entries = tree
         .tree
@@ -165,13 +202,10 @@ pub async fn analyze_repository_snapshot(
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.path.cmp(&right.path));
 
-    let mut limitations = Vec::new();
-    if tree.truncated {
-        limitations.push(limitation(
-            "github_tree_truncated",
-            "GitHub truncated the recursive tree; missing Cargo files remain unknown",
-        ));
-    }
+    let mut limitations = tree_limitations
+        .iter()
+        .map(|item| limitation(item.code, &item.message))
+        .collect::<Vec<_>>();
     if entries.len() > bounds.file_limit {
         limitations.push(limitation(
             "repository_file_limit",
@@ -234,7 +268,7 @@ pub async fn analyze_repository_snapshot(
         manifest_evidence.effective_msrv.as_deref(),
         &lock_evidence,
         limitations.clone(),
-        !tree.truncated && limitations.is_empty(),
+        tree_complete && limitations.is_empty(),
     );
 
     Ok(EvidenceBundleV1 {
@@ -255,7 +289,7 @@ pub async fn analyze_repository_snapshot(
 
 /// Build the stable key for complete derived-evidence reuse. Request
 /// concurrency is intentionally excluded because it cannot affect evidence;
-/// all semantic byte and file bounds are included.
+/// all semantic analysis and tree-inventory bounds are included.
 pub fn analysis_reuse_fingerprint(
     snapshot: &ResolvedRepositorySnapshot,
     target_name: &str,
@@ -271,6 +305,9 @@ pub fn analysis_reuse_fingerprint(
             file_limit: bounds.file_limit,
             file_bytes: bounds.file_bytes,
             repository_bytes: bounds.repository_bytes,
+            tree_request_limit: bounds.tree_request_limit,
+            tree_entry_limit: bounds.tree_entry_limit,
+            tree_depth_limit: bounds.tree_depth_limit,
         })?,
         target_hash: analysis_target_hash(target_name, target_version)?,
         evidence_profile_hash: analysis_evidence_profile_hash(),
@@ -575,7 +612,8 @@ fn project_repository(
         },
         ExplanationStepV1 {
             kind: ExplanationStepKindV1::ImmutableRevision,
-            statement: "analyzed the immutable default-branch head and recursive tree".to_owned(),
+            statement: "analyzed the immutable default-branch head and bounded tree inventory"
+                .to_owned(),
             reference: Some(EvidenceReferenceV1 {
                 commit_sha: Some(head_sha.to_owned()),
                 tree_sha: Some(tree_sha.to_owned()),

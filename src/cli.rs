@@ -12,6 +12,7 @@ use crate::{
     operations::{AgentArgs, CoordinatorArgs, JobArgs, SlaArgs},
     report,
     resolve::{ResolveOptions, resolve_target},
+    version_selector::VersionSelector,
 };
 
 const PARTIAL_RESULTS_EXIT_CODE: i32 = 4;
@@ -21,7 +22,7 @@ const REQUIRED_MATCH_NOT_FOUND_EXIT_CODE: i32 = 3;
 #[command(
     name = "crate-dependent-repos",
     version,
-    about = "Find published declarations and exact default-branch Cargo.lock resolutions",
+    about = "Find published declarations and selected default-branch Cargo.lock resolutions",
     long_about = "Evidence-oriented inventory of repositories that declare or resolve a Cargo crate version. Results are bounded by public registry and GitHub coverage and are never represented as exhaustive."
 )]
 pub struct Cli {
@@ -167,8 +168,16 @@ struct ScanArgs {
     query: String,
 
     /// Exact version to test in requirements and lockfiles.
-    #[arg(long)]
-    version: semver::Version,
+    #[arg(
+        long,
+        conflicts_with = "version_range",
+        required_unless_present = "version_range"
+    )]
+    version: Option<semver::Version>,
+
+    /// Cargo requirement selecting concrete published and lockfile versions.
+    #[arg(long, conflicts_with = "version", required_unless_present = "version")]
+    version_range: Option<semver::VersionReq>,
 
     /// Select this exact crate when QUERY is a repository or fuzzy name.
     #[arg(long)]
@@ -267,7 +276,7 @@ struct ScanArgs {
     #[arg(long)]
     allow_partial: bool,
 
-    /// Return a non-zero exit when no exact lockfile match is confirmed.
+    /// Return a non-zero exit when no selected lockfile match is confirmed.
     #[arg(long)]
     require_match: bool,
 }
@@ -564,9 +573,14 @@ fn parse_bounded_usize(
 
 impl ScanArgs {
     fn into_options(self, jobs: usize, repository_scope: RepositoryScope) -> ScanOptions {
+        let version_selector = match (self.version, self.version_range) {
+            (Some(version), None) => VersionSelector::exact(version),
+            (None, Some(requirement)) => VersionSelector::range(requirement),
+            _ => unreachable!("clap requires exactly one scan version selector"),
+        };
         ScanOptions {
             query: self.query,
-            version: self.version,
+            version_selector,
             explicit_crate: self.crate_name,
             accept_closest: self.accept_closest,
             requirement_filter: self.requirement_filter,
@@ -619,6 +633,30 @@ mod tests {
             Cli::try_parse_from(["crate-dependent-repos", "scan", "fs2", "--version", "0.4.3"])
                 .unwrap();
         assert!(matches!(scan.command, Command::Scan(_)));
+
+        let range = Cli::try_parse_from([
+            "crate-dependent-repos",
+            "scan",
+            "fs2",
+            "--version-range",
+            "^0.4",
+        ])
+        .unwrap();
+        assert!(matches!(range.command, Command::Scan(_)));
+
+        assert!(
+            Cli::try_parse_from([
+                "crate-dependent-repos",
+                "scan",
+                "fs2",
+                "--version",
+                "0.4.3",
+                "--version-range",
+                "^0.4",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["crate-dependent-repos", "scan", "fs2"]).is_err());
     }
 
     #[test]

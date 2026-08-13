@@ -1,8 +1,8 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::IsTerminal,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, bail};
@@ -14,18 +14,27 @@ use serde::Serialize;
 use tokio::sync::Semaphore;
 
 use crate::{
-    cargo_evidence::ManifestEvidence,
+    cargo_evidence::{ManifestEvidence, RangeManifestEvidence},
     cli::{ActivityFilter, DependencyKind, Discovery, OptionalFilter, RequirementFilter},
-    crates_io::{CratesIoClient, REVERSE_DEPENDENCY_SCOPE},
-    github::{GitHubClient, GitHubTreeEntry, RepositoryScope, RepositoryVisibility},
+    crates_io::{CrateVersionCatalog, CratesIoClient, REVERSE_DEPENDENCY_SCOPE},
+    github::{
+        GitHubClient, GitHubTreeEntry, GitHubTreeInventoryLimits, RepositoryScope,
+        RepositoryVisibility,
+    },
     output::{write_csv, write_json},
     resolve::{ResolveOptions, resolve_target},
+    version_selector::{
+        RequirementRangeEvaluation, VersionSelector, VersionSelectorKind,
+        evaluate_requirement_intersection,
+    },
 };
 
+pub mod csv_schema;
 mod discovery;
 mod evidence_adapter;
 mod projection;
 mod repository;
+pub use csv_schema::CsvRow;
 use discovery::{
     CandidateGroup, ResolvedGroup, add_credential_visible_candidates, add_github_code_candidates,
     add_published_candidate, filter_candidate, resolve_repository_groups,
@@ -49,7 +58,7 @@ const CREDENTIAL_VISIBLE_REPOSITORY_LIMIT: usize = 10_000;
 #[derive(Clone, Debug)]
 pub struct ScanOptions {
     pub query: String,
-    pub version: Version,
+    pub version_selector: VersionSelector,
     pub explicit_crate: Option<String>,
     pub accept_closest: bool,
     pub requirement_filter: RequirementFilter,
@@ -93,6 +102,9 @@ pub struct ScanSummary {
     pub input_query: String,
     pub target_crate: String,
     pub target_version: String,
+    pub target_selector_kind: String,
+    pub target_version_requirement: String,
+    pub target_version_catalog_sha256: String,
     pub globally_exhaustive: bool,
     pub candidate_scope: String,
     pub repository_scope: String,
@@ -119,6 +131,8 @@ pub struct ScanSummary {
     pub lockfiles_parsed: usize,
     pub repositories_exact_confirmed: usize,
     pub exact_occurrences: usize,
+    pub repositories_matching_confirmed: usize,
+    pub matching_occurrences: usize,
     pub matched_cargo_files: usize,
     pub matched_cargo_file_bytes_downloaded: u64,
     pub repositories_file_limit_exceeded: usize,
@@ -136,6 +150,9 @@ pub struct ScanSummary {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ScanPolicy {
+    pub target_selector_kind: String,
+    pub target_version_requirement: String,
+    pub target_version_catalog_sha256: Option<String>,
     pub repository_scope: String,
     pub requirement_filter: String,
     pub discovery: String,
@@ -155,152 +172,16 @@ pub struct ScanPolicy {
     pub repository_matched_file_byte_budget: u64,
     pub repository_byte_budget_priority: String,
     pub repository_resolution_overscan_factor: usize,
+    pub tree_inventory_strategy: String,
+    pub tree_inventory_request_limit: usize,
+    pub tree_inventory_entry_limit: usize,
+    pub tree_inventory_depth_limit: usize,
+    pub tree_inventory_json_byte_limit: u64,
+    pub tree_inventory_path_byte_limit: usize,
+    pub tree_inventory_elapsed_seconds: u64,
     pub jobs: usize,
     pub allow_partial: bool,
     pub require_match: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct CsvRow {
-    pub observed_at_utc: String,
-    pub input_query: String,
-    pub target_crate: String,
-    pub target_version: String,
-    pub target_repository_url: String,
-    pub globally_exhaustive: bool,
-    pub candidate_scope: String,
-    pub repository_scope: String,
-    pub scan_policy_json: String,
-    pub candidate_sources_json: String,
-    pub dependent_crates_json: String,
-    pub dependent_versions_json: String,
-    pub published_requirements_json: String,
-    pub dependency_kinds_json: String,
-    pub dependency_targets_json: String,
-    pub optional_declarations: String,
-    pub published_direct_status: String,
-    pub any_requirement_accepts: String,
-    pub any_exact_pin: String,
-    pub original_repository_urls_json: String,
-    pub repository_url: String,
-    pub github_repository_id: String,
-    pub repository_visibility: String,
-    pub github_full_name: String,
-    pub default_branch: String,
-    pub head_sha: String,
-    pub tree_sha: String,
-    pub head_committed_at: String,
-    pub repo_pushed_at: String,
-    pub archived: String,
-    pub fork: String,
-    pub disabled: String,
-    pub stale: String,
-    pub inventory_status: String,
-    pub tree_truncated: String,
-    pub repository_matched_cargo_file_count: usize,
-    pub repository_matched_file_limit: usize,
-    pub repository_matched_file_bytes_downloaded: u64,
-    pub repository_matched_file_byte_budget: u64,
-    pub cargo_lock_path: String,
-    pub cargo_lock_blob_sha: String,
-    pub lock_status: String,
-    pub resolved_target_versions_json: String,
-    pub resolved_target_sources_json: String,
-    pub exact_resolution_status: String,
-    pub exact_occurrence_count: usize,
-    pub exact_crates_io_occurrence_count: usize,
-    pub manifest_paths_json: String,
-    pub current_direct_status: String,
-    pub current_direct_requirements_json: String,
-    pub msrv_effective: String,
-    pub msrv_source: String,
-    pub msrv_observations_json: String,
-    pub os_observed_targets_json: String,
-    pub os_has_unconditional_declaration: String,
-    pub recorded_relation: String,
-    pub shortest_dependency_depth: String,
-    pub direct_relation_witness_json: String,
-    pub transitive_relation_witness_json: String,
-    pub evidence_strength: String,
-    pub inclusion_reasons_json: String,
-    pub scope_limitations_json: String,
-    pub cache_status: String,
-    pub reused_from_scan_id: String,
-    pub evidence_completeness: String,
-    pub error_code: String,
-    pub error_message: String,
-}
-
-impl CsvRow {
-    pub const HEADERS: &'static [&'static str] = &[
-        "observed_at_utc",
-        "input_query",
-        "target_crate",
-        "target_version",
-        "target_repository_url",
-        "globally_exhaustive",
-        "candidate_scope",
-        "repository_scope",
-        "scan_policy_json",
-        "candidate_sources_json",
-        "dependent_crates_json",
-        "dependent_versions_json",
-        "published_requirements_json",
-        "dependency_kinds_json",
-        "dependency_targets_json",
-        "optional_declarations",
-        "published_direct_status",
-        "any_requirement_accepts",
-        "any_exact_pin",
-        "original_repository_urls_json",
-        "repository_url",
-        "github_repository_id",
-        "repository_visibility",
-        "github_full_name",
-        "default_branch",
-        "head_sha",
-        "tree_sha",
-        "head_committed_at",
-        "repo_pushed_at",
-        "archived",
-        "fork",
-        "disabled",
-        "stale",
-        "inventory_status",
-        "tree_truncated",
-        "repository_matched_cargo_file_count",
-        "repository_matched_file_limit",
-        "repository_matched_file_bytes_downloaded",
-        "repository_matched_file_byte_budget",
-        "cargo_lock_path",
-        "cargo_lock_blob_sha",
-        "lock_status",
-        "resolved_target_versions_json",
-        "resolved_target_sources_json",
-        "exact_resolution_status",
-        "exact_occurrence_count",
-        "exact_crates_io_occurrence_count",
-        "manifest_paths_json",
-        "current_direct_status",
-        "current_direct_requirements_json",
-        "msrv_effective",
-        "msrv_source",
-        "msrv_observations_json",
-        "os_observed_targets_json",
-        "os_has_unconditional_declaration",
-        "recorded_relation",
-        "shortest_dependency_depth",
-        "direct_relation_witness_json",
-        "transitive_relation_witness_json",
-        "evidence_strength",
-        "inclusion_reasons_json",
-        "scope_limitations_json",
-        "cache_status",
-        "reused_from_scan_id",
-        "evidence_completeness",
-        "error_code",
-        "error_message",
-    ];
 }
 
 #[derive(Clone, Debug)]
@@ -308,12 +189,68 @@ struct RunContext {
     observed_at: DateTime<Utc>,
     input_query: String,
     target_crate: String,
-    target_version: Version,
+    version_selector: VersionSelector,
+    version_catalog: Option<Arc<CrateVersionCatalog>>,
+    range_requirement_cache: Arc<RangeRequirementCache>,
     target_repository_url: Option<String>,
     globally_exhaustive: bool,
     candidate_scope: String,
     repository_scope: RepositoryScope,
     scan_policy_json: String,
+}
+
+impl RunContext {
+    fn exact_version(&self) -> Option<&Version> {
+        self.version_selector.as_exact()
+    }
+
+    fn published_versions(&self) -> Option<&[crate::version_selector::PublishedVersionV1]> {
+        self.version_catalog
+            .as_deref()
+            .map(|catalog| catalog.versions.as_slice())
+    }
+
+    fn evaluate_range_requirement(&self, requirement: &str) -> RequirementRangeEvaluation {
+        self.range_requirement_cache.evaluate(
+            requirement,
+            &self.version_selector,
+            self.published_versions()
+                .expect("range scans retain their version catalog"),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct RangeRequirementCache {
+    evaluations: Mutex<HashMap<String, RequirementRangeEvaluation>>,
+}
+
+impl RangeRequirementCache {
+    fn evaluate(
+        &self,
+        requirement: &str,
+        selector: &VersionSelector,
+        published_versions: &[crate::version_selector::PublishedVersionV1],
+    ) -> RequirementRangeEvaluation {
+        if let Some(evaluation) = self
+            .evaluations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(requirement)
+            .cloned()
+        {
+            return evaluation;
+        }
+
+        let evaluation =
+            evaluate_requirement_intersection(requirement, selector, published_versions);
+        self.evaluations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(requirement.to_owned())
+            .or_insert_with(|| evaluation.clone())
+            .clone()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -329,6 +266,8 @@ struct InspectionResult {
     lockfiles_parsed: usize,
     exact_occurrences: usize,
     exact_confirmed_repositories: usize,
+    matching_occurrences: usize,
+    matching_confirmed_repositories: usize,
     matched_cargo_files: usize,
     matched_cargo_file_bytes_downloaded: u64,
     file_limit_exceeded: usize,
@@ -348,6 +287,8 @@ impl InspectionResult {
         self.lockfiles_parsed += other.lockfiles_parsed;
         self.exact_occurrences += other.exact_occurrences;
         self.exact_confirmed_repositories += other.exact_confirmed_repositories;
+        self.matching_occurrences += other.matching_occurrences;
+        self.matching_confirmed_repositories += other.matching_confirmed_repositories;
         self.matched_cargo_files += other.matched_cargo_files;
         self.matched_cargo_file_bytes_downloaded += other.matched_cargo_file_bytes_downloaded;
         self.file_limit_exceeded += other.file_limit_exceeded;
@@ -378,9 +319,7 @@ impl ScanAccumulator {
         let mut row = base_row(context, group);
         row.inventory_status = "unsupported_repository".to_owned();
         row.lock_status = "not_scanned".to_owned();
-        row.exact_resolution_status = "unknown".to_owned();
         row.current_direct_status = "unknown".to_owned();
-        row.recorded_relation = "unknown".to_owned();
         row.evidence_completeness = "unavailable".to_owned();
         row.error_code = "unsupported_repository".to_owned();
         row.error_message = group
@@ -401,9 +340,7 @@ impl ScanAccumulator {
         let mut row = base_row(context, group);
         row.inventory_status = "failed".to_owned();
         row.lock_status = "not_scanned".to_owned();
-        row.exact_resolution_status = "unknown".to_owned();
         row.current_direct_status = "unknown".to_owned();
-        row.recorded_relation = "unknown".to_owned();
         row.evidence_completeness = "failed".to_owned();
         row.error_code = "repository_resolution_failed".to_owned();
         row.error_message = format!("{error:#}");
@@ -420,12 +357,14 @@ impl ScanAccumulator {
         self.summary.lockfiles_found = aggregate.lockfiles_found;
         self.summary.lockfiles_parsed = aggregate.lockfiles_parsed;
         self.summary.exact_occurrences = aggregate.exact_occurrences;
+        self.summary.matching_occurrences = aggregate.matching_occurrences;
         self.summary.matched_cargo_files = aggregate.matched_cargo_files;
         self.summary.matched_cargo_file_bytes_downloaded =
             aggregate.matched_cargo_file_bytes_downloaded;
         self.summary.repositories_file_limit_exceeded = aggregate.file_limit_exceeded;
         self.summary.repositories_byte_budget_exceeded = aggregate.byte_budget_exceeded;
         self.summary.repositories_exact_confirmed = aggregate.exact_confirmed_repositories;
+        self.summary.repositories_matching_confirmed = aggregate.matching_confirmed_repositories;
         self.summary.partial |= self.summary.repositories_partial > 0
             || self.summary.repositories_failed > 0
             || self.summary.repository_resolution_budget_exhausted
@@ -453,16 +392,39 @@ impl ScanAccumulator {
 
 #[derive(Debug)]
 struct ManifestScan {
-    evidence: ManifestEvidence,
+    evidence: ManifestAnalysis,
     paths: Vec<String>,
     complete: bool,
     diagnostics: Vec<String>,
 }
 
+#[derive(Debug)]
+enum ManifestAnalysis {
+    Exact(ManifestEvidence),
+    Range(RangeManifestEvidence),
+}
+
+impl ManifestAnalysis {
+    fn analysis_complete(&self) -> bool {
+        match self {
+            Self::Exact(evidence) => evidence.analysis_complete,
+            Self::Range(evidence) => evidence.analysis_complete,
+        }
+    }
+
+    fn diagnostics(&self) -> &[crate::cargo_evidence::ManifestDiagnostic] {
+        match self {
+            Self::Exact(evidence) => &evidence.diagnostics,
+            Self::Range(evidence) => &evidence.diagnostics,
+        }
+    }
+}
+
 struct ManifestScanConfig<'a> {
     selected_count: usize,
     target_crate: &'a str,
-    target_version: &'a Version,
+    version_selector: &'a VersionSelector,
+    published_versions: Option<&'a [crate::version_selector::PublishedVersionV1]>,
     max_file_bytes: u64,
     tree_complete: bool,
     byte_ceiling: u64,
@@ -563,8 +525,13 @@ fn candidate_scope(discovery: Discovery, repository_scope: RepositoryScope) -> S
     }
 }
 
-fn scan_policy(options: &ScanOptions) -> ScanPolicy {
+fn scan_policy(options: &ScanOptions, catalog: Option<&CrateVersionCatalog>) -> ScanPolicy {
+    let tree = GitHubTreeInventoryLimits::default();
     ScanPolicy {
+        target_selector_kind: version_selector_kind_name(options.version_selector.kind())
+            .to_owned(),
+        target_version_requirement: options.version_selector.canonical_spec(),
+        target_version_catalog_sha256: catalog.map(|catalog| catalog.sha256.clone()),
         repository_scope: options.repository_scope.as_str().to_owned(),
         requirement_filter: requirement_filter_name(options.requirement_filter).to_owned(),
         discovery: discovery_name(options.discovery).to_owned(),
@@ -588,9 +555,23 @@ fn scan_policy(options: &ScanOptions) -> ScanPolicy {
         repository_matched_file_byte_budget: REPOSITORY_MATCHED_FILE_BYTE_BUDGET,
         repository_byte_budget_priority: "Cargo.lock before Cargo.toml".to_owned(),
         repository_resolution_overscan_factor: REPOSITORY_RESOLUTION_OVERSCAN_FACTOR,
+        tree_inventory_strategy: "recursive_then_adaptive_subtree_split".to_owned(),
+        tree_inventory_request_limit: tree.max_requests,
+        tree_inventory_entry_limit: tree.max_entries,
+        tree_inventory_depth_limit: tree.max_depth,
+        tree_inventory_json_byte_limit: tree.max_json_bytes,
+        tree_inventory_path_byte_limit: tree.max_path_bytes,
+        tree_inventory_elapsed_seconds: tree.max_elapsed.as_secs(),
         jobs: options.jobs,
         allow_partial: options.allow_partial,
         require_match: options.require_match,
+    }
+}
+
+fn version_selector_kind_name(kind: VersionSelectorKind) -> &'static str {
+    match kind {
+        VersionSelectorKind::Exact => "exact",
+        VersionSelectorKind::Range => "range",
     }
 }
 
@@ -716,6 +697,16 @@ pub async fn scan(
         bail!("--output and --summary-json must refer to different files");
     }
     validate_distinct_outputs(&options)?;
+    if options.version_selector.kind() == VersionSelectorKind::Range
+        && (options.evidence_json.is_some()
+            || options.policy_file.is_some()
+            || options.policy_report.is_some()
+            || options.data_snapshot.is_some())
+    {
+        bail!(
+            "--version-range currently supports CSV and summary output only; exact-version evidence, policy, and data snapshots require --version"
+        );
+    }
     let organization_policy = if let Some(path) = options.policy_file.as_deref() {
         if options.requirement_filter != RequirementFilter::Any {
             bail!(
@@ -740,8 +731,6 @@ pub async fn scan(
         bail!("--include-private requires GITHUB_APP_TOKEN, GITHUB_TOKEN, or GH_TOKEN");
     }
     let candidate_scope = candidate_scope(options.discovery, options.repository_scope);
-    let policy = scan_policy(&options);
-    let policy_json = json_cell(&policy);
     let resolution = resolve_target(
         crates_io,
         github,
@@ -755,11 +744,32 @@ pub async fn scan(
     )
     .await?;
     let target_crate = resolution.selected_name()?.to_owned();
+    let version_catalog = match &options.version_selector {
+        VersionSelector::Exact(_) => None,
+        VersionSelector::Range(_) => {
+            Some(Arc::new(crates_io.version_catalog(&target_crate).await?))
+        }
+    };
+    let policy = scan_policy(&options, version_catalog.as_deref());
+    let policy_json = json_cell(&policy);
+    let exact_version = options
+        .version_selector
+        .as_exact()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let selector_kind = version_selector_kind_name(options.version_selector.kind()).to_owned();
+    let selector_spec = options.version_selector.canonical_spec();
+    let catalog_sha256 = version_catalog
+        .as_deref()
+        .map(|catalog| catalog.sha256.clone())
+        .unwrap_or_default();
     let context = RunContext {
         observed_at,
         input_query: options.query.clone(),
         target_crate: target_crate.clone(),
-        target_version: options.version.clone(),
+        version_selector: options.version_selector.clone(),
+        version_catalog,
+        range_requirement_cache: Arc::new(RangeRequirementCache::default()),
         target_repository_url: resolution.repository().map(str::to_owned),
         globally_exhaustive: false,
         candidate_scope: candidate_scope.clone(),
@@ -771,7 +781,10 @@ pub async fn scan(
         observed_at_utc: observed_at.to_rfc3339(),
         input_query: options.query.clone(),
         target_crate: target_crate.clone(),
-        target_version: options.version.to_string(),
+        target_version: exact_version,
+        target_selector_kind: selector_kind,
+        target_version_requirement: selector_spec,
+        target_version_catalog_sha256: catalog_sha256,
         globally_exhaustive: false,
         candidate_scope,
         repository_scope: options.repository_scope.as_str().to_owned(),
@@ -779,7 +792,7 @@ pub async fn scan(
         notes: vec![
             "GitHub code search and dependents data are bounded and non-exhaustive.".to_owned(),
             "A lock entry records a resolution; it does not prove a feature/target-specific build or runtime use.".to_owned(),
-            "An exact dependency confirmation requires a direct or transitive path from a recorded lock-graph root; unclassified presence is retained but not confirmed.".to_owned(),
+            "A dependency confirmation requires a selected direct or transitive path from a recorded lock-graph root; unclassified presence is retained but not confirmed.".to_owned(),
         ],
         ..ScanSummary::default()
     };
@@ -795,7 +808,12 @@ pub async fn scan(
             .max_candidates
             .is_some_and(|maximum| candidates.len() >= maximum);
         for candidate in candidates {
-            if let Some(candidate) = filter_candidate(candidate, &options) {
+            if let Some(candidate) = filter_candidate(
+                candidate,
+                &options,
+                context.version_catalog.as_deref(),
+                Some(context.range_requirement_cache.as_ref()),
+            ) {
                 accounting.summary.candidate_release_records += 1;
                 candidate_crates.insert(candidate.dependent_name.clone());
                 add_published_candidate(&mut groups, candidate);
@@ -809,7 +827,7 @@ pub async fn scan(
         add_github_code_candidates(
             github,
             &target_crate,
-            &options.version,
+            &options.version_selector,
             options.github_search_limit,
             &mut groups,
             &mut accounting.summary,
@@ -952,16 +970,17 @@ pub async fn scan(
         None
     };
     eprintln!(
-        "scanned {} repositories; parsed {} lockfiles; confirmed {} repositories; partial={}",
+        "scanned {} repositories; parsed {} lockfiles; confirmed {} repositories for {}; partial={}",
         summary.repositories_scanned,
         summary.lockfiles_parsed,
-        summary.repositories_exact_confirmed,
+        summary.repositories_matching_confirmed,
+        summary.target_version_requirement,
         summary.partial
     );
 
     Ok(ScanOutcome {
         partial: summary.partial,
-        no_match: summary.repositories_exact_confirmed == 0,
+        no_match: summary.repositories_matching_confirmed == 0,
         allow_partial: options.allow_partial,
         require_match: options.require_match,
         policy_exit_code,
@@ -1001,14 +1020,17 @@ mod tests {
     use super::*;
     use crate::{
         cargo_evidence::RecordedRelation,
-        crates_io::{DependencyDeclaration, RepresentativeDependency, ReverseDependencyCandidate},
+        crates_io::{
+            CrateVersionCatalog, DependencyDeclaration, RepresentativeDependency,
+            ReverseDependencyCandidate,
+        },
         github::GitHubRepo,
     };
 
     fn scan_options(requirement_filter: RequirementFilter) -> ScanOptions {
         ScanOptions {
             query: "fs2".to_owned(),
-            version: Version::parse("0.4.3").unwrap(),
+            version_selector: VersionSelector::exact(Version::parse("0.4.3").unwrap()),
             explicit_crate: None,
             accept_closest: false,
             requirement_filter,
@@ -1139,6 +1161,8 @@ mod tests {
             filter_candidate(
                 reverse_candidate("^0.4.3", "normal", false, None),
                 &scan_options(RequirementFilter::Accepts),
+                None,
+                None,
             )
             .is_some()
         );
@@ -1146,6 +1170,8 @@ mod tests {
             filter_candidate(
                 reverse_candidate("^0.4.3", "normal", false, None),
                 &scan_options(RequirementFilter::Exact),
+                None,
+                None,
             )
             .is_none()
         );
@@ -1153,8 +1179,69 @@ mod tests {
             filter_candidate(
                 reverse_candidate("=0.4.3", "normal", false, None),
                 &scan_options(RequirementFilter::Exact),
+                None,
+                None,
             )
             .is_some()
+        );
+    }
+
+    #[test]
+    fn range_requirement_filters_use_the_complete_published_universe() {
+        let catalog = CrateVersionCatalog {
+            crate_name: "fs2".to_owned(),
+            versions: vec![
+                crate::version_selector::PublishedVersionV1 {
+                    version: Version::parse("0.4.3").unwrap(),
+                    yanked: true,
+                },
+                crate::version_selector::PublishedVersionV1 {
+                    version: Version::parse("0.5.0").unwrap(),
+                    yanked: false,
+                },
+            ],
+            sha256: "0".repeat(64),
+        };
+        let mut options = scan_options(RequirementFilter::Accepts);
+        options.version_selector =
+            VersionSelector::range(semver::VersionReq::parse("^0.4").unwrap());
+        assert!(
+            filter_candidate(
+                reverse_candidate(">=0.4.2, <0.5", "normal", false, None),
+                &options,
+                Some(&catalog),
+                None,
+            )
+            .is_some()
+        );
+        assert!(
+            filter_candidate(
+                reverse_candidate("^0.5", "normal", false, None),
+                &options,
+                Some(&catalog),
+                None,
+            )
+            .is_none()
+        );
+
+        options.requirement_filter = RequirementFilter::Exact;
+        assert!(
+            filter_candidate(
+                reverse_candidate("=0.4.3", "normal", false, None),
+                &options,
+                Some(&catalog),
+                None,
+            )
+            .is_some()
+        );
+        assert!(
+            filter_candidate(
+                reverse_candidate("=0.5.0", "normal", false, None),
+                &options,
+                Some(&catalog),
+                None,
+            )
+            .is_none()
         );
     }
 
@@ -1163,6 +1250,8 @@ mod tests {
         let candidate = filter_candidate(
             reverse_candidate("^0.5", "normal", false, Some("index unavailable")),
             &scan_options(RequirementFilter::Exact),
+            None,
+            None,
         )
         .unwrap();
         let mut group = CandidateGroup::default();
@@ -1171,7 +1260,9 @@ mod tests {
             observed_at: Utc::now(),
             input_query: "fs2".to_owned(),
             target_crate: "fs2".to_owned(),
-            target_version: Version::parse("0.4.3").unwrap(),
+            version_selector: VersionSelector::exact(Version::parse("0.4.3").unwrap()),
+            version_catalog: None,
+            range_requirement_cache: Arc::new(RangeRequirementCache::default()),
             target_repository_url: None,
             globally_exhaustive: false,
             candidate_scope: "test scope".to_owned(),
@@ -1193,6 +1284,8 @@ mod tests {
         let candidate = filter_candidate(
             reverse_candidate("^0.5", "build", true, Some("index unavailable")),
             &options,
+            None,
+            None,
         )
         .expect("unknown declarations must not become a false negative");
         assert!(candidate.declarations.is_empty());
@@ -1203,7 +1296,9 @@ mod tests {
             observed_at: Utc::now(),
             input_query: "fs2".to_owned(),
             target_crate: "fs2".to_owned(),
-            target_version: Version::parse("0.4.3").unwrap(),
+            version_selector: VersionSelector::exact(Version::parse("0.4.3").unwrap()),
+            version_catalog: None,
+            range_requirement_cache: Arc::new(RangeRequirementCache::default()),
             target_repository_url: None,
             globally_exhaustive: false,
             candidate_scope: "test scope".to_owned(),
@@ -1222,12 +1317,22 @@ mod tests {
         options.dependency_kinds = vec![DependencyKind::Normal];
         options.optional = OptionalFilter::Exclude;
         assert!(
-            filter_candidate(reverse_candidate("^0.4.3", "build", false, None), &options,)
-                .is_none()
+            filter_candidate(
+                reverse_candidate("^0.4.3", "build", false, None),
+                &options,
+                None,
+                None,
+            )
+            .is_none()
         );
         assert!(
-            filter_candidate(reverse_candidate("^0.4.3", "normal", true, None), &options,)
-                .is_none()
+            filter_candidate(
+                reverse_candidate("^0.4.3", "normal", true, None),
+                &options,
+                None,
+                None,
+            )
+            .is_none()
         );
     }
 
@@ -1257,18 +1362,24 @@ mod tests {
     fn code_search_seeds_are_explicitly_public() {
         for (query, _, _) in github_code_queries(
             "fs2",
-            &Version::parse("0.4.3").unwrap(),
+            &VersionSelector::exact(Version::parse("0.4.3").unwrap()),
             RepositoryScope::PublicOnly,
         ) {
             assert!(query.contains("is:public"));
         }
         for (query, _, _) in github_code_queries(
             "fs2",
-            &Version::parse("0.4.3").unwrap(),
+            &VersionSelector::exact(Version::parse("0.4.3").unwrap()),
             RepositoryScope::AllVisible,
         ) {
             assert!(!query.contains("is:public"));
         }
+        let range_queries = github_code_queries(
+            "fs2",
+            &VersionSelector::range(semver::VersionReq::parse("^0.4").unwrap()),
+            RepositoryScope::PublicOnly,
+        );
+        assert_eq!(range_queries[0].0, "fs2 filename:Cargo.lock is:public");
     }
 
     #[tokio::test]
@@ -1303,7 +1414,7 @@ mod tests {
         add_github_code_candidates(
             &github,
             "fs2",
-            &Version::parse("0.4.3").unwrap(),
+            &VersionSelector::exact(Version::parse("0.4.3").unwrap()),
             10,
             &mut groups,
             &mut summary,
@@ -1457,7 +1568,7 @@ mod tests {
         options.stale_after_days = 730;
         options.max_candidates = Some(50);
         options.max_repositories = Some(10);
-        let policy = scan_policy(&options);
+        let policy = scan_policy(&options, None);
         assert_eq!(policy.requirement_filter, "exact");
         assert_eq!(policy.stale_after_days, 730);
         assert_eq!(policy.max_candidates, Some(50));
@@ -1465,6 +1576,14 @@ mod tests {
         assert_eq!(
             policy.repository_matched_file_byte_budget,
             REPOSITORY_MATCHED_FILE_BYTE_BUDGET
+        );
+        assert_eq!(
+            policy.tree_inventory_strategy,
+            "recursive_then_adaptive_subtree_split"
+        );
+        assert_eq!(
+            policy.tree_inventory_request_limit,
+            GitHubTreeInventoryLimits::default().max_requests
         );
         assert!(CsvRow::HEADERS.contains(&"globally_exhaustive"));
         assert!(CsvRow::HEADERS.contains(&"candidate_scope"));

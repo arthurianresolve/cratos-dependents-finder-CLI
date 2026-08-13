@@ -5,16 +5,23 @@ use futures::{StreamExt, stream};
 use tokio::sync::Semaphore;
 
 use crate::{
-    cargo_evidence::{analyze_cargo_lock, analyze_cargo_manifests},
-    github::{GitHubClient, GitHubHead, GitHubRepo, GitHubRepository, GitHubTree, GitHubTreeEntry},
+    cargo_evidence::{
+        analyze_cargo_lock, analyze_cargo_lock_range, analyze_cargo_manifests,
+        analyze_cargo_manifests_for_range,
+    },
+    github::{
+        GitHubClient, GitHubHead, GitHubRepo, GitHubRepository, GitHubTreeEntry,
+        GitHubTreeInventory, GitHubTreeInventoryLimitation, GitHubTreeInventoryLimits,
+    },
 };
 
 use super::{
-    ActivityDecision, CandidateGroup, CsvRow, InspectionResult, LockEvidence, ManifestScan,
-    ManifestScanConfig, REPOSITORY_MATCHED_FILE_BYTE_BUDGET, REPOSITORY_MATCHED_FILE_LIMIT,
-    RepositoryByteBudget, RepositoryEvidence, ResolvedGroup, RunContext, ScanOptions,
-    activity_decision, append_error, final_component, finalize_completeness, project_lock_evidence,
-    repository_row, repository_row_for_evidence, reserved_lock_bytes, sanitize_row,
+    ActivityDecision, CandidateGroup, CsvRow, InspectionResult, LockEvidence, ManifestAnalysis,
+    ManifestScan, ManifestScanConfig, REPOSITORY_MATCHED_FILE_BYTE_BUDGET,
+    REPOSITORY_MATCHED_FILE_LIMIT, RepositoryByteBudget, RepositoryEvidence, ResolvedGroup,
+    RunContext, ScanOptions, activity_decision, append_error, final_component,
+    finalize_completeness, project_lock_evidence, repository_row, repository_row_for_evidence,
+    reserved_lock_bytes, sanitize_row,
 };
 async fn limited_github_request<T>(
     request_permits: &Semaphore,
@@ -39,9 +46,7 @@ fn failed_repository_row(
     let mut row = repository_row(context, group, repository, head, stale);
     row.inventory_status = "failed".to_owned();
     row.lock_status = "not_scanned".to_owned();
-    row.exact_resolution_status = "unknown".to_owned();
     row.current_direct_status = "unknown".to_owned();
-    row.recorded_relation = "unknown".to_owned();
     row.evidence_completeness = "failed".to_owned();
     append_error(&mut row, code, message);
     sanitize_row(row)
@@ -49,6 +54,8 @@ fn failed_repository_row(
 
 struct RepositorySnapshot {
     tree_truncated: bool,
+    tree_inventory_complete: bool,
+    tree_limitations: Vec<GitHubTreeInventoryLimitation>,
     lock_entries: Vec<GitHubTreeEntry>,
     matched_file_count: usize,
     selected_lock_count: usize,
@@ -60,12 +67,14 @@ struct RepositorySnapshot {
 async fn load_repository_snapshot(
     github: &GitHubClient,
     repo: &GitHubRepo,
-    tree: GitHubTree,
+    tree: GitHubTreeInventory,
     context: &RunContext,
     options: &ScanOptions,
     request_permits: &Semaphore,
 ) -> RepositorySnapshot {
-    let tree_truncated = tree.truncated;
+    let tree_truncated = tree.initial_response_truncated;
+    let tree_inventory_complete = tree.complete;
+    let tree_limitations = tree.limitations;
     let mut manifest_entries = Vec::new();
     let mut lock_entries = Vec::new();
     for entry in tree.tree {
@@ -103,9 +112,10 @@ async fn load_repository_snapshot(
         ManifestScanConfig {
             selected_count: selected_manifest_count,
             target_crate: &context.target_crate,
-            target_version: &context.target_version,
+            version_selector: &context.version_selector,
+            published_versions: context.published_versions(),
             max_file_bytes: options.max_file_bytes,
-            tree_complete: !tree_truncated,
+            tree_complete: tree_inventory_complete,
             byte_ceiling: manifest_byte_ceiling,
             request_permits,
             max_in_flight: options.jobs,
@@ -115,6 +125,8 @@ async fn load_repository_snapshot(
 
     RepositorySnapshot {
         tree_truncated,
+        tree_inventory_complete,
+        tree_limitations,
         lock_entries,
         matched_file_count,
         selected_lock_count,
@@ -178,11 +190,19 @@ pub(super) async fn inspect_repository(
     };
 
     let repo = repository.repo();
-    let tree = match limited_github_request(
-        request_permits,
-        github.recursive_tree(&repo, &head.tree_sha),
-    )
-    .await
+    let tree = match github
+        .tree_inventory(
+            &repo,
+            &head.tree_sha,
+            GitHubTreeInventoryLimits {
+                max_in_flight: options
+                    .jobs
+                    .min(GitHubTreeInventoryLimits::default().max_in_flight),
+                ..GitHubTreeInventoryLimits::default()
+            },
+            Some(request_permits),
+        )
+        .await
     {
         Ok(tree) => tree,
         Err(error) => {
@@ -205,6 +225,8 @@ pub(super) async fn inspect_repository(
         load_repository_snapshot(github, &repo, tree, context, options, request_permits).await;
     let RepositorySnapshot {
         tree_truncated,
+        tree_inventory_complete,
+        tree_limitations,
         lock_entries,
         matched_file_count,
         selected_lock_count,
@@ -222,14 +244,15 @@ pub(super) async fn inspect_repository(
         .iter()
         .any(|candidate| candidate.declaration_enrichment_error.is_some());
     let repository_baseline_partial =
-        tree_truncated || !manifest_scan.complete || enrichment_partial;
+        !tree_inventory_complete || !manifest_scan.complete || enrichment_partial;
     let mut repository_became_partial = repository_baseline_partial || file_limit_hit;
     let evidence = RepositoryEvidence {
         tree_truncated,
+        tree_inventory_complete,
         manifest_scan: &manifest_scan,
         enrichment_partial,
     };
-    let row_template = repository_row_for_evidence(
+    let mut row_template = repository_row_for_evidence(
         context,
         &resolved.group,
         repository,
@@ -237,22 +260,38 @@ pub(super) async fn inspect_repository(
         Some(stale),
         evidence,
     );
+    for limitation in &tree_limitations {
+        append_error(&mut row_template, limitation.code, &limitation.message);
+    }
 
     if lock_entries.is_empty() {
         let mut row = row_template;
-        row.lock_status = if tree_truncated {
+        row.lock_status = if !tree_inventory_complete {
             "unknown_truncated"
         } else {
             "not_found"
         }
         .to_owned();
-        row.exact_resolution_status = if tree_truncated {
+        row.exact_resolution_status = if context.version_selector.as_exact().is_none() {
+            "not_applicable"
+        } else if !tree_inventory_complete {
             "unknown"
         } else {
             "not_observed"
         }
         .to_owned();
-        row.recorded_relation = "unknown".to_owned();
+        row.matching_resolution_status = if !tree_inventory_complete {
+            "unknown"
+        } else {
+            "not_observed"
+        }
+        .to_owned();
+        row.recorded_relation = if context.version_selector.as_exact().is_some() {
+            "unknown"
+        } else {
+            "not_applicable"
+        }
+        .to_owned();
         finalize_completeness(&mut row, repository_baseline_partial);
         result.rows.push(sanitize_row(row));
     } else {
@@ -311,17 +350,37 @@ pub(super) async fn inspect_repository(
                         Ok(bytes) => {
                             byte_budget.record(bytes.len());
                             match String::from_utf8(bytes) {
-                                Ok(text) => match analyze_cargo_lock(
-                                    &text,
-                                    &context.target_crate,
-                                    &context.target_version,
-                                ) {
-                                    Ok(evidence) => LockEvidence::Parsed(evidence),
-                                    Err(error) => LockEvidence::Unclassified {
-                                        status: "parse_failed",
-                                        code: "lockfile_parse_failed",
-                                        message: format!("{error:#}"),
-                                    },
+                                Ok(text) => match &context.version_selector {
+                                    crate::version_selector::VersionSelector::Exact(version) => {
+                                        match analyze_cargo_lock(
+                                            &text,
+                                            &context.target_crate,
+                                            version,
+                                        ) {
+                                            Ok(evidence) => LockEvidence::Parsed(evidence),
+                                            Err(error) => LockEvidence::Unclassified {
+                                                status: "parse_failed",
+                                                code: "lockfile_parse_failed",
+                                                message: format!("{error:#}"),
+                                            },
+                                        }
+                                    }
+                                    crate::version_selector::VersionSelector::Range(
+                                        requirement,
+                                    ) => {
+                                        match analyze_cargo_lock_range(
+                                            &text,
+                                            &context.target_crate,
+                                            requirement,
+                                        ) {
+                                            Ok(evidence) => LockEvidence::ParsedRange(evidence),
+                                            Err(error) => LockEvidence::Unclassified {
+                                                status: "parse_failed",
+                                                code: "lockfile_parse_failed",
+                                                message: format!("{error:#}"),
+                                            },
+                                        }
+                                    }
                                 },
                                 Err(error) => LockEvidence::Unclassified {
                                     status: "non_utf8",
@@ -342,7 +401,11 @@ pub(super) async fn inspect_repository(
             let projection = project_lock_evidence(&mut row, evidence, repository_baseline_partial);
             result.lockfiles_parsed += usize::from(projection.parsed);
             result.exact_occurrences += projection.exact_occurrences;
-            result.exact_confirmed_repositories |= usize::from(projection.confirmed);
+            result.matching_occurrences += projection.matching_occurrences;
+            if context.version_selector.as_exact().is_some() {
+                result.exact_confirmed_repositories |= usize::from(projection.confirmed);
+            }
+            result.matching_confirmed_repositories |= usize::from(projection.confirmed);
             repository_became_partial |= projection.partial;
             result.rows.push(sanitize_row(row));
         }
@@ -540,14 +603,28 @@ async fn scan_manifests(
         }
     }
 
-    let evidence = analyze_cargo_manifests(manifests, config.target_crate, config.target_version);
-    diagnostics.extend(evidence.diagnostics.iter().map(|diagnostic| {
+    let evidence = match config.version_selector {
+        crate::version_selector::VersionSelector::Exact(version) => ManifestAnalysis::Exact(
+            analyze_cargo_manifests(manifests, config.target_crate, version),
+        ),
+        crate::version_selector::VersionSelector::Range(requirement) => {
+            ManifestAnalysis::Range(analyze_cargo_manifests_for_range(
+                manifests,
+                config.target_crate,
+                requirement,
+                config
+                    .published_versions
+                    .expect("range scans retain their version catalog"),
+            ))
+        }
+    };
+    diagnostics.extend(evidence.diagnostics().iter().map(|diagnostic| {
         format!(
             "{}: {}: {}",
             diagnostic.manifest_path, diagnostic.code, diagnostic.message
         )
     }));
-    let complete = config.tree_complete && diagnostics.is_empty() && evidence.analysis_complete;
+    let complete = config.tree_complete && diagnostics.is_empty() && evidence.analysis_complete();
     ManifestScan {
         evidence,
         paths,

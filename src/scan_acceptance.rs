@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use url::Url;
@@ -80,7 +80,9 @@ source = "{CRATES_IO_SOURCE}"
         &github,
         ScanOptions {
             query: "fs2".to_owned(),
-            version: Version::parse("0.4.3").unwrap(),
+            version_selector: crate::version_selector::VersionSelector::exact(
+                Version::parse("0.4.3").unwrap(),
+            ),
             explicit_crate: None,
             accept_closest: false,
             requirement_filter: RequirementFilter::Accepts,
@@ -114,6 +116,7 @@ source = "{CRATES_IO_SOURCE}"
 
     assert!(!outcome.partial);
     assert!(!outcome.no_match);
+    crate::report::validate_report_input(&csv_path).unwrap();
 
     let rows = csv_rows(&csv_path);
     assert_eq!(rows.len(), 2);
@@ -125,6 +128,13 @@ source = "{CRATES_IO_SOURCE}"
     assert_eq!(dependent["recorded_relation"], "recorded_transitive");
     assert_eq!(dependent["shortest_dependency_depth"], "2");
     assert_eq!(dependent["exact_crates_io_occurrence_count"], "1");
+    assert_eq!(dependent["matching_resolution_status"], "present");
+    assert_eq!(dependent["matching_occurrence_count"], "1");
+    assert_eq!(dependent["range_matching_resolutions_json"], "[]");
+    assert_eq!(dependent["target_selector_kind"], "exact");
+    assert_eq!(dependent["target_version_requirement"], "'=0.4.3");
+    assert_eq!(dependent["tree_inventory_complete"], "true");
+    assert_eq!(dependent["csv_schema_version"], "2");
     assert_eq!(dependent["current_direct_status"], "present");
 
     assert_eq!(root_only["lock_status"], "parsed");
@@ -161,9 +171,171 @@ source = "{CRATES_IO_SOURCE}"
     assert_eq!(summary["lockfiles_parsed"], 2);
     assert_eq!(summary["exact_occurrences"], 2);
     assert_eq!(summary["repositories_exact_confirmed"], 1);
+    assert_eq!(summary["matching_occurrences"], 2);
+    assert_eq!(summary["repositories_matching_confirmed"], 1);
     assert_eq!(summary["output_rows"], 2);
 
     server.verify().await;
+}
+
+#[tokio::test]
+async fn mocked_range_scan_matches_concrete_versions_without_per_version_fanout() {
+    let server = MockServer::start().await;
+    mount_crates_io(&server).await;
+    mount_target_catalog(&server).await;
+
+    let manifest = r#"[package]
+name = "consumer-app"
+version = "2.0.0"
+
+[dependencies]
+filesystem = { package = "fs2", version = "=0.4.3" }
+"#;
+    let dependent_lock = format!(
+        r#"version = 3
+
+[[package]]
+name = "consumer-app"
+version = "2.0.0"
+dependencies = ["bridge"]
+
+[[package]]
+name = "bridge"
+version = "1.0.0"
+dependencies = ["fs2"]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "{CRATES_IO_SOURCE}"
+"#
+    );
+    let root_only_lock = format!(
+        r#"version = 3
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "{CRATES_IO_SOURCE}"
+"#
+    );
+    mount_github(&server, manifest, &dependent_lock, &root_only_lock).await;
+
+    let crates_io = CratesIoClient::with_configuration(
+        Url::parse(&format!("{}/api/v1/", server.uri())).unwrap(),
+        Url::parse(&format!("{}/index/", server.uri())).unwrap(),
+        Duration::ZERO,
+        100,
+    )
+    .unwrap();
+    let github =
+        GitHubClient::with_api_base(None, Url::parse(&format!("{}/", server.uri())).unwrap())
+            .unwrap();
+    let output_dir = tempdir().unwrap();
+    let csv_path = output_dir.path().join("range.csv");
+    let summary_path = output_dir.path().join("range-summary.json");
+
+    let outcome = scan(
+        &crates_io,
+        &github,
+        ScanOptions {
+            query: "fs2".to_owned(),
+            version_selector: crate::version_selector::VersionSelector::range(
+                VersionReq::parse("^0.4").unwrap(),
+            ),
+            explicit_crate: None,
+            accept_closest: false,
+            requirement_filter: RequirementFilter::Accepts,
+            discovery: Discovery::CratesIo,
+            dependency_kinds: vec![DependencyKind::Normal],
+            optional: OptionalFilter::Include,
+            include_forks: false,
+            exclude_archived: false,
+            stale_after_days: 365,
+            activity: ActivityFilter::All,
+            committed_since: None,
+            committed_before: None,
+            max_candidates: None,
+            max_repositories: None,
+            github_search_limit: 10,
+            max_file_bytes: 1024 * 1024,
+            output: csv_path.clone(),
+            summary_json: Some(summary_path.clone()),
+            evidence_json: None,
+            policy_file: None,
+            policy_report: None,
+            data_snapshot: None,
+            allow_partial: false,
+            require_match: true,
+            jobs: 2,
+            repository_scope: RepositoryScope::PublicOnly,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!outcome.partial);
+    assert!(!outcome.no_match);
+    let rows = csv_rows(&csv_path);
+    assert_eq!(rows.len(), 2);
+    let dependent = row_for_path(&rows, "dependent/Cargo.lock");
+    assert_eq!(dependent["target_selector_kind"], "range");
+    assert_eq!(dependent["target_version_requirement"], "^0.4");
+    assert_eq!(dependent["target_version"], "");
+    assert_eq!(dependent["exact_resolution_status"], "not_applicable");
+    assert_eq!(dependent["recorded_relation"], "not_applicable");
+    assert_eq!(dependent["shortest_dependency_depth"], "");
+    assert_eq!(dependent["direct_relation_witness_json"], "null");
+    assert_eq!(dependent["matching_resolution_status"], "present");
+    assert_eq!(dependent["matching_occurrence_count"], "1");
+    assert_eq!(dependent["matching_resolved_versions_json"], r#"["0.4.3"]"#);
+    assert_eq!(
+        dependent["matching_recorded_relation"],
+        "recorded_transitive"
+    );
+    assert_eq!(dependent["any_requirement_intersects"], "true");
+    assert_eq!(dependent["any_exact_pin_matches_selector"], "true");
+    assert_eq!(dependent["target_version_catalog_sha256"].len(), 64);
+    assert!(dependent["range_matching_resolutions_json"].contains("0.4.3"));
+    assert!(dependent["current_direct_requirements_json"].contains("exact_pin_matches_selector"));
+
+    let root_only = row_for_path(&rows, "root-only/Cargo.lock");
+    assert_eq!(
+        root_only["matching_recorded_relation"],
+        "recorded_present_unclassified"
+    );
+
+    let summary: Value = serde_json::from_slice(&std::fs::read(summary_path).unwrap()).unwrap();
+    assert_eq!(summary["target_selector_kind"], "range");
+    assert_eq!(summary["target_version_requirement"], "^0.4");
+    assert_eq!(summary["target_version"], "");
+    assert_eq!(summary["matching_occurrences"], 2);
+    assert_eq!(summary["repositories_matching_confirmed"], 1);
+    assert_eq!(summary["exact_occurrences"], 0);
+    assert_eq!(summary["repositories_exact_confirmed"], 0);
+
+    server.verify().await;
+}
+
+async fn mount_target_catalog(server: &MockServer) {
+    let body = [
+        json!({"name": "fs2", "vers": "0.4.2", "yanked": false}),
+        json!({"name": "fs2", "vers": "0.4.3", "yanked": true}),
+        json!({"name": "fs2", "vers": "0.5.0", "yanked": false}),
+    ]
+    .into_iter()
+    .map(|entry| entry.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/index/{}",
+            sparse_index_path("fs2").unwrap()
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(1)
+        .mount(server)
+        .await;
 }
 
 async fn mount_crates_io(server: &MockServer) {

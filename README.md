@@ -87,6 +87,25 @@ cargo run --locked -- scan fs2 `
   --output fs2-exact-pins.csv
 ```
 
+Scan a Cargo-compatible release series without scanning each version
+separately:
+
+```powershell
+cargo run --locked -- scan fs2 `
+  --version-range '^0.4' `
+  --requirement-filter accepts `
+  --output fs2-0.4-series.csv `
+  --summary-json fs2-0.4-series.summary.json
+```
+
+Range scans fetch the target crate's sparse-index release catalog once,
+including yanked releases, and use it to prove whether published dependency
+requirements intersect the selector. Every repository and Cargo file is still
+fetched and parsed once. Lockfile results retain each concrete matching version
+and source. Range mode currently emits CSV/summary evidence only; canonical
+exact evidence bundles, policies, pinned data snapshots, durable jobs, and
+`links` remain exact-version interfaces.
+
 Stale repositories whose default-branch HEAD commit is at least two years old:
 
 ```powershell
@@ -167,8 +186,11 @@ For a crates.io-seeded run, the CLI:
 10. classifies staleness from the frozen default-branch HEAD commit time while
     also reporting GitHub's repository-wide `pushed_at` value.
 
-If GitHub reports a recursive tree as truncated, the result is marked partial;
-absence is never claimed from an incomplete tree.
+If GitHub truncates the recursive tree response, the client adaptively reads
+immutable subtrees under recorded request, unique-path, depth, JSON-byte,
+path-length, elapsed-time, and concurrency bounds. Successful recovery can
+prove file absence; a failed or capped recovery preserves observed files and is
+marked partial. The normal repository path still performs one tree request.
 
 Repository inspection is public-only unless `--include-private` is supplied.
 Without opt-in, private search results or repositories visible to the supplied
@@ -184,9 +206,11 @@ across all repository inspections.
 `--requirement-filter` has three modes:
 
 - `accepts` (default): retain a published declaration when at least one matching
-  requirement accepts the requested version;
+  requirement accepts the exact version, or intersects the requested range over
+  the complete published release catalog;
 - `exact`: retain it only when at least one declaration is an explicit, single
-  exact comparator such as `=0.4.3`;
+  exact comparator such as `=0.4.3` which is selected by the exact version or
+  range;
 - `any`: retain declarations without filtering on the requested version.
 
 If sparse-index enrichment fails for an individual candidate, semantic filters
@@ -199,7 +223,8 @@ compatible `0.4.x` releases at or above `0.4.3`; it is not treated as exact.
 ## CSV evidence
 
 The CSV is designed for audit and follow-up rather than a single optimistic
-boolean. It includes:
+boolean. Schema V2 appends selector-generic fields to the original exact fields,
+so exact consumers can continue reading their established columns. It includes:
 
 - input, canonical crate, target version, collection time, discovery source,
   `globally_exhaustive: false`, candidate scope, and the applied scan policy;
@@ -211,6 +236,9 @@ boolean. It includes:
 - inventory completeness, tree truncation, blob/path identities, parse status,
   every resolved target version/source, exact occurrence counts, and exact
   crates.io-registry occurrence counts;
+- selector kind, canonical requirement, catalog digest, final tree-inventory
+  completeness, matching concrete versions/sources/counts, and matching graph
+  witnesses;
 - current manifest declarations and requirements;
 - declared MSRV observations and effective MSRV source, plus OS names inferred
   from `cfg(target_os = "...")` dependency selectors;
@@ -220,7 +248,7 @@ boolean. It includes:
 
 `not_found`, `absent`, `unknown`, `truncated`, and `failed` remain distinct.
 Untrusted text is protected from spreadsheet formula execution in CSV cells.
-An exact package entry is confirmed as a dependent only when the lock graph
+A selected package entry is confirmed as a dependent only when the lock graph
 supports a direct or transitive path from a recorded root; root-only or
 unreachable presence remains visible but does not satisfy `--require-match`.
 
@@ -375,8 +403,8 @@ derived evidence currently enters the encrypted cache.
 
 The client uses the current versioned GitHub REST API, pins repository content to
 an immutable commit, and treats search caps, `incomplete_results`, rate limits,
-tree truncation, oversized blobs, parse failures, and missing repositories as
-explicit evidence states.
+incomplete adaptive tree recovery, oversized blobs, parse failures, and missing
+repositories as explicit evidence states.
 
 CSV and summary paths must be different after lexical path normalization.
 Explicit file outputs are written through a temporary file and atomically
@@ -421,7 +449,7 @@ Primary references:
 - `1`: a fatal failure occurred before useful output;
 - `2`: command-line usage or argument validation failed (Clap's conventional
   usage-error code);
-- `3`: `--require-match` was set and no direct or transitive exact lockfile
+- `3`: `--require-match` was set and no direct or transitive selected lockfile
   resolution was confirmed;
 - `4`: usable output exists but the run or policy result is indeterminate;
 - `5`: policy evaluation found a definitive violation.
