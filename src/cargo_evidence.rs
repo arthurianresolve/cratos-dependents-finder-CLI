@@ -493,7 +493,46 @@ where
             .and_then(|package| package.get("name"))
             .and_then(toml::Value::as_str)
             .map(str::to_owned);
+// --- MSRV extraction ---
+        let rust_version_value = manifest
+            .document
+            .get("package")
+            .and_then(toml::Value::as_table)
+            .and_then(|pkg| pkg.get("rust-version"));
 
+        let msrv_observation = match rust_version_value {
+        Some(toml::Value::String(v)) => MsrvObservation {
+             manifest_path: manifest.path.clone(),
+             msrv: Some(v.clone()),
+             source: MsrvSource::PackageField,
+    },
+    Some(toml::Value::Table(t)) if t.get("workspace").and_then(toml::Value::as_bool) == Some(true) => {
+        // workspace-inherited: try to resolve from workspace root
+        let resolved = find_workspace_root(manifest_index, &parsed_manifests, &workspace_roots)
+            .and_then(|root_idx| {
+                parsed_manifests[root_idx]
+                    .document
+                    .get("workspace")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|ws| ws.get("package"))
+                    .and_then(toml::Value::as_table)
+                    .and_then(|pkg| pkg.get("rust-version"))
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned)
+            });
+        MsrvObservation {
+            manifest_path: manifest.path.clone(),
+            msrv: resolved,
+            source: MsrvSource::WorkspaceInherited,
+        }
+    }
+    _ => MsrvObservation {
+        manifest_path: manifest.path.clone(),
+        msrv: None,
+        source: MsrvSource::NotDeclared,
+    },
+};
+msrv_observations.push(msrv_observation);
         for table in dependency_tables(&manifest.document) {
             for (alias, value) in table.dependencies {
                 let Some(member_spec) =
