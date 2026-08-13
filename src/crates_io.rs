@@ -1,11 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use futures::{StreamExt, stream};
 use reqwest::{StatusCode, Url, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{sync::Mutex, time::Instant};
@@ -28,6 +23,9 @@ const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (crate dependency inventory CLI)"
 );
+
+mod catalog;
+mod reverse;
 
 /// Scope of crates.io's reverse-dependency endpoint as currently implemented.
 ///
@@ -117,199 +115,6 @@ impl CratesIoClient {
             API_REQUEST_INTERVAL,
             REVERSE_DEPENDENCIES_PER_PAGE,
         )
-    }
-
-    /// Look up a crate by canonical crates.io identity.
-    ///
-    /// crates.io treats ASCII case and `-` versus `_` differences as the same
-    /// identity. A missing crate is returned as `None`; other HTTP errors fail.
-    pub async fn lookup_exact(&self, name: &str) -> Result<Option<CrateSummary>> {
-        ensure!(!name.trim().is_empty(), "crate name must not be empty");
-
-        let url = endpoint_url(&self.inner.api_base, &["crates", name])?;
-        let response = self.get(url.clone(), RequestClass::Api).await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-
-        let envelope: CrateEnvelope = decode_json(response, &url).await?;
-        ensure!(
-            canonical_crate_name(&envelope.krate.name) == canonical_crate_name(name),
-            "crates.io returned `{}` for exact lookup `{name}`",
-            envelope.krate.name
-        );
-        Ok(Some(envelope.krate.into()))
-    }
-
-    /// Search crates.io and return up to `limit` server-ranked candidates.
-    ///
-    /// crates.io search is relevance/substring based, not an edit-distance or
-    /// repository-name lookup. Callers should rank these candidates locally.
-    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<CrateSummary>> {
-        if limit == 0 || query.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let per_page = limit.min(REVERSE_DEPENDENCIES_PER_PAGE);
-        let mut url = endpoint_url(&self.inner.api_base, &["crates"])?;
-        url.query_pairs_mut()
-            .append_pair("q", query)
-            .append_pair("sort", "relevance")
-            .append_pair("include_yanked", "no")
-            .append_pair("page", "1")
-            .append_pair("per_page", &per_page.to_string());
-
-        let response = self.get(url.clone(), RequestClass::Api).await?;
-        let response: SearchResponse = decode_json(response, &url).await?;
-        Ok(response
-            .crates
-            .into_iter()
-            .take(limit)
-            .map(Into::into)
-            .collect())
-    }
-
-    /// Fetch and enrich every page exposed by crates.io's reverse-dependency API.
-    ///
-    /// The returned records have [`REVERSE_DEPENDENCY_SCOPE`]. The two arrays in
-    /// the API response are joined by `version_id`; their positions are unrelated.
-    /// Each result is then enriched from the sparse index so duplicate, renamed,
-    /// target-specific, build, and dev declarations are retained.
-    pub async fn reverse_dependencies(
-        &self,
-        target_crate: &str,
-    ) -> Result<Vec<ReverseDependencyCandidate>> {
-        self.reverse_dependencies_limited(target_crate, None).await
-    }
-
-    /// Fetch reverse dependencies while stopping once `limit` records are found.
-    ///
-    /// The limit is applied before sparse-index enrichment, so a bounded scan
-    /// does not download or enrich the full ecosystem candidate set.
-    pub async fn reverse_dependencies_limited(
-        &self,
-        target_crate: &str,
-        limit: Option<usize>,
-    ) -> Result<Vec<ReverseDependencyCandidate>> {
-        ensure!(
-            !target_crate.trim().is_empty(),
-            "target crate name must not be empty"
-        );
-        if limit == Some(0) {
-            return Ok(Vec::new());
-        }
-
-        let mut page_number = 1usize;
-        let mut candidates = Vec::new();
-        let mut seen_versions = HashSet::new();
-        let mut records_seen = 0usize;
-
-        loop {
-            let mut url = endpoint_url(
-                &self.inner.api_base,
-                &["crates", target_crate, "reverse_dependencies"],
-            )?;
-            url.query_pairs_mut()
-                .append_pair("page", &page_number.to_string())
-                .append_pair(
-                    "per_page",
-                    &self.inner.reverse_dependencies_per_page.to_string(),
-                );
-
-            let response = self.get(url.clone(), RequestClass::Api).await?;
-            let response: ReverseDependenciesPage = decode_json(response, &url).await?;
-            let reported_total = response.meta.total;
-            let page_len = response.dependencies.len();
-            let joined = join_reverse_page(response)?;
-            records_seen = records_seen.saturating_add(page_len);
-
-            for candidate in joined {
-                if seen_versions.insert(candidate.version_id) {
-                    candidates.push(candidate);
-                    if limit.is_some_and(|limit| candidates.len() >= limit) {
-                        break;
-                    }
-                }
-            }
-
-            if limit.is_some_and(|limit| candidates.len() >= limit)
-                || !has_another_reverse_page(
-                    page_len,
-                    records_seen,
-                    reported_total,
-                    self.inner.reverse_dependencies_per_page,
-                )
-            {
-                break;
-            }
-
-            page_number = page_number
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("reverse-dependency page number overflow"))?;
-        }
-
-        if let Some(limit) = limit {
-            candidates.truncate(limit);
-        }
-
-        Ok(self.enrich_declarations(candidates).await)
-    }
-
-    async fn enrich_declarations(
-        &self,
-        candidates: Vec<ReverseDependencyCandidate>,
-    ) -> Vec<ReverseDependencyCandidate> {
-        let work = candidates
-            .into_iter()
-            .enumerate()
-            .map(|(position, mut candidate)| {
-                let client = self.clone();
-                async move {
-                    match client
-                        .sparse_index_declarations(
-                            &candidate.dependent_name,
-                            &candidate.dependent_version,
-                            &candidate.representative.crate_id,
-                        )
-                        .await
-                    {
-                        Ok(declarations) => candidate.declarations = declarations,
-                        Err(error) => {
-                            candidate.declarations =
-                                vec![representative_declaration(&candidate.representative)];
-                            candidate.declaration_enrichment_error = Some(format!("{error:#}"));
-                        }
-                    }
-                    (position, candidate)
-                }
-            });
-
-        let mut enriched: Vec<_> = stream::iter(work)
-            .buffer_unordered(INDEX_FETCH_CONCURRENCY)
-            .collect()
-            .await;
-        enriched.sort_unstable_by_key(|(position, _)| *position);
-        enriched
-            .into_iter()
-            .map(|(_, candidate)| candidate)
-            .collect()
-    }
-
-    async fn sparse_index_declarations(
-        &self,
-        dependent_name: &str,
-        dependent_version: &str,
-        target_crate: &str,
-    ) -> Result<Vec<DependencyDeclaration>> {
-        let path = sparse_index_path(dependent_name)?;
-        let url = endpoint_url(&self.inner.index_base, &path.split('/').collect::<Vec<_>>())?;
-        let response = self.get(url.clone(), RequestClass::Index).await?;
-        let body = decode_text(response, &url).await?;
-        extract_index_declarations(&body, dependent_version, target_crate).with_context(|| {
-            format!(
-                "failed to enrich {dependent_name} {dependent_version} from sparse index `{url}`"
-            )
-        })
     }
 
     async fn get(&self, url: Url, class: RequestClass) -> Result<reqwest::Response> {

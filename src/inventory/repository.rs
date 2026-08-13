@@ -10,11 +10,11 @@ use crate::{
 };
 
 use super::{
-    ActivityDecision, CandidateGroup, CsvRow, InspectionResult, ManifestScan, ManifestScanConfig,
-    REPOSITORY_MATCHED_FILE_BYTE_BUDGET, REPOSITORY_MATCHED_FILE_LIMIT, RepositoryByteBudget,
-    ResolvedGroup, RunContext, ScanOptions, activity_decision, append_error,
-    apply_tree_and_manifest, final_component, finalize_completeness, json_cell,
-    relation_confirms_dependency, relation_name, repository_row, reserved_lock_bytes, sanitize_row,
+    ActivityDecision, CandidateGroup, CsvRow, InspectionResult, LockEvidence, ManifestScan,
+    ManifestScanConfig, REPOSITORY_MATCHED_FILE_BYTE_BUDGET, REPOSITORY_MATCHED_FILE_LIMIT,
+    RepositoryByteBudget, RepositoryEvidence, ResolvedGroup, RunContext, ScanOptions,
+    activity_decision, append_error, final_component, finalize_completeness, project_lock_evidence,
+    repository_row, repository_row_for_evidence, reserved_lock_bytes, sanitize_row,
 };
 async fn limited_github_request<T>(
     request_permits: &Semaphore,
@@ -45,13 +45,6 @@ fn failed_repository_row(
     row.evidence_completeness = "failed".to_owned();
     append_error(&mut row, code, message);
     sanitize_row(row)
-}
-
-fn mark_lock_unclassified(row: &mut CsvRow, status: &str, code: &str, message: &str) {
-    row.lock_status = status.to_owned();
-    row.exact_resolution_status = "unknown".to_owned();
-    row.recorded_relation = "unknown".to_owned();
-    append_error(row, code, message);
 }
 
 struct RepositorySnapshot {
@@ -231,18 +224,18 @@ pub(super) async fn inspect_repository(
     let repository_baseline_partial =
         tree_truncated || !manifest_scan.complete || enrichment_partial;
     let mut repository_became_partial = repository_baseline_partial || file_limit_hit;
-    let mut row_template = repository_row(
+    let evidence = RepositoryEvidence {
+        tree_truncated,
+        manifest_scan: &manifest_scan,
+        enrichment_partial,
+    };
+    let row_template = repository_row_for_evidence(
         context,
         &resolved.group,
         repository,
         Some(&head),
         Some(stale),
-    );
-    apply_tree_and_manifest(
-        &mut row_template,
-        tree_truncated,
-        &manifest_scan,
-        enrichment_partial,
+        evidence,
     );
 
     if lock_entries.is_empty() {
@@ -268,160 +261,89 @@ pub(super) async fn inspect_repository(
             row.cargo_lock_path = entry.path.clone();
             row.cargo_lock_blob_sha = entry.sha.clone();
 
-            if lock_index >= selected_lock_count {
-                mark_lock_unclassified(
-                    &mut row,
-                    "repository_file_limit_exceeded",
-                    "repository_matched_file_limit",
-                    &format!(
+            let evidence = if lock_index >= selected_lock_count {
+                LockEvidence::Unclassified {
+                    status: "repository_file_limit_exceeded",
+                    code: "repository_matched_file_limit",
+                    message: format!(
                         "repository has {matched_file_count} matching Cargo files, exceeding the per-repository limit {REPOSITORY_MATCHED_FILE_LIMIT}"
                     ),
-                );
-                repository_became_partial = true;
-                finalize_completeness(&mut row, true);
-                result.rows.push(sanitize_row(row));
-                continue;
-            }
-
-            if entry.mode == "120000" {
-                mark_lock_unclassified(
-                    &mut row,
-                    "symlink_not_followed",
-                    "lockfile_symlink",
-                    "Cargo.lock is a symbolic link; the immutable blob is the link target path",
-                );
-                repository_became_partial = true;
-                finalize_completeness(&mut row, true);
-                result.rows.push(sanitize_row(row));
-                continue;
-            }
-            if entry.size.is_some_and(|size| size > options.max_file_bytes) {
-                mark_lock_unclassified(
-                    &mut row,
-                    "too_large",
-                    "lockfile_too_large",
-                    &format!(
+                }
+            } else if entry.mode == "120000" {
+                LockEvidence::Unclassified {
+                    status: "symlink_not_followed",
+                    code: "lockfile_symlink",
+                    message:
+                        "Cargo.lock is a symbolic link; the immutable blob is the link target path"
+                            .to_owned(),
+                }
+            } else if entry.size.is_some_and(|size| size > options.max_file_bytes) {
+                LockEvidence::Unclassified {
+                    status: "too_large",
+                    code: "lockfile_too_large",
+                    message: format!(
                         "blob size {} exceeds --max-file-bytes {}",
                         entry.size.unwrap_or_default(),
                         options.max_file_bytes
                     ),
-                );
-                repository_became_partial = true;
-                finalize_completeness(&mut row, true);
-                result.rows.push(sanitize_row(row));
-                continue;
-            }
-            let lock_byte_ceiling = byte_budget.limit;
-            if !byte_budget.can_fetch_below(entry.size, lock_byte_ceiling) {
-                mark_lock_unclassified(
-                    &mut row,
-                    "repository_byte_budget_exceeded",
-                    "repository_matched_file_byte_budget",
-                    &format!(
-                        "Cargo file download would exceed the per-repository {}-byte budget",
-                        byte_budget.limit
-                    ),
-                );
-                repository_became_partial = true;
-                finalize_completeness(&mut row, true);
-                result.rows.push(sanitize_row(row));
-                continue;
-            }
-
-            let max_bytes = options
-                .max_file_bytes
-                .min(byte_budget.remaining_below(lock_byte_ceiling));
-            let bytes = match limited_github_request(
-                request_permits,
-                github.blob_by_sha(&repo, &entry.sha, max_bytes),
-            )
-            .await
-            {
-                Ok(bytes) => {
-                    byte_budget.record(bytes.len());
-                    bytes
                 }
-                Err(error) => {
-                    mark_lock_unclassified(
-                        &mut row,
-                        "fetch_failed",
-                        "lockfile_fetch_failed",
-                        &format!("{error:#}"),
-                    );
-                    repository_became_partial = true;
-                    finalize_completeness(&mut row, true);
-                    result.rows.push(sanitize_row(row));
-                    continue;
-                }
-            };
-            let text = match String::from_utf8(bytes) {
-                Ok(text) => text,
-                Err(error) => {
-                    mark_lock_unclassified(
-                        &mut row,
-                        "non_utf8",
-                        "lockfile_non_utf8",
-                        &error.to_string(),
-                    );
-                    repository_became_partial = true;
-                    finalize_completeness(&mut row, true);
-                    result.rows.push(sanitize_row(row));
-                    continue;
-                }
-            };
-
-            match analyze_cargo_lock(&text, &context.target_crate, &context.target_version) {
-                Ok(evidence) => {
-                    result.lockfiles_parsed += 1;
-                    result.exact_occurrences += evidence.exact_occurrences;
-                    if evidence.exact_occurrences > 0
-                        && relation_confirms_dependency(evidence.recorded_relation)
+            } else {
+                let lock_byte_ceiling = byte_budget.limit;
+                if !byte_budget.can_fetch_below(entry.size, lock_byte_ceiling) {
+                    LockEvidence::Unclassified {
+                        status: "repository_byte_budget_exceeded",
+                        code: "repository_matched_file_byte_budget",
+                        message: format!(
+                            "Cargo file download would exceed the per-repository {}-byte budget",
+                            byte_budget.limit
+                        ),
+                    }
+                } else {
+                    let max_bytes = options
+                        .max_file_bytes
+                        .min(byte_budget.remaining_below(lock_byte_ceiling));
+                    match limited_github_request(
+                        request_permits,
+                        github.blob_by_sha(&repo, &entry.sha, max_bytes),
+                    )
+                    .await
                     {
-                        result.exact_confirmed_repositories = 1;
+                        Ok(bytes) => {
+                            byte_budget.record(bytes.len());
+                            match String::from_utf8(bytes) {
+                                Ok(text) => match analyze_cargo_lock(
+                                    &text,
+                                    &context.target_crate,
+                                    &context.target_version,
+                                ) {
+                                    Ok(evidence) => LockEvidence::Parsed(evidence),
+                                    Err(error) => LockEvidence::Unclassified {
+                                        status: "parse_failed",
+                                        code: "lockfile_parse_failed",
+                                        message: format!("{error:#}"),
+                                    },
+                                },
+                                Err(error) => LockEvidence::Unclassified {
+                                    status: "non_utf8",
+                                    code: "lockfile_non_utf8",
+                                    message: error.to_string(),
+                                },
+                            }
+                        }
+                        Err(error) => LockEvidence::Unclassified {
+                            status: "fetch_failed",
+                            code: "lockfile_fetch_failed",
+                            message: format!("{error:#}"),
+                        },
                     }
-                    row.lock_status = "parsed".to_owned();
-                    row.resolved_target_versions_json = json_cell(&evidence.resolved_versions);
-                    row.resolved_target_sources_json = json_cell(&evidence.occurrences);
-                    row.exact_resolution_status = if evidence.exact_occurrences > 0 {
-                        "present"
-                    } else {
-                        "absent"
-                    }
-                    .to_owned();
-                    row.exact_occurrence_count = evidence.exact_occurrences;
-                    row.exact_crates_io_occurrence_count = evidence.exact_crates_io_occurrences;
-                    row.recorded_relation = relation_name(evidence.recorded_relation).to_owned();
-                    row.shortest_dependency_depth = evidence
-                        .shortest_depth
-                        .map(|depth| depth.to_string())
-                        .unwrap_or_default();
+                }
+            };
 
-                    let graph_partial =
-                        evidence.exact_occurrences > 0 && !evidence.graph_analysis_complete;
-                    if graph_partial {
-                        append_error(
-                            &mut row,
-                            "lock_graph_unclassified",
-                            evidence
-                                .graph_diagnostic
-                                .as_deref()
-                                .unwrap_or("lock graph could not be classified"),
-                        );
-                        repository_became_partial = true;
-                    }
-                    finalize_completeness(&mut row, repository_baseline_partial || graph_partial);
-                }
-                Err(error) => {
-                    mark_lock_unclassified(
-                        &mut row,
-                        "parse_failed",
-                        "lockfile_parse_failed",
-                        &format!("{error:#}"),
-                    );
-                    repository_became_partial = true;
-                    finalize_completeness(&mut row, true);
-                }
-            }
+            let projection = project_lock_evidence(&mut row, evidence, repository_baseline_partial);
+            result.lockfiles_parsed += usize::from(projection.parsed);
+            result.exact_occurrences += projection.exact_occurrences;
+            result.exact_confirmed_repositories |= usize::from(projection.confirmed);
+            repository_became_partial |= projection.partial;
             result.rows.push(sanitize_row(row));
         }
     }

@@ -31,9 +31,11 @@ use discovery::{
 };
 #[cfg(test)]
 use discovery::{github_code_queries, repository_resolution_budget};
+#[cfg(test)]
+use projection::relation_confirms_dependency;
 use projection::{
-    append_error, apply_tree_and_manifest, base_row, finalize_completeness, json_cell,
-    relation_confirms_dependency, relation_name, repository_row, sanitize_row,
+    LockEvidence, RepositoryEvidence, append_error, base_row, finalize_completeness, json_cell,
+    project_lock_evidence, repository_row, repository_row_for_evidence, sanitize_row,
 };
 use repository::inspect_repository;
 
@@ -317,6 +319,102 @@ impl InspectionResult {
     }
 }
 
+/// Owns scan-phase rows and counters so each phase updates accounting in one
+/// place. Inspection results are absorbed by move; request scheduling and row
+/// ordering stay unchanged.
+#[derive(Debug)]
+struct ScanAccumulator {
+    summary: ScanSummary,
+    rows: Vec<CsvRow>,
+}
+
+impl ScanAccumulator {
+    fn new(summary: ScanSummary) -> Self {
+        Self {
+            summary,
+            rows: Vec::new(),
+        }
+    }
+
+    fn record_unsupported(&mut self, context: &RunContext, group: &CandidateGroup) {
+        self.summary.repositories_unsupported += 1;
+        self.summary.partial = true;
+        let mut row = base_row(context, group);
+        row.inventory_status = "unsupported_repository".to_owned();
+        row.lock_status = "not_scanned".to_owned();
+        row.exact_resolution_status = "unknown".to_owned();
+        row.current_direct_status = "unknown".to_owned();
+        row.recorded_relation = "unknown".to_owned();
+        row.evidence_completeness = "unavailable".to_owned();
+        row.error_code = "unsupported_repository".to_owned();
+        row.error_message = group
+            .unsupported_reason
+            .clone()
+            .unwrap_or_else(|| "candidate has no GitHub repository URL".to_owned());
+        self.rows.push(sanitize_row(row));
+    }
+
+    fn record_resolution_failure(
+        &mut self,
+        context: &RunContext,
+        group: &CandidateGroup,
+        error: &anyhow::Error,
+    ) {
+        self.summary.repositories_failed += 1;
+        self.summary.partial = true;
+        let mut row = base_row(context, group);
+        row.inventory_status = "failed".to_owned();
+        row.lock_status = "not_scanned".to_owned();
+        row.exact_resolution_status = "unknown".to_owned();
+        row.current_direct_status = "unknown".to_owned();
+        row.recorded_relation = "unknown".to_owned();
+        row.evidence_completeness = "failed".to_owned();
+        row.error_code = "repository_resolution_failed".to_owned();
+        row.error_message = format!("{error:#}");
+        self.rows.push(sanitize_row(row));
+    }
+
+    fn absorb_inspection(&mut self, aggregate: InspectionResult) {
+        self.summary.repositories_scanned = aggregate.scanned;
+        self.summary.repositories_filtered_by_activity = aggregate.filtered_activity;
+        self.summary.repositories_filtered_as_forks = aggregate.filtered_fork;
+        self.summary.repositories_filtered_as_archived = aggregate.filtered_archived;
+        self.summary.repositories_partial += aggregate.partial_repositories;
+        self.summary.repositories_failed += aggregate.failed_repositories;
+        self.summary.lockfiles_found = aggregate.lockfiles_found;
+        self.summary.lockfiles_parsed = aggregate.lockfiles_parsed;
+        self.summary.exact_occurrences = aggregate.exact_occurrences;
+        self.summary.matched_cargo_files = aggregate.matched_cargo_files;
+        self.summary.matched_cargo_file_bytes_downloaded =
+            aggregate.matched_cargo_file_bytes_downloaded;
+        self.summary.repositories_file_limit_exceeded = aggregate.file_limit_exceeded;
+        self.summary.repositories_byte_budget_exceeded = aggregate.byte_budget_exceeded;
+        self.summary.repositories_exact_confirmed = aggregate.exact_confirmed_repositories;
+        self.summary.partial |= self.summary.repositories_partial > 0
+            || self.summary.repositories_failed > 0
+            || self.summary.repository_resolution_budget_exhausted
+            || self.summary.github_search_incomplete;
+        self.rows.extend(aggregate.rows);
+    }
+
+    fn finish(mut self) -> (ScanSummary, Vec<CsvRow>) {
+        self.rows.sort_by(|left, right| {
+            (
+                &left.github_full_name,
+                &left.repository_url,
+                &left.cargo_lock_path,
+            )
+                .cmp(&(
+                    &right.github_full_name,
+                    &right.repository_url,
+                    &right.cargo_lock_path,
+                ))
+        });
+        self.summary.output_rows = self.rows.len();
+        (self.summary, self.rows)
+    }
+}
+
 #[derive(Debug)]
 struct ManifestScan {
     evidence: ManifestEvidence,
@@ -572,7 +670,7 @@ pub async fn scan(
         scan_policy_json: policy_json,
     };
 
-    let mut summary = ScanSummary {
+    let summary = ScanSummary {
         observed_at_utc: observed_at.to_rfc3339(),
         input_query: options.query.clone(),
         target_crate: target_crate.clone(),
@@ -587,6 +685,7 @@ pub async fn scan(
         ],
         ..ScanSummary::default()
     };
+    let mut accounting = ScanAccumulator::new(summary);
 
     let mut groups = BTreeMap::<String, CandidateGroup>::new();
     let mut candidate_crates = HashSet::new();
@@ -594,19 +693,19 @@ pub async fn scan(
         let candidates = crates_io
             .reverse_dependencies_limited(&target_crate, options.max_candidates)
             .await?;
-        summary.candidate_limit_reached = options
+        accounting.summary.candidate_limit_reached = options
             .max_candidates
             .is_some_and(|maximum| candidates.len() >= maximum);
         for candidate in candidates {
             if let Some(candidate) = filter_candidate(candidate, &options) {
-                summary.candidate_release_records += 1;
+                accounting.summary.candidate_release_records += 1;
                 candidate_crates.insert(candidate.dependent_name.clone());
                 add_published_candidate(&mut groups, candidate);
             }
         }
     }
 
-    summary.candidate_crates = candidate_crates.len();
+    accounting.summary.candidate_crates = candidate_crates.len();
 
     if matches!(options.discovery, Discovery::GithubCode | Discovery::Both) {
         add_github_code_candidates(
@@ -615,34 +714,19 @@ pub async fn scan(
             &options.version,
             options.github_search_limit,
             &mut groups,
-            &mut summary,
+            &mut accounting.summary,
         )
         .await?;
     }
 
-    summary.candidate_repositories = groups.len();
+    accounting.summary.candidate_repositories = groups.len();
 
-    let mut rows = Vec::new();
     let mut github_groups = Vec::new();
     for group in groups.into_values() {
         if group.repository_hint.is_some() {
             github_groups.push(group);
         } else {
-            summary.repositories_unsupported += 1;
-            summary.partial = true;
-            let mut row = base_row(&context, &group);
-            row.inventory_status = "unsupported_repository".to_owned();
-            row.lock_status = "not_scanned".to_owned();
-            row.exact_resolution_status = "unknown".to_owned();
-            row.current_direct_status = "unknown".to_owned();
-            row.recorded_relation = "unknown".to_owned();
-            row.evidence_completeness = "unavailable".to_owned();
-            row.error_code = "unsupported_repository".to_owned();
-            row.error_message = group
-                .unsupported_reason
-                .clone()
-                .unwrap_or_else(|| "candidate has no GitHub repository URL".to_owned());
-            rows.push(sanitize_row(row));
+            accounting.record_unsupported(&context, &group);
         }
     }
 
@@ -653,28 +737,17 @@ pub async fn scan(
         options.max_repositories,
     )
     .await;
-    summary.repositories_filtered_as_private = resolution.filtered_private;
-    summary.repository_limit_reached = resolution.limit_reached;
-    summary.repository_resolution_budget_exhausted = resolution.budget_exhausted;
+    accounting.summary.repositories_filtered_as_private = resolution.filtered_private;
+    accounting.summary.repository_limit_reached = resolution.limit_reached;
+    accounting.summary.repository_resolution_budget_exhausted = resolution.budget_exhausted;
     if resolution.budget_exhausted {
-        summary.notes.push(format!(
+        accounting.summary.notes.push(format!(
             "repository resolution stopped after the bounded {}x redirect/private overscan budget before filling --max-repositories",
             REPOSITORY_RESOLUTION_OVERSCAN_FACTOR
         ));
     }
     for (group, error) in resolution.failures {
-        summary.repositories_failed += 1;
-        summary.partial = true;
-        let mut row = base_row(&context, &group);
-        row.inventory_status = "failed".to_owned();
-        row.lock_status = "not_scanned".to_owned();
-        row.exact_resolution_status = "unknown".to_owned();
-        row.current_direct_status = "unknown".to_owned();
-        row.recorded_relation = "unknown".to_owned();
-        row.evidence_completeness = "failed".to_owned();
-        row.error_code = "repository_resolution_failed".to_owned();
-        row.error_message = format!("{error:#}");
-        rows.push(sanitize_row(row));
+        accounting.record_resolution_failure(&context, &group, &error);
     }
 
     let github_requests = Arc::new(Semaphore::new(options.jobs));
@@ -710,40 +783,8 @@ pub async fn scan(
         aggregate.absorb(inspection);
     }
     progress.finish_with_message("scan complete");
-    rows.extend(aggregate.rows);
-
-    summary.repositories_scanned = aggregate.scanned;
-    summary.repositories_filtered_by_activity = aggregate.filtered_activity;
-    summary.repositories_filtered_as_forks = aggregate.filtered_fork;
-    summary.repositories_filtered_as_archived = aggregate.filtered_archived;
-    summary.repositories_partial += aggregate.partial_repositories;
-    summary.repositories_failed += aggregate.failed_repositories;
-    summary.lockfiles_found = aggregate.lockfiles_found;
-    summary.lockfiles_parsed = aggregate.lockfiles_parsed;
-    summary.exact_occurrences = aggregate.exact_occurrences;
-    summary.matched_cargo_files = aggregate.matched_cargo_files;
-    summary.matched_cargo_file_bytes_downloaded = aggregate.matched_cargo_file_bytes_downloaded;
-    summary.repositories_file_limit_exceeded = aggregate.file_limit_exceeded;
-    summary.repositories_byte_budget_exceeded = aggregate.byte_budget_exceeded;
-    summary.repositories_exact_confirmed = aggregate.exact_confirmed_repositories;
-    summary.partial |= summary.repositories_partial > 0
-        || summary.repositories_failed > 0
-        || summary.repository_resolution_budget_exhausted
-        || summary.github_search_incomplete;
-
-    rows.sort_by(|left, right| {
-        (
-            &left.github_full_name,
-            &left.repository_url,
-            &left.cargo_lock_path,
-        )
-            .cmp(&(
-                &right.github_full_name,
-                &right.repository_url,
-                &right.cargo_lock_path,
-            ))
-    });
-    summary.output_rows = rows.len();
+    accounting.absorb_inspection(aggregate);
+    let (summary, rows) = accounting.finish();
 
     write_csv(&options.output, CsvRow::HEADERS, &rows)?;
     if let Some(path) = &options.summary_json {

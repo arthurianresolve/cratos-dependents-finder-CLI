@@ -4,7 +4,8 @@ use serde::Serialize;
 
 use crate::{
     cargo_evidence::{
-        MsrvSource, RecordedRelation, aggregate_os_support, evaluate_cargo_requirement,
+        CargoLockEvidence, MsrvSource, RecordedRelation, aggregate_os_support,
+        evaluate_cargo_requirement,
     },
     crates_io::{DependencyDeclaration, ReverseDependencyCandidate},
     github::{GitHubHead, GitHubRepo, GitHubRepository},
@@ -15,6 +16,35 @@ use super::{
     CandidateGroup, CsvRow, ManifestScan, REPOSITORY_MATCHED_FILE_BYTE_BUDGET,
     REPOSITORY_MATCHED_FILE_LIMIT, RunContext,
 };
+
+/// Typed repository observations consumed by the CSV adapter.
+///
+/// Keeping the snapshot state separate from serialized cells lets inspection
+/// remain about evidence collection while this module owns CSV spelling and
+/// completeness projection. Borrowing keeps manifest evidence out of
+/// per-lockfile clones.
+pub(super) struct RepositoryEvidence<'a> {
+    pub(super) tree_truncated: bool,
+    pub(super) manifest_scan: &'a ManifestScan,
+    pub(super) enrichment_partial: bool,
+}
+
+pub(super) enum LockEvidence {
+    Unclassified {
+        status: &'static str,
+        code: &'static str,
+        message: String,
+    },
+    Parsed(CargoLockEvidence),
+}
+
+#[derive(Default)]
+pub(super) struct LockProjection {
+    pub(super) parsed: bool,
+    pub(super) exact_occurrences: usize,
+    pub(super) confirmed: bool,
+    pub(super) partial: bool,
+}
 
 #[derive(Clone, Debug, Serialize)]
 struct PublishedDeclarationCell {
@@ -97,6 +127,86 @@ pub(super) fn apply_tree_and_manifest(
             "sparse_index_enrichment_partial",
             "one or more published candidates use representative fallback data",
         );
+    }
+}
+
+pub(super) fn repository_row_for_evidence(
+    context: &RunContext,
+    group: &CandidateGroup,
+    repository: &GitHubRepository,
+    head: Option<&GitHubHead>,
+    stale: Option<bool>,
+    evidence: RepositoryEvidence<'_>,
+) -> CsvRow {
+    let mut row = repository_row(context, group, repository, head, stale);
+    apply_tree_and_manifest(
+        &mut row,
+        evidence.tree_truncated,
+        evidence.manifest_scan,
+        evidence.enrichment_partial,
+    );
+    row
+}
+
+pub(super) fn project_lock_evidence(
+    row: &mut CsvRow,
+    evidence: LockEvidence,
+    repository_baseline_partial: bool,
+) -> LockProjection {
+    match evidence {
+        LockEvidence::Unclassified {
+            status,
+            code,
+            message,
+        } => {
+            row.lock_status = status.to_owned();
+            row.exact_resolution_status = "unknown".to_owned();
+            row.recorded_relation = "unknown".to_owned();
+            append_error(row, code, &message);
+            finalize_completeness(row, true);
+            LockProjection {
+                partial: true,
+                ..LockProjection::default()
+            }
+        }
+        LockEvidence::Parsed(evidence) => {
+            row.lock_status = "parsed".to_owned();
+            row.resolved_target_versions_json = json_cell(&evidence.resolved_versions);
+            row.resolved_target_sources_json = json_cell(&evidence.occurrences);
+            row.exact_resolution_status = if evidence.exact_occurrences > 0 {
+                "present"
+            } else {
+                "absent"
+            }
+            .to_owned();
+            row.exact_occurrence_count = evidence.exact_occurrences;
+            row.exact_crates_io_occurrence_count = evidence.exact_crates_io_occurrences;
+            row.recorded_relation = relation_name(evidence.recorded_relation).to_owned();
+            row.shortest_dependency_depth = evidence
+                .shortest_depth
+                .map(|depth| depth.to_string())
+                .unwrap_or_default();
+
+            let graph_partial = evidence.exact_occurrences > 0 && !evidence.graph_analysis_complete;
+            if graph_partial {
+                append_error(
+                    row,
+                    "lock_graph_unclassified",
+                    evidence
+                        .graph_diagnostic
+                        .as_deref()
+                        .unwrap_or("lock graph could not be classified"),
+                );
+            }
+            finalize_completeness(row, repository_baseline_partial || graph_partial);
+            LockProjection {
+                parsed: true,
+                exact_occurrences: evidence.exact_occurrences,
+                confirmed: evidence.exact_occurrences > 0
+                    && relation_confirms_dependency(evidence.recorded_relation),
+                partial: graph_partial,
+            }
+        }
     }
 }
 
