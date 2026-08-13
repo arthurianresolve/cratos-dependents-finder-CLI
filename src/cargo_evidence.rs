@@ -303,6 +303,26 @@ pub struct ManifestDiagnostic {
     pub message: String,
 }
 
+/// How the MSRV was determined for a package manifest.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MsrvSource {
+    /// `[package] rust-version = "..."` present in this manifest.
+    PackageField,
+    /// `rust-version.workspace = true` — value lives in workspace root.
+    WorkspaceInherited,
+    #[default]
+    NotDeclared,
+}
+
+/// Per-manifest MSRV observation.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MsrvObservation {
+    pub manifest_path: String,
+    pub msrv: Option<String>,
+    pub source: MsrvSource,
+}
+
 /// Direct-declaration evidence collected from all supplied manifests.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ManifestEvidence {
@@ -314,8 +334,11 @@ pub struct ManifestEvidence {
     pub diagnostics: Vec<ManifestDiagnostic>,
     /// `false` means absence of a declaration must not be treated as proven.
     pub analysis_complete: bool,
+    pub msrv_observations: Vec<MsrvObservation>,
+    /// The lowest (most permissive) declared rust-version across all manifests, if any.
+    pub effective_msrv: Option<String>,
+    pub effective_msrv_source: MsrvSource,
 }
-
 /// The result of parsing and evaluating one Cargo version requirement.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequirementEvaluation {
