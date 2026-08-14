@@ -13,16 +13,19 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::control_auth::{ServiceTokenIdV1, ServiceTokenRecordV1};
 use crate::secure_cache::{EnvelopeKey, sha256_hex};
 
 use super::{
     AgentAuthorizationV1, ArtifactRefV1, CacheCatalog, CacheContentKindV1, CacheKeyV1,
-    CacheMetadataV1, CacheNamespaceV1, CacheProtectionV1, InMemoryStateStore, JobEventV1, JobId,
-    NewRepositoryTaskV1, PermitDecision, PermitId, ProviderKeyV1, ProviderOutcomeClassV1,
-    ProviderPolicyV1, QuotaResourceV1, RateLimitObservationV1, RepositoryScopeV1,
-    RepositoryTaskStateV1, RepositoryTaskV1, ReservationId, ReservationOutcome, ReuseFingerprintV1,
-    ScanJobV1, StateStore as _, StoreError, SubmitJobV1, SubmitOutcome, TaskFailureV1, TaskId,
-    TaskUsageV1,
+    CacheMetadataV1, CacheNamespaceV1, CacheProtectionV1, ControlCommandV1, ControlOutcomeV1,
+    ControlState, ControlStateSnapshotV1, ControlTaskV1, DispatchJobV1, InMemoryStateStore,
+    JobEventV1, JobId, NewRepositoryTaskV1, OperationalRetentionSummaryV1, PermitDecision,
+    PermitId, ProviderKeyV1, ProviderOutcomeClassV1, ProviderPolicyV1, QuotaResourceV1,
+    RateLimitObservationV1, RepositoryScopeV1, RepositoryTaskStateV1, RepositoryTaskV1,
+    ReservationId, ReservationOutcome, ReuseFingerprintV1, ScanJobV1, ScanScheduleV1, ScheduleId,
+    ScheduleOccurrenceV1, ScheduleRevisionV1, ScheduledOccurrenceRefV1, StateStore as _,
+    StoreError, SubmitJobV1, SubmitOutcome, TaskFailureV1, TaskId, TaskUsageV1,
 };
 
 const DATABASE_SCHEMA_VERSION: u16 = 1;
@@ -61,12 +64,22 @@ struct CoordinatorSnapshotV1 {
     command_count: u64,
     state: super::store::StateSnapshotV1,
     artifacts: Vec<ArtifactRecordV1>,
+    /// Absent in snapshots written before failed-attempt catalog projection
+    /// became durable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    failed_attempt_projections: Vec<FailedAttemptProjectionRecordV1>,
+    /// Absent in snapshots written before the control plane was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control: Option<ControlStateSnapshotV1>,
 }
 
 #[derive(Debug)]
 struct LoadedState {
     memory: InMemoryStateStore,
+    control: ControlState,
     artifacts: BTreeMap<TaskId, ArtifactRecordV1>,
+    failed_attempt_projections:
+        BTreeMap<FailedAttemptProjectionKeyV1, FailedAttemptProjectionRecordV1>,
     reuse_index: ReuseIndex,
     journal: JournalState,
 }
@@ -81,6 +94,12 @@ struct JournalAppend {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DurableCommandV1 {
+    /// Apply a command to the independent control-plane aggregate. The
+    /// aggregate shares this authenticated journal without coupling its jobs
+    /// or tasks to the legacy worker state machine.
+    Control {
+        command: Box<ControlCommandV1>,
+    },
     SubmitJob {
         request: SubmitJobV1,
     },
@@ -91,6 +110,9 @@ pub enum DurableCommandV1 {
     },
     StartJob {
         job_id: JobId,
+        now: DateTime<Utc>,
+    },
+    StartNextQueuedJob {
         now: DateTime<Utc>,
     },
     PauseJob {
@@ -120,11 +142,26 @@ pub enum DurableCommandV1 {
         lease_seconds: u64,
         now: DateTime<Utc>,
     },
+    LeaseNextAuthorizedTask {
+        authorization: AgentAuthorizationV1,
+        agent_id: String,
+        lease_id: String,
+        lease_seconds: u64,
+        now: DateTime<Utc>,
+    },
     HeartbeatTask {
         task_id: TaskId,
         agent_id: String,
         lease_id: String,
         lease_seconds: u64,
+        now: DateTime<Utc>,
+    },
+    DeferTask {
+        task_id: TaskId,
+        agent_id: String,
+        lease_id: String,
+        not_before: DateTime<Utc>,
+        reason_code: String,
         now: DateTime<Utc>,
     },
     CompleteTask {
@@ -142,6 +179,16 @@ pub enum DurableCommandV1 {
         artifact: Box<ArtifactRecordV1>,
         #[serde(default)]
         usage: TaskUsageV1,
+        now: DateTime<Utc>,
+    },
+    MarkArtifactProjected {
+        task_id: TaskId,
+        artifact_digest: super::Sha256Digest,
+        now: DateTime<Utc>,
+    },
+    MarkFailedAttemptProjected {
+        key: FailedAttemptProjectionKeyV1,
+        projection_digest: super::Sha256Digest,
         now: DateTime<Utc>,
     },
     RemoveExpiredArtifact {
@@ -175,6 +222,19 @@ pub enum DurableCommandV1 {
     /// Remove historical events older than the retention cutoff only for jobs
     /// that are already terminal. Active-job event history is never pruned.
     PruneEventsBefore {
+        cutoff: DateTime<Utc>,
+    },
+    /// Expire failed-attempt projection records at the same boundary as their
+    /// searchable catalog attempts. Pending records are intentionally removed
+    /// once their retention window ends so private aliases cannot outlive the
+    /// declared policy.
+    PruneFailedAttemptProjectionsBefore {
+        cutoff: DateTime<Utc>,
+    },
+    /// Remove whole terminal runs only after their evidence metadata has been
+    /// collected. Artifact and schedule references are consulted atomically
+    /// by the actor.
+    PruneTerminalRunsBefore {
         cutoff: DateTime<Utc>,
     },
     ReserveQuota {
@@ -215,13 +275,19 @@ pub enum DurableCommandV1 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableOutcomeV1 {
     Applied,
+    ArtifactProjection(ArtifactProjectionOutcomeV1),
+    FailedAttemptProjection(FailedAttemptProjectionOutcomeV1),
+    Control(ControlOutcomeV1),
     Submitted(SubmitOutcome),
+    StartedJob(Option<JobId>),
     Task(Option<RepositoryTaskV1>),
     Tasks(Vec<TaskId>),
     Reservation(ReservationOutcome),
     Permit(PermitDecision),
     QuotaExceeded(QuotaResourceV1),
     EventsPruned(usize),
+    FailedAttemptProjectionsPruned(usize),
+    RunsPruned(OperationalRetentionSummaryV1),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -249,6 +315,66 @@ pub struct ArtifactRecordV1 {
     pub job_id: JobId,
     pub task_id: TaskId,
     pub metadata: CacheMetadataV1,
+    #[serde(default)]
+    pub inventory_projection: InventoryProjectionStateV1,
+}
+
+/// A bounded retention page. Only selected candidates are cloned; the actor
+/// computes blob exclusivity against the complete metadata index.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ArtifactRetentionPageV1 {
+    pub candidates: Vec<ArtifactRecordV1>,
+    pub total_candidates: usize,
+    pub removable_blob_keys: BTreeSet<CacheKeyV1>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum InventoryProjectionStateV1 {
+    /// The record predates durable projection tracking and must be reconciled.
+    #[default]
+    LegacyUnknown,
+    Pending,
+    Projected {
+        at: DateTime<Utc>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactProjectionOutcomeV1 {
+    Marked,
+    AlreadyProjected,
+}
+
+/// Stable key for one repository task attempt. A task can fail, retry, and
+/// fail again, so task ID alone is not sufficient for the projection outbox.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct FailedAttemptProjectionKeyV1 {
+    pub task_id: TaskId,
+    pub task_attempt: u32,
+}
+
+/// Durable, privacy-bounded input for a failed-attempt catalog projection.
+/// The worker-provided failure text is intentionally excluded.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FailedAttemptProjectionRecordV1 {
+    pub key: FailedAttemptProjectionKeyV1,
+    pub job_id: JobId,
+    pub namespace: CacheNamespaceV1,
+    pub repository_alias: String,
+    pub normalized_repository_alias: String,
+    pub completed_at: DateTime<Utc>,
+    pub failure_code: String,
+    pub failure_message: String,
+    pub projection_digest: super::Sha256Digest,
+    #[serde(default)]
+    pub inventory_projection: InventoryProjectionStateV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailedAttemptProjectionOutcomeV1 {
+    Marked,
+    AlreadyProjected,
 }
 
 type ReuseIndex = BTreeMap<(CacheNamespaceV1, ReuseFingerprintV1), BTreeSet<TaskId>>;
@@ -265,6 +391,38 @@ enum ActorRequest {
     Jobs {
         response: oneshot::Sender<Vec<ScanJobV1>>,
     },
+    ControlSnapshot {
+        response: oneshot::Sender<ControlStateSnapshotV1>,
+    },
+    ControlSchedule {
+        schedule_id: ScheduleId,
+        response: oneshot::Sender<Option<ScanScheduleV1>>,
+    },
+    ControlScheduleRevision {
+        schedule_id: ScheduleId,
+        revision: u64,
+        response: oneshot::Sender<Option<ScheduleRevisionV1>>,
+    },
+    ControlOccurrence {
+        occurrence: ScheduledOccurrenceRefV1,
+        response: oneshot::Sender<Option<ScheduleOccurrenceV1>>,
+    },
+    DispatchJob {
+        job_id: JobId,
+        response: oneshot::Sender<Option<DispatchJobV1>>,
+    },
+    ControlTask {
+        task_id: TaskId,
+        response: oneshot::Sender<Option<ControlTaskV1>>,
+    },
+    CredentialProfile {
+        profile_id: String,
+        response: oneshot::Sender<Option<super::CredentialProfileV1>>,
+    },
+    ServiceToken {
+        token_id: ServiceTokenIdV1,
+        response: oneshot::Sender<Option<ServiceTokenRecordV1>>,
+    },
     Task {
         task_id: TaskId,
         response: oneshot::Sender<Option<RepositoryTaskV1>>,
@@ -279,8 +437,23 @@ enum ActorRequest {
         task_id: TaskId,
         response: oneshot::Sender<Option<ArtifactRecordV1>>,
     },
+    PendingArtifacts {
+        after_task_id: Option<TaskId>,
+        limit: usize,
+        response: oneshot::Sender<Vec<ArtifactRecordV1>>,
+    },
     Artifacts {
         response: oneshot::Sender<Vec<ArtifactRecordV1>>,
+    },
+    PendingFailedAttemptProjections {
+        after: Option<FailedAttemptProjectionKeyV1>,
+        limit: usize,
+        response: oneshot::Sender<Vec<FailedAttemptProjectionRecordV1>>,
+    },
+    ExpiredArtifacts {
+        now: DateTime<Utc>,
+        limit: usize,
+        response: oneshot::Sender<ArtifactRetentionPageV1>,
     },
     ReusableArtifact {
         namespace: CacheNamespaceV1,
@@ -364,7 +537,9 @@ impl TursoCoordinatorStore {
             database_path,
             key,
             loaded.memory,
+            loaded.control,
             loaded.artifacts,
+            loaded.failed_attempt_projections,
             loaded.reuse_index,
             loaded.journal,
             owner_lock.clone(),
@@ -388,6 +563,148 @@ impl TursoCoordinatorStore {
             .await
             .map_err(|_| anyhow!("coordinator state actor dropped response"))?
             .map_err(anyhow::Error::msg)
+    }
+
+    /// Fill one available running-job slot with the oldest queued job.
+    pub async fn start_next_queued_job(&self, now: DateTime<Utc>) -> Result<Option<JobId>> {
+        match self
+            .apply(DurableCommandV1::StartNextQueuedJob { now })
+            .await?
+        {
+            DurableOutcomeV1::StartedJob(job_id) => Ok(job_id),
+            _ => unreachable!("queue dispatch commands always produce a job outcome"),
+        }
+    }
+
+    /// Apply one idempotent control-plane command through the encrypted
+    /// coordinator journal.
+    pub async fn apply_control(&self, command: ControlCommandV1) -> Result<ControlOutcomeV1> {
+        match self
+            .apply(DurableCommandV1::Control {
+                command: Box::new(command),
+            })
+            .await?
+        {
+            DurableOutcomeV1::Control(outcome) => Ok(outcome),
+            _ => unreachable!("control commands always produce control outcomes"),
+        }
+    }
+
+    pub async fn control_snapshot(&self) -> Result<ControlStateSnapshotV1> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::ControlSnapshot { response })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
+    }
+
+    pub async fn control_schedule(
+        &self,
+        schedule_id: ScheduleId,
+    ) -> Result<Option<ScanScheduleV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::ControlSchedule {
+                schedule_id,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
+    }
+
+    pub async fn control_schedule_revision(
+        &self,
+        schedule_id: ScheduleId,
+        revision: u64,
+    ) -> Result<Option<ScheduleRevisionV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::ControlScheduleRevision {
+                schedule_id,
+                revision,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
+    }
+
+    pub async fn control_occurrence(
+        &self,
+        occurrence: ScheduledOccurrenceRefV1,
+    ) -> Result<Option<ScheduleOccurrenceV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::ControlOccurrence {
+                occurrence,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
+    }
+
+    pub async fn dispatch_job(&self, job_id: JobId) -> Result<Option<DispatchJobV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::DispatchJob { job_id, response })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
+    }
+
+    pub async fn control_task(&self, task_id: TaskId) -> Result<Option<ControlTaskV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::ControlTask { task_id, response })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
+    }
+
+    pub async fn credential_profile(
+        &self,
+        profile_id: impl Into<String>,
+    ) -> Result<Option<super::CredentialProfileV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::CredentialProfile {
+                profile_id: profile_id.into(),
+                response,
+            })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
+    }
+
+    pub async fn service_token(
+        &self,
+        token_id: ServiceTokenIdV1,
+    ) -> Result<Option<ServiceTokenRecordV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::ServiceToken { token_id, response })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
     }
 
     pub async fn job(&self, job_id: JobId) -> Result<Option<ScanJobV1>> {
@@ -455,10 +772,68 @@ impl TursoCoordinatorStore {
             .map_err(|_| anyhow!("coordinator state actor dropped response"))
     }
 
-    pub async fn artifacts(&self) -> Result<Vec<ArtifactRecordV1>> {
+    /// Return the complete artifact metadata index in deterministic task order.
+    pub(crate) async fn artifacts(&self) -> Result<Vec<ArtifactRecordV1>> {
         let (response, result) = oneshot::channel();
         self.sender
             .send(ActorRequest::Artifacts { response })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
+    }
+
+    pub async fn pending_artifacts_page(
+        &self,
+        after_task_id: Option<TaskId>,
+        limit: usize,
+    ) -> Result<Vec<ArtifactRecordV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::PendingArtifacts {
+                after_task_id,
+                limit,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
+    }
+
+    pub async fn pending_failed_attempt_projections_page(
+        &self,
+        after: Option<FailedAttemptProjectionKeyV1>,
+        limit: usize,
+    ) -> Result<Vec<FailedAttemptProjectionRecordV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::PendingFailedAttemptProjections {
+                after,
+                limit,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
+    }
+
+    pub(crate) async fn expired_artifacts_page(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<ArtifactRetentionPageV1> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::ExpiredArtifacts {
+                now,
+                limit,
+                response,
+            })
             .await
             .map_err(|_| anyhow!("coordinator state actor stopped"))?;
         result
@@ -639,6 +1014,28 @@ impl TursoCoordinatorStore {
     }
 }
 
+/// Read the authenticated artifact index from an offline checkpoint without
+/// acquiring ownership or starting a state actor.
+pub(crate) async fn artifacts_from_checkpoint(
+    database_path: &Path,
+    key: &EnvelopeKey,
+) -> Result<Vec<ArtifactRecordV1>> {
+    let database_path = database_path
+        .to_str()
+        .context("coordinator checkpoint path is not valid UTF-8")?;
+    let database = turso::Builder::new_local(database_path)
+        .build()
+        .await
+        .context("opening coordinator checkpoint")?;
+    let connection = database
+        .connect()
+        .context("connecting to coordinator checkpoint")?;
+    let loaded = replay(&connection, key)
+        .await
+        .context("replaying coordinator checkpoint")?;
+    Ok(loaded.artifacts.into_values().collect())
+}
+
 fn acquire_owner_lock(database_path: &Path) -> Result<File> {
     let mut lock_path = database_path.as_os_str().to_os_string();
     lock_path.push(".owner.lock");
@@ -667,7 +1064,12 @@ async fn run_actor(
     database_path: PathBuf,
     key: EnvelopeKey,
     mut memory: InMemoryStateStore,
+    mut control: ControlState,
     mut artifacts: BTreeMap<TaskId, ArtifactRecordV1>,
+    mut failed_attempt_projections: BTreeMap<
+        FailedAttemptProjectionKeyV1,
+        FailedAttemptProjectionRecordV1,
+    >,
     mut reuse_index: ReuseIndex,
     mut journal: JournalState,
     _owner_lock: Arc<File>,
@@ -679,7 +1081,9 @@ async fn run_actor(
                     &connection,
                     &key,
                     &mut memory,
+                    &mut control,
                     &mut artifacts,
+                    &mut failed_attempt_projections,
                     &mut reuse_index,
                     &mut journal,
                     &command,
@@ -693,6 +1097,43 @@ async fn run_actor(
             }
             ActorRequest::Jobs { response } => {
                 let _ = response.send(memory.jobs().into_iter().cloned().collect());
+            }
+            ActorRequest::ControlSnapshot { response } => {
+                let _ = response.send(control.snapshot());
+            }
+            ActorRequest::ControlSchedule {
+                schedule_id,
+                response,
+            } => {
+                let _ = response.send(control.schedule(&schedule_id).cloned());
+            }
+            ActorRequest::ControlScheduleRevision {
+                schedule_id,
+                revision,
+                response,
+            } => {
+                let _ = response.send(control.schedule_revision(&schedule_id, revision).cloned());
+            }
+            ActorRequest::ControlOccurrence {
+                occurrence,
+                response,
+            } => {
+                let _ = response.send(control.occurrence(&occurrence).cloned());
+            }
+            ActorRequest::DispatchJob { job_id, response } => {
+                let _ = response.send(control.job(&job_id).cloned());
+            }
+            ActorRequest::ControlTask { task_id, response } => {
+                let _ = response.send(control.task(&task_id).cloned());
+            }
+            ActorRequest::CredentialProfile {
+                profile_id,
+                response,
+            } => {
+                let _ = response.send(control.credential_profile(&profile_id).cloned());
+            }
+            ActorRequest::ServiceToken { token_id, response } => {
+                let _ = response.send(control.service_token(&token_id).cloned());
             }
             ActorRequest::Task { task_id, response } => {
                 let _ = response.send(memory.task(&task_id).cloned());
@@ -714,6 +1155,35 @@ async fn run_actor(
             }
             ActorRequest::Artifacts { response } => {
                 let _ = response.send(artifacts.values().cloned().collect());
+            }
+            ActorRequest::PendingArtifacts {
+                after_task_id,
+                limit,
+                response,
+            } => {
+                let _ = response.send(pending_artifact_page(
+                    &artifacts,
+                    after_task_id.as_ref(),
+                    limit,
+                ));
+            }
+            ActorRequest::PendingFailedAttemptProjections {
+                after,
+                limit,
+                response,
+            } => {
+                let _ = response.send(pending_failed_attempt_projection_page(
+                    &failed_attempt_projections,
+                    after.as_ref(),
+                    limit,
+                ));
+            }
+            ActorRequest::ExpiredArtifacts {
+                now,
+                limit,
+                response,
+            } => {
+                let _ = response.send(expired_artifact_page(&artifacts, now, limit));
             }
             ActorRequest::ReusableArtifact {
                 namespace,
@@ -749,7 +1219,16 @@ async fn run_actor(
                 response,
             } => {
                 let result = async {
-                    compact_state(&connection, &key, &memory, &artifacts, &mut journal).await?;
+                    compact_state(
+                        &connection,
+                        &key,
+                        &memory,
+                        &control,
+                        &artifacts,
+                        &failed_attempt_projections,
+                        &mut journal,
+                    )
+                    .await?;
                     backup_database(
                         &connection,
                         &database_path,
@@ -763,9 +1242,17 @@ async fn run_actor(
                 let _ = response.send(result);
             }
             ActorRequest::Compact { response } => {
-                let result = compact_state(&connection, &key, &memory, &artifacts, &mut journal)
-                    .await
-                    .map_err(|error| format!("compacting coordinator journal: {error:#}"));
+                let result = compact_state(
+                    &connection,
+                    &key,
+                    &memory,
+                    &control,
+                    &artifacts,
+                    &failed_attempt_projections,
+                    &mut journal,
+                )
+                .await
+                .map_err(|error| format!("compacting coordinator journal: {error:#}"));
                 let _ = response.send(result);
             }
             ActorRequest::RegisterAgent { record, response } => {
@@ -794,23 +1281,183 @@ async fn run_actor(
     }
 }
 
+fn pending_artifact_page(
+    artifacts: &BTreeMap<TaskId, ArtifactRecordV1>,
+    after_task_id: Option<&TaskId>,
+    limit: usize,
+) -> Vec<ArtifactRecordV1> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let is_pending = |artifact: &&ArtifactRecordV1| {
+        matches!(
+            artifact.inventory_projection,
+            InventoryProjectionStateV1::LegacyUnknown | InventoryProjectionStateV1::Pending
+        )
+    };
+    let mut selected = Vec::with_capacity(limit.min(artifacts.len()));
+    if let Some(after) = after_task_id {
+        selected.extend(
+            artifacts
+                .range((
+                    std::ops::Bound::Excluded(after.clone()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map(|(_, artifact)| artifact)
+                .filter(is_pending)
+                .take(limit)
+                .cloned(),
+        );
+        if selected.len() < limit {
+            selected.extend(
+                artifacts
+                    .range((
+                        std::ops::Bound::Unbounded,
+                        std::ops::Bound::Included(after.clone()),
+                    ))
+                    .map(|(_, artifact)| artifact)
+                    .filter(is_pending)
+                    .take(limit - selected.len())
+                    .cloned(),
+            );
+        }
+    } else {
+        selected.extend(artifacts.values().filter(is_pending).take(limit).cloned());
+    }
+    selected
+}
+
+fn pending_failed_attempt_projection_page(
+    projections: &BTreeMap<FailedAttemptProjectionKeyV1, FailedAttemptProjectionRecordV1>,
+    after: Option<&FailedAttemptProjectionKeyV1>,
+    limit: usize,
+) -> Vec<FailedAttemptProjectionRecordV1> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let is_pending = |record: &&FailedAttemptProjectionRecordV1| {
+        matches!(
+            record.inventory_projection,
+            InventoryProjectionStateV1::LegacyUnknown | InventoryProjectionStateV1::Pending
+        )
+    };
+    let mut selected = Vec::with_capacity(limit.min(projections.len()));
+    if let Some(after) = after {
+        selected.extend(
+            projections
+                .range((
+                    std::ops::Bound::Excluded(after.clone()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map(|(_, record)| record)
+                .filter(is_pending)
+                .take(limit)
+                .cloned(),
+        );
+        if selected.len() < limit {
+            selected.extend(
+                projections
+                    .range((
+                        std::ops::Bound::Unbounded,
+                        std::ops::Bound::Included(after.clone()),
+                    ))
+                    .map(|(_, record)| record)
+                    .filter(is_pending)
+                    .take(limit - selected.len())
+                    .cloned(),
+            );
+        }
+    } else {
+        selected.extend(projections.values().filter(is_pending).take(limit).cloned());
+    }
+    selected
+}
+
+fn expired_artifact_page(
+    artifacts: &BTreeMap<TaskId, ArtifactRecordV1>,
+    now: DateTime<Utc>,
+    limit: usize,
+) -> ArtifactRetentionPageV1 {
+    let mut page = ArtifactRetentionPageV1 {
+        candidates: Vec::with_capacity(limit.min(artifacts.len())),
+        ..ArtifactRetentionPageV1::default()
+    };
+    for artifact in artifacts.values() {
+        if artifact.metadata.content_kind == CacheContentKindV1::DerivedEvidence
+            && artifact.metadata.is_retention_candidate(now)
+        {
+            page.total_candidates += 1;
+            if page.candidates.len() < limit {
+                page.candidates.push(artifact.clone());
+            }
+        }
+    }
+    page.removable_blob_keys = page
+        .candidates
+        .iter()
+        .map(|artifact| artifact.metadata.key.clone())
+        .collect();
+    if page.removable_blob_keys.is_empty() {
+        return page;
+    }
+    let selected_tasks = page
+        .candidates
+        .iter()
+        .map(|artifact| artifact.task_id.clone())
+        .collect::<BTreeSet<_>>();
+    for artifact in artifacts.values() {
+        if !selected_tasks.contains(&artifact.task_id) {
+            page.removable_blob_keys.remove(&artifact.metadata.key);
+        }
+    }
+    page
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the journal boundary must update every independently snapshotted aggregate atomically"
+)]
 async fn apply_and_persist(
     connection: &turso::Connection,
     key: &EnvelopeKey,
     memory: &mut InMemoryStateStore,
+    control: &mut ControlState,
     artifacts: &mut BTreeMap<TaskId, ArtifactRecordV1>,
+    failed_attempt_projections: &mut BTreeMap<
+        FailedAttemptProjectionKeyV1,
+        FailedAttemptProjectionRecordV1,
+    >,
     reuse_index: &mut ReuseIndex,
     journal: &mut JournalState,
     command: &DurableCommandV1,
 ) -> Result<DurableOutcomeV1> {
     validate_artifact_command(memory, artifacts, command)?;
-    let outcome = apply_to_memory(memory, command)?;
+    validate_failed_attempt_projection_command(memory, failed_attempt_projections, command)?;
+    let control_generation = control.generation();
+    let outcome = apply_to_state(
+        memory,
+        control,
+        artifacts,
+        failed_attempt_projections,
+        command,
+    )?;
     if matches!(
         outcome,
         DurableOutcomeV1::Submitted(SubmitOutcome::Existing(_))
             | DurableOutcomeV1::Reservation(ReservationOutcome::AlreadyReserved)
             | DurableOutcomeV1::EventsPruned(0)
-    ) {
+            | DurableOutcomeV1::FailedAttemptProjectionsPruned(0)
+            | DurableOutcomeV1::StartedJob(None)
+            | DurableOutcomeV1::Task(None)
+            | DurableOutcomeV1::ArtifactProjection(ArtifactProjectionOutcomeV1::AlreadyProjected)
+            | DurableOutcomeV1::FailedAttemptProjection(
+                FailedAttemptProjectionOutcomeV1::AlreadyProjected
+            )
+    ) || matches!(&outcome, DurableOutcomeV1::Tasks(tasks) if tasks.is_empty())
+        || matches!(&outcome, DurableOutcomeV1::RunsPruned(summary) if summary.is_empty())
+        || matches!(command, DurableCommandV1::Control { .. })
+            && control.generation() == control_generation
+    {
         return Ok(outcome);
     }
     let appended = match append(connection, key, command).await {
@@ -822,25 +1469,108 @@ async fn apply_and_persist(
                 )
             });
             *memory = restored.memory;
+            *control = restored.control;
             *artifacts = restored.artifacts;
+            *failed_attempt_projections = restored.failed_attempt_projections;
             *reuse_index = restored.reuse_index;
             *journal = restored.journal;
             return Err(error).context("persisting coordinator command");
         }
     };
     update_artifact_index(artifacts, reuse_index, command, &outcome);
+    update_failed_attempt_projection_outbox(failed_attempt_projections, memory, command, &outcome);
     journal.total_commands = journal.total_commands.saturating_add(1);
     journal.tail_commands = journal.tail_commands.saturating_add(1);
     journal.tail_bytes = journal.tail_bytes.saturating_add(appended.stored_bytes);
     journal.watermark_sequence = appended.sequence;
     if journal.should_compact()
-        && let Err(error) = compact_state(connection, key, memory, artifacts, journal).await
+        && let Err(error) = compact_state(
+            connection,
+            key,
+            memory,
+            control,
+            artifacts,
+            failed_attempt_projections,
+            journal,
+        )
+        .await
     {
         // The command is already committed. Reporting failure would invite an
         // ambiguous retry, so retain the tail and retry compaction later.
         tracing::warn!(%error, "automatic coordinator journal compaction failed");
     }
     Ok(outcome)
+}
+
+fn apply_to_state(
+    memory: &mut InMemoryStateStore,
+    control: &mut ControlState,
+    artifacts: &BTreeMap<TaskId, ArtifactRecordV1>,
+    failed_attempt_projections: &BTreeMap<
+        FailedAttemptProjectionKeyV1,
+        FailedAttemptProjectionRecordV1,
+    >,
+    command: &DurableCommandV1,
+) -> Result<DurableOutcomeV1> {
+    match command {
+        DurableCommandV1::Control { command } => {
+            let mut candidate = control.clone();
+            let outcome = candidate
+                .apply(command.as_ref().clone())
+                .map_err(anyhow::Error::new)?;
+            *control = candidate;
+            Ok(DurableOutcomeV1::Control(outcome))
+        }
+        DurableCommandV1::MarkArtifactProjected { task_id, .. } => {
+            let outcome = match &artifacts
+                .get(task_id)
+                .context("artifact task was not found")?
+                .inventory_projection
+            {
+                InventoryProjectionStateV1::Projected { .. } => {
+                    ArtifactProjectionOutcomeV1::AlreadyProjected
+                }
+                InventoryProjectionStateV1::LegacyUnknown | InventoryProjectionStateV1::Pending => {
+                    ArtifactProjectionOutcomeV1::Marked
+                }
+            };
+            Ok(DurableOutcomeV1::ArtifactProjection(outcome))
+        }
+        DurableCommandV1::MarkFailedAttemptProjected { key, .. } => {
+            let outcome = match &failed_attempt_projections
+                .get(key)
+                .context("failed-attempt projection was not found")?
+                .inventory_projection
+            {
+                InventoryProjectionStateV1::Projected { .. } => {
+                    FailedAttemptProjectionOutcomeV1::AlreadyProjected
+                }
+                InventoryProjectionStateV1::LegacyUnknown | InventoryProjectionStateV1::Pending => {
+                    FailedAttemptProjectionOutcomeV1::Marked
+                }
+            };
+            Ok(DurableOutcomeV1::FailedAttemptProjection(outcome))
+        }
+        DurableCommandV1::PruneFailedAttemptProjectionsBefore { cutoff } => {
+            Ok(DurableOutcomeV1::FailedAttemptProjectionsPruned(
+                failed_attempt_projections
+                    .values()
+                    .filter(|record| record.completed_at < *cutoff)
+                    .count(),
+            ))
+        }
+        DurableCommandV1::PruneTerminalRunsBefore { cutoff } => {
+            let protected_jobs = artifacts
+                .values()
+                .map(|artifact| artifact.job_id.clone())
+                .chain(control.retained_job_ids().cloned())
+                .collect::<BTreeSet<_>>();
+            Ok(DurableOutcomeV1::RunsPruned(
+                memory.prune_terminal_runs_before(*cutoff, &protected_jobs),
+            ))
+        }
+        _ => apply_to_memory(memory, command),
+    }
 }
 
 async fn migrate(connection: &turso::Connection) -> Result<()> {
@@ -920,8 +1650,14 @@ async fn migrate_agent_authorization(connection: &turso::Connection) -> Result<(
 }
 
 async fn replay(connection: &turso::Connection, key: &EnvelopeKey) -> Result<LoadedState> {
-    let (mut memory, mut artifacts, snapshot_watermark, snapshot_commands) =
-        load_snapshot(connection, key).await?.unwrap_or_default();
+    let (
+        mut memory,
+        mut control,
+        mut artifacts,
+        mut failed_attempt_projections,
+        snapshot_watermark,
+        snapshot_commands,
+    ) = load_snapshot(connection, key).await?.unwrap_or_default();
     let mut reuse_index = build_reuse_index(&artifacts);
     let mut rows = connection
         .query(
@@ -955,9 +1691,23 @@ async fn replay(connection: &turso::Connection, key: &EnvelopeKey) -> Result<Loa
             .with_context(|| format!("decoding journal record {record_id}"))?;
         validate_artifact_command(&memory, &artifacts, &command)
             .with_context(|| format!("validating journal record {record_id}"))?;
-        let outcome = apply_to_memory(&mut memory, &command)
-            .with_context(|| format!("replaying journal record {record_id}"))?;
+        validate_failed_attempt_projection_command(&memory, &failed_attempt_projections, &command)
+            .with_context(|| format!("validating journal record {record_id}"))?;
+        let outcome = apply_to_state(
+            &mut memory,
+            &mut control,
+            &artifacts,
+            &failed_attempt_projections,
+            &command,
+        )
+        .with_context(|| format!("replaying journal record {record_id}"))?;
         update_artifact_index(&mut artifacts, &mut reuse_index, &command, &outcome);
+        update_failed_attempt_projection_outbox(
+            &mut failed_attempt_projections,
+            &memory,
+            &command,
+            &outcome,
+        );
         journal.total_commands = journal.total_commands.saturating_add(1);
         journal.tail_commands = journal.tail_commands.saturating_add(1);
         journal.tail_bytes = journal.tail_bytes.saturating_add(payload.len() as u64);
@@ -965,7 +1715,9 @@ async fn replay(connection: &turso::Connection, key: &EnvelopeKey) -> Result<Loa
     }
     Ok(LoadedState {
         memory,
+        control,
         artifacts,
+        failed_attempt_projections,
         reuse_index,
         journal,
     })
@@ -977,7 +1729,9 @@ async fn load_snapshot(
 ) -> Result<
     Option<(
         InMemoryStateStore,
+        ControlState,
         BTreeMap<TaskId, ArtifactRecordV1>,
+        BTreeMap<FailedAttemptProjectionKeyV1, FailedAttemptProjectionRecordV1>,
         u64,
         u64,
     )>,
@@ -1033,6 +1787,12 @@ async fn load_snapshot(
     );
     let memory = InMemoryStateStore::from_snapshot(snapshot.state)
         .context("restoring coordinator state snapshot")?;
+    let control = snapshot
+        .control
+        .map(ControlState::restore)
+        .transpose()
+        .context("restoring control-plane state snapshot")?
+        .unwrap_or_default();
     let mut artifacts = BTreeMap::new();
     let mut catalog = CacheCatalog::default();
     for artifact in snapshot.artifacts {
@@ -1046,14 +1806,39 @@ async fn load_snapshot(
             "snapshot contains duplicate artifact task IDs"
         );
     }
-    Ok(Some((memory, artifacts, watermark, snapshot.command_count)))
+    let mut failed_attempt_projections = BTreeMap::new();
+    for record in snapshot.failed_attempt_projections {
+        ensure!(
+            failed_attempt_projection_digest(&record) == record.projection_digest,
+            "snapshot contains an invalid failed-attempt projection digest"
+        );
+        ensure!(
+            failed_attempt_projections
+                .insert(record.key.clone(), record)
+                .is_none(),
+            "snapshot contains duplicate failed-attempt projection keys"
+        );
+    }
+    Ok(Some((
+        memory,
+        control,
+        artifacts,
+        failed_attempt_projections,
+        watermark,
+        snapshot.command_count,
+    )))
 }
 
 async fn compact_state(
     connection: &turso::Connection,
     key: &EnvelopeKey,
     memory: &InMemoryStateStore,
+    control: &ControlState,
     artifacts: &BTreeMap<TaskId, ArtifactRecordV1>,
+    failed_attempt_projections: &BTreeMap<
+        FailedAttemptProjectionKeyV1,
+        FailedAttemptProjectionRecordV1,
+    >,
     journal: &mut JournalState,
 ) -> Result<CompactionStatsV1> {
     let stats = CompactionStatsV1 {
@@ -1069,6 +1854,8 @@ async fn compact_state(
         command_count: journal.total_commands,
         state: memory.snapshot(),
         artifacts: artifacts.values().cloned().collect(),
+        failed_attempt_projections: failed_attempt_projections.values().cloned().collect(),
+        control: Some(control.snapshot()),
     };
     let plaintext = serde_json::to_vec(&snapshot).context("serializing coordinator snapshot")?;
     ensure!(
@@ -1193,6 +1980,21 @@ fn apply_to_memory(
     command: &DurableCommandV1,
 ) -> Result<DurableOutcomeV1> {
     let outcome = match command {
+        DurableCommandV1::Control { .. } => {
+            bail!("control command requires the control-plane aggregate")
+        }
+        DurableCommandV1::MarkArtifactProjected { .. } => {
+            bail!("projection command requires the artifact index")
+        }
+        DurableCommandV1::MarkFailedAttemptProjected { .. } => {
+            bail!("projection command requires the failed-attempt outbox")
+        }
+        DurableCommandV1::PruneFailedAttemptProjectionsBefore { .. } => {
+            bail!("failed-attempt retention requires the projection outbox")
+        }
+        DurableCommandV1::PruneTerminalRunsBefore { .. } => {
+            bail!("whole-run retention requires the artifact index")
+        }
         DurableCommandV1::SubmitJob { request } => {
             DurableOutcomeV1::Submitted(memory.submit_job(request.clone())?)
         }
@@ -1205,8 +2007,12 @@ fn apply_to_memory(
             memory.start_job(job_id, *now)?;
             DurableOutcomeV1::Applied
         }
+        DurableCommandV1::StartNextQueuedJob { now } => {
+            DurableOutcomeV1::StartedJob(memory.start_next_queued_job(*now)?)
+        }
         DurableCommandV1::PauseJob { job_id, now } => {
             memory.pause_job(job_id, *now)?;
+            let _ = memory.start_next_queued_job(*now)?;
             DurableOutcomeV1::Applied
         }
         DurableCommandV1::ResumeJob { job_id, now } => {
@@ -1215,6 +2021,7 @@ fn apply_to_memory(
         }
         DurableCommandV1::CancelJob { job_id, now } => {
             memory.cancel_job(job_id, *now)?;
+            let _ = memory.start_next_queued_job(*now)?;
             DurableOutcomeV1::Applied
         }
         DurableCommandV1::FinalizeJob {
@@ -1223,6 +2030,7 @@ fn apply_to_memory(
             now,
         } => {
             memory.finalize_job(job_id, partial_reasons.clone(), *now)?;
+            let _ = memory.start_next_queued_job(*now)?;
             DurableOutcomeV1::Applied
         }
         DurableCommandV1::EnqueueTask { task } => {
@@ -1242,6 +2050,19 @@ fn apply_to_memory(
             *lease_seconds,
             *now,
         )?),
+        DurableCommandV1::LeaseNextAuthorizedTask {
+            authorization,
+            agent_id,
+            lease_id,
+            lease_seconds,
+            now,
+        } => DurableOutcomeV1::Task(memory.lease_next_authorized_task(
+            authorization,
+            agent_id,
+            lease_id,
+            *lease_seconds,
+            *now,
+        )?),
         DurableCommandV1::HeartbeatTask {
             task_id,
             agent_id,
@@ -1250,6 +2071,17 @@ fn apply_to_memory(
             now,
         } => {
             memory.heartbeat_task(task_id, agent_id, lease_id, *lease_seconds, *now)?;
+            DurableOutcomeV1::Applied
+        }
+        DurableCommandV1::DeferTask {
+            task_id,
+            agent_id,
+            lease_id,
+            not_before,
+            reason_code,
+            now,
+        } => {
+            memory.defer_task(task_id, agent_id, lease_id, *not_before, reason_code, *now)?;
             DurableOutcomeV1::Applied
         }
         DurableCommandV1::CompleteTask {
@@ -1281,6 +2113,7 @@ fn apply_to_memory(
             if let Some(resource) =
                 apply_task_usage(memory, &artifact.job_id, task_id, lease_id, *usage, *now)?
             {
+                let _ = memory.start_next_queued_job(*now)?;
                 return Ok(DurableOutcomeV1::QuotaExceeded(resource));
             }
             let already_succeeded = memory
@@ -1296,6 +2129,7 @@ fn apply_to_memory(
                     *now,
                 );
                 if let Err(StoreError::QuotaExceeded(resource)) = reservation {
+                    let _ = memory.start_next_queued_job(*now)?;
                     return Ok(DurableOutcomeV1::QuotaExceeded(resource));
                 }
                 reservation?;
@@ -1334,6 +2168,7 @@ fn apply_to_memory(
             if let Some(resource) =
                 apply_task_usage(memory, &job_id, task_id, lease_id, *usage, *now)?
             {
+                let _ = memory.start_next_queued_job(*now)?;
                 return Ok(DurableOutcomeV1::QuotaExceeded(resource));
             }
             memory.fail_task(failure)?;
@@ -1354,7 +2189,10 @@ fn apply_to_memory(
             now,
         } => match memory.reserve_quota(reservation_id.clone(), job_id, *resource, *amount, *now) {
             Ok(outcome) => DurableOutcomeV1::Reservation(outcome),
-            Err(StoreError::QuotaExceeded(resource)) => DurableOutcomeV1::QuotaExceeded(resource),
+            Err(StoreError::QuotaExceeded(resource)) => {
+                let _ = memory.start_next_queued_job(*now)?;
+                DurableOutcomeV1::QuotaExceeded(resource)
+            }
             Err(error) => return Err(error.into()),
         },
         DurableCommandV1::ReconcileQuota {
@@ -1440,54 +2278,9 @@ fn submit_job_with_tasks(
     tasks: &[NewRepositoryTaskV1],
     now: DateTime<Utc>,
 ) -> Result<DurableOutcomeV1> {
-    ensure!(
-        !tasks.is_empty(),
-        "a submitted job must contain a repository task"
-    );
-    ensure!(
-        tasks.len() as u64 <= request.spec.bounds.repository_limit,
-        "repository task count exceeds the scan bound"
-    );
-    let mut task_ids = BTreeSet::new();
-    let mut repositories = BTreeSet::new();
-    for task in tasks {
-        ensure!(task.job_id == request.job_id, "task job ID mismatch");
-        ensure!(
-            !task.task_id.0.trim().is_empty() && !task.repository_id.trim().is_empty(),
-            "task identifiers must not be empty"
-        );
-        ensure!(task_ids.insert(task.task_id.clone()), "duplicate task ID");
-        ensure!(
-            repositories.insert(task.repository_id.clone()),
-            "duplicate repository task"
-        );
-    }
-
-    match memory.submit_job(request.clone())? {
-        SubmitOutcome::Existing(job_id) => {
-            ensure!(
-                memory.repository_ids_for_job(&job_id) == repositories,
-                "idempotency key is already associated with a different repository set"
-            );
-            Ok(DurableOutcomeV1::Submitted(SubmitOutcome::Existing(job_id)))
-        }
-        SubmitOutcome::Created(job_id) => {
-            let reservation_id = ReservationId(format!("repositories:{}", job_id.0));
-            memory.reserve_quota(
-                reservation_id.clone(),
-                &job_id,
-                QuotaResourceV1::Repositories,
-                tasks.len() as u64,
-                now,
-            )?;
-            memory.reconcile_quota(&reservation_id, tasks.len() as u64, now)?;
-            for task in tasks {
-                memory.enqueue_task(task.clone())?;
-            }
-            memory.start_job(&job_id, now)?;
-            Ok(DurableOutcomeV1::Submitted(SubmitOutcome::Created(job_id)))
-        }
-    }
+    Ok(DurableOutcomeV1::Submitted(
+        memory.submit_job_with_tasks_atomic(request, tasks, now)?,
+    ))
 }
 
 fn validate_artifact_command(
@@ -1502,6 +2295,21 @@ fn validate_artifact_command(
                 "artifact is still retained"
             );
         }
+        return Ok(());
+    }
+    if let DurableCommandV1::MarkArtifactProjected {
+        task_id,
+        artifact_digest,
+        ..
+    } = command
+    {
+        let artifact = artifacts
+            .get(task_id)
+            .context("artifact task was not found")?;
+        ensure!(
+            artifact.metadata.key.digest == *artifact_digest,
+            "artifact digest changed before inventory projection"
+        );
         return Ok(());
     }
     let DurableCommandV1::CompleteTaskWithArtifact {
@@ -1566,6 +2374,117 @@ fn validate_artifact_command(
     Ok(())
 }
 
+fn validate_failed_attempt_projection_command(
+    memory: &InMemoryStateStore,
+    projections: &BTreeMap<FailedAttemptProjectionKeyV1, FailedAttemptProjectionRecordV1>,
+    command: &DurableCommandV1,
+) -> Result<()> {
+    match command {
+        DurableCommandV1::MarkFailedAttemptProjected {
+            key,
+            projection_digest,
+            ..
+        } => {
+            let record = projections
+                .get(key)
+                .context("failed-attempt projection was not found")?;
+            ensure!(
+                record.projection_digest == *projection_digest,
+                "failed-attempt projection changed before it was marked"
+            );
+        }
+        DurableCommandV1::FailTask {
+            task_id,
+            retry_at,
+            now,
+            ..
+        } => {
+            let record = failed_attempt_projection_record(memory, task_id, *retry_at, *now)?;
+            if let Some(existing) = projections.get(&record.key) {
+                ensure!(
+                    existing.projection_digest == record.projection_digest,
+                    "failed-attempt projection conflicts with its durable outbox record"
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn failed_attempt_projection_record(
+    memory: &InMemoryStateStore,
+    task_id: &TaskId,
+    retry_at: Option<DateTime<Utc>>,
+    completed_at: DateTime<Utc>,
+) -> Result<FailedAttemptProjectionRecordV1> {
+    let task = memory.task(task_id).context("task was not found")?;
+    let job = memory
+        .job(&task.job_id)
+        .context("failed-attempt task job was not found")?;
+    let namespace = match job.spec.repository_scope {
+        RepositoryScopeV1::PublicOnly => CacheNamespaceV1::Public,
+        RepositoryScopeV1::AllVisible => CacheNamespaceV1::Private {
+            principal_id: job
+                .spec
+                .credential_profile_id
+                .clone()
+                .context("private job lacks credential profile")?,
+        },
+    };
+    let repository_alias = task.repository_id.clone();
+    let normalized_repository_alias = crate::catalog::normalize_repository_alias(&repository_alias);
+    ensure!(
+        !normalized_repository_alias.is_empty(),
+        "failed-attempt repository alias is empty"
+    );
+    let (failure_code, failure_message) = if retry_at.is_some() {
+        (
+            "scan_attempt_retryable",
+            "repository scan attempt failed and is scheduled for retry",
+        )
+    } else {
+        ("scan_attempt_failed", "repository scan attempt failed")
+    };
+    let mut record = FailedAttemptProjectionRecordV1 {
+        key: FailedAttemptProjectionKeyV1 {
+            task_id: task.id.clone(),
+            task_attempt: task.attempt,
+        },
+        job_id: task.job_id.clone(),
+        namespace,
+        repository_alias,
+        normalized_repository_alias,
+        completed_at,
+        failure_code: failure_code.to_owned(),
+        failure_message: failure_message.to_owned(),
+        projection_digest: super::Sha256Digest::parse("0".repeat(64))
+            .expect("zero digest has valid syntax"),
+        inventory_projection: InventoryProjectionStateV1::Pending,
+    };
+    record.projection_digest = failed_attempt_projection_digest(&record);
+    Ok(record)
+}
+
+fn failed_attempt_projection_digest(
+    record: &FailedAttemptProjectionRecordV1,
+) -> super::Sha256Digest {
+    let canonical = serde_json::to_vec(&(
+        "failed-attempt-projection-v1",
+        &record.key,
+        &record.job_id,
+        &record.namespace,
+        &record.repository_alias,
+        &record.normalized_repository_alias,
+        record.completed_at,
+        &record.failure_code,
+        &record.failure_message,
+    ))
+    .expect("failed-attempt projection fields are JSON serializable");
+    super::Sha256Digest::parse(sha256_hex(&canonical))
+        .expect("SHA-256 output always has valid digest syntax")
+}
+
 fn update_artifact_index(
     artifacts: &mut BTreeMap<TaskId, ArtifactRecordV1>,
     reuse_index: &mut ReuseIndex,
@@ -1581,6 +2500,17 @@ fn update_artifact_index(
                 .entry(artifact.task_id.clone())
                 .or_insert_with(|| artifact.as_ref().clone());
             index_reusable_artifact(reuse_index, artifact);
+        }
+        DurableCommandV1::MarkArtifactProjected { task_id, now, .. } => {
+            let artifact = artifacts
+                .get_mut(task_id)
+                .expect("projection command was validated before persistence");
+            if !matches!(
+                artifact.inventory_projection,
+                InventoryProjectionStateV1::Projected { .. }
+            ) {
+                artifact.inventory_projection = InventoryProjectionStateV1::Projected { at: *now };
+            }
         }
         DurableCommandV1::RemoveExpiredArtifact { task_id, .. } => {
             if let Some(artifact) = artifacts.remove(task_id) {
@@ -1605,6 +2535,44 @@ fn update_artifact_index(
                     artifact.metadata.last_accessed_at = *accessed_at;
                 }
             }
+        }
+        _ => {}
+    }
+}
+
+fn update_failed_attempt_projection_outbox(
+    projections: &mut BTreeMap<FailedAttemptProjectionKeyV1, FailedAttemptProjectionRecordV1>,
+    memory: &InMemoryStateStore,
+    command: &DurableCommandV1,
+    outcome: &DurableOutcomeV1,
+) {
+    if matches!(outcome, DurableOutcomeV1::QuotaExceeded(_)) {
+        return;
+    }
+    match command {
+        DurableCommandV1::FailTask {
+            task_id,
+            retry_at,
+            now,
+            ..
+        } => {
+            let record = failed_attempt_projection_record(memory, task_id, *retry_at, *now)
+                .expect("failure projection command was validated before persistence");
+            projections.entry(record.key.clone()).or_insert(record);
+        }
+        DurableCommandV1::MarkFailedAttemptProjected { key, now, .. } => {
+            let record = projections
+                .get_mut(key)
+                .expect("projection marker command was validated before persistence");
+            if !matches!(
+                record.inventory_projection,
+                InventoryProjectionStateV1::Projected { .. }
+            ) {
+                record.inventory_projection = InventoryProjectionStateV1::Projected { at: *now };
+            }
+        }
+        DurableCommandV1::PruneFailedAttemptProjectionsBefore { cutoff } => {
+            projections.retain(|_, record| record.completed_at >= *cutoff);
         }
         _ => {}
     }
@@ -1670,6 +2638,7 @@ fn auto_finalize_job(
         && job.progress.tasks_leased == 0
     {
         memory.finalize_job(job_id, BTreeSet::new(), now)?;
+        let _ = memory.start_next_queued_job(now)?;
     }
     Ok(())
 }
@@ -1831,8 +2800,11 @@ mod tests {
 
     use super::*;
     use crate::coordinator::{
-        CacheKeyV1, EvidenceCompletenessV1, RepositoryScopeV1, SCHEMA_VERSION_V1, ScanBoundsV1,
-        ScanJobStateV1, ScanSpecV1, ScanTargetV1, Sha256Digest,
+        CacheKeyV1, ControlActionV1, ControlCommandV1, ControlResultV1, CreateScheduleV1,
+        EvidenceCompletenessV1, JobPriorityV1, OccurrenceStateV1, RepositoryScopeV1,
+        RepositorySetContentV1, RepositorySourceRefV1, SCHEMA_VERSION_V1, ScanBoundsV1,
+        ScanJobStateV1, ScanSpecV1, ScanTargetV1, ScheduleDefinitionV1, ScheduleId,
+        ScheduledOccurrenceRefV1, Sha256Digest, UtcCronV1,
     };
 
     fn submit_request(job: &str, now: DateTime<Utc>) -> SubmitJobV1 {
@@ -1854,9 +2826,40 @@ mod tests {
         }
     }
 
+    fn control_command(
+        command_id: &str,
+        issued_at: DateTime<Utc>,
+        action: ControlActionV1,
+    ) -> ControlCommandV1 {
+        ControlCommandV1 {
+            schema_version: SCHEMA_VERSION_V1,
+            command_id: command_id.to_owned(),
+            expected_generation: None,
+            issued_at,
+            action,
+        }
+    }
+
     fn submit(job: &str, now: DateTime<Utc>) -> DurableCommandV1 {
         DurableCommandV1::SubmitJob {
             request: submit_request(job, now),
+        }
+    }
+
+    fn register_repository_set(
+        command_id: &str,
+        repository: &str,
+        now: DateTime<Utc>,
+    ) -> ControlCommandV1 {
+        ControlCommandV1 {
+            schema_version: SCHEMA_VERSION_V1,
+            command_id: command_id.to_owned(),
+            expected_generation: None,
+            issued_at: now,
+            action: ControlActionV1::RegisterRepositorySet {
+                content: RepositorySetContentV1::from_repositories(vec![repository.to_owned()])
+                    .unwrap(),
+            },
         }
     }
 
@@ -1903,6 +2906,194 @@ mod tests {
                 .repository_ids_for_job(&JobId("batch".to_owned()))
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_batch_leaves_no_partial_state_before_or_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("coordinator.db");
+        let key_path = directory.path().join("key");
+        let key = EnvelopeKey::generate("test-key");
+        key.persist_new(&key_path).unwrap();
+        let now = Utc::now();
+        let store = TursoCoordinatorStore::open(&database, key).await.unwrap();
+        store
+            .apply(DurableCommandV1::SubmitJobWithTasks {
+                request: submit_request("accepted", now),
+                tasks: vec![task("accepted", "shared-task", "example/accepted", now)],
+                now,
+            })
+            .await
+            .unwrap();
+        let before_events = store.events().await.unwrap();
+
+        let error = store
+            .apply(DurableCommandV1::SubmitJobWithTasks {
+                request: submit_request("rejected", now),
+                tasks: vec![task("rejected", "shared-task", "example/rejected", now)],
+                now,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("TaskIdConflict"));
+        assert!(
+            store
+                .job(JobId("rejected".to_owned()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.events().await.unwrap(), before_events);
+
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let reopened = TursoCoordinatorStore::open(
+            &database,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            reopened
+                .job(JobId("rejected".to_owned()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(reopened.events().await.unwrap(), before_events);
+    }
+
+    #[tokio::test]
+    async fn deferred_task_state_and_retry_budget_survive_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("coordinator.db");
+        let key_path = directory.path().join("key");
+        let key = EnvelopeKey::generate("test-key");
+        key.persist_new(&key_path).unwrap();
+        let now = Utc::now();
+        let task_id = TaskId("deferred-task".to_owned());
+        let store = TursoCoordinatorStore::open(&database, key).await.unwrap();
+        store
+            .apply(DurableCommandV1::SubmitJobWithTasks {
+                request: submit_request("deferred", now),
+                tasks: vec![task("deferred", &task_id.0, "example/deferred", now)],
+                now,
+            })
+            .await
+            .unwrap();
+        store
+            .apply(DurableCommandV1::LeaseNextTask {
+                job_id: JobId("deferred".to_owned()),
+                agent_id: "agent".to_owned(),
+                lease_id: "lease".to_owned(),
+                lease_seconds: 60,
+                now,
+            })
+            .await
+            .unwrap();
+        let not_before = now + chrono::TimeDelta::seconds(30);
+        assert_eq!(
+            store
+                .apply(DurableCommandV1::DeferTask {
+                    task_id: task_id.clone(),
+                    agent_id: "agent".to_owned(),
+                    lease_id: "lease".to_owned(),
+                    not_before,
+                    reason_code: "provider_wait".to_owned(),
+                    now: now + chrono::TimeDelta::seconds(1),
+                })
+                .await
+                .unwrap(),
+            DurableOutcomeV1::Applied
+        );
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let reopened = TursoCoordinatorStore::open(
+            &database,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        let task = reopened.task(task_id).await.unwrap().unwrap();
+        assert_eq!(task.state, RepositoryTaskStateV1::Pending);
+        assert_eq!(task.attempt, 0);
+        assert_eq!(task.not_before, not_before);
+        assert!(task.lease.is_none());
+    }
+
+    #[tokio::test]
+    async fn twenty_sixth_batch_waits_and_is_promoted_durably() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("coordinator.db");
+        let key_path = directory.path().join("key");
+        let key = EnvelopeKey::generate("test-key");
+        key.persist_new(&key_path).unwrap();
+        let now = Utc::now();
+        let store = TursoCoordinatorStore::open(&database, key).await.unwrap();
+        for index in 0..=super::super::dispatch::MAX_RUNNING_JOBS {
+            let job = format!("dispatch-{index:02}");
+            store
+                .apply(DurableCommandV1::SubmitJobWithTasks {
+                    request: submit_request(&job, now + chrono::TimeDelta::seconds(index as i64)),
+                    tasks: vec![task(
+                        &job,
+                        &format!("dispatch-task-{index:02}"),
+                        &format!("example/repo-{index:02}"),
+                        now,
+                    )],
+                    now,
+                })
+                .await
+                .unwrap();
+        }
+        let queued_id = JobId(format!(
+            "dispatch-{:02}",
+            super::super::dispatch::MAX_RUNNING_JOBS
+        ));
+        assert_eq!(
+            store.job(queued_id.clone()).await.unwrap().unwrap().state,
+            ScanJobStateV1::Queued
+        );
+
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let reopened = TursoCoordinatorStore::open(
+            &database,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened
+                .job(queued_id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ScanJobStateV1::Queued
+        );
+        reopened
+            .apply(DurableCommandV1::PauseJob {
+                job_id: JobId("dispatch-00".to_owned()),
+                now: now + chrono::TimeDelta::minutes(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.job(queued_id).await.unwrap().unwrap().state,
+            ScanJobStateV1::Running
+        );
+        assert_eq!(
+            reopened
+                .jobs()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|job| job.state == ScanJobStateV1::Running)
+                .count(),
+            super::super::dispatch::MAX_RUNNING_JOBS
         );
     }
 
@@ -2077,6 +3268,315 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_attempt_projection_outbox_survives_compaction_and_marking() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("coordinator.db");
+        let key_path = directory.path().join("key");
+        EnvelopeKey::generate("test-key")
+            .persist_new(&key_path)
+            .unwrap();
+        let now = Utc::now();
+        let job_id = JobId("failure-outbox".to_owned());
+        let task_id = TaskId("failure-outbox-task".to_owned());
+        let store = TursoCoordinatorStore::open(
+            &database,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        store
+            .apply(DurableCommandV1::SubmitJobWithTasks {
+                request: submit_request(&job_id.0, now),
+                tasks: vec![task(&job_id.0, &task_id.0, "Example/App", now)],
+                now,
+            })
+            .await
+            .unwrap();
+        store
+            .apply(DurableCommandV1::LeaseNextTask {
+                job_id,
+                agent_id: "worker".to_owned(),
+                lease_id: "lease".to_owned(),
+                lease_seconds: 120,
+                now,
+            })
+            .await
+            .unwrap();
+        store
+            .apply(DurableCommandV1::FailTask {
+                task_id: task_id.clone(),
+                agent_id: "worker".to_owned(),
+                lease_id: "lease".to_owned(),
+                failure: "sensitive upstream response".to_owned(),
+                retry_at: None,
+                usage: TaskUsageV1::default(),
+                now: now + chrono::TimeDelta::seconds(1),
+            })
+            .await
+            .unwrap();
+        let [pending] = store
+            .pending_failed_attempt_projections_page(None, 10)
+            .await
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(pending.key.task_attempt, 1);
+        assert_eq!(pending.normalized_repository_alias, "example/app");
+        assert!(!pending.failure_message.contains("sensitive"));
+        store.compact().await.unwrap();
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let reopened = TursoCoordinatorStore::open(
+            &database,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened
+                .pending_failed_attempt_projections_page(None, 10)
+                .await
+                .unwrap(),
+            vec![pending.clone()]
+        );
+        assert_eq!(
+            reopened
+                .apply(DurableCommandV1::MarkFailedAttemptProjected {
+                    key: pending.key.clone(),
+                    projection_digest: pending.projection_digest.clone(),
+                    now: now + chrono::TimeDelta::seconds(2),
+                })
+                .await
+                .unwrap(),
+            DurableOutcomeV1::FailedAttemptProjection(FailedAttemptProjectionOutcomeV1::Marked)
+        );
+        reopened.compact().await.unwrap();
+        drop(reopened);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let reopened = TursoCoordinatorStore::open(
+            &database,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            reopened
+                .pending_failed_attempt_projections_page(None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .apply(DurableCommandV1::PruneFailedAttemptProjectionsBefore {
+                    cutoff: now + chrono::TimeDelta::days(365),
+                })
+                .await
+                .unwrap(),
+            DurableOutcomeV1::FailedAttemptProjectionsPruned(1)
+        );
+        assert_eq!(
+            reopened
+                .apply(DurableCommandV1::PruneFailedAttemptProjectionsBefore {
+                    cutoff: now + chrono::TimeDelta::days(365),
+                })
+                .await
+                .unwrap(),
+            DurableOutcomeV1::FailedAttemptProjectionsPruned(0)
+        );
+        reopened.compact().await.unwrap();
+        drop(reopened);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let reopened = TursoCoordinatorStore::open(
+            &database,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            reopened
+                .apply(DurableCommandV1::MarkFailedAttemptProjected {
+                    key: pending.key,
+                    projection_digest: pending.projection_digest,
+                    now: now + chrono::TimeDelta::days(365),
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_attempt_projection_retention_expires_pending_private_aliases() {
+        let cutoff = Utc::now();
+        let key = FailedAttemptProjectionKeyV1 {
+            task_id: TaskId("expired-private-task".to_owned()),
+            task_attempt: 1,
+        };
+        let record = FailedAttemptProjectionRecordV1 {
+            key: key.clone(),
+            job_id: JobId("expired-private-job".to_owned()),
+            namespace: CacheNamespaceV1::Private {
+                principal_id: "private-profile".to_owned(),
+            },
+            repository_alias: "Private/Repository".to_owned(),
+            normalized_repository_alias: "private/repository".to_owned(),
+            completed_at: cutoff - chrono::TimeDelta::seconds(1),
+            failure_code: "scan_attempt_failed".to_owned(),
+            failure_message: "repository scan attempt failed".to_owned(),
+            projection_digest: Sha256Digest::parse("a".repeat(64)).unwrap(),
+            inventory_projection: InventoryProjectionStateV1::Pending,
+        };
+        let mut projections = BTreeMap::from([(key, record)]);
+        update_failed_attempt_projection_outbox(
+            &mut projections,
+            &InMemoryStateStore::default(),
+            &DurableCommandV1::PruneFailedAttemptProjectionsBefore { cutoff },
+            &DurableOutcomeV1::FailedAttemptProjectionsPruned(1),
+        );
+        assert!(projections.is_empty());
+    }
+
+    #[test]
+    fn terminal_run_retention_preserves_retained_occurrence_jobs() {
+        let now = Utc::now();
+        let cutoff = now + chrono::TimeDelta::days(365);
+        let protected_job = JobId("scheduled-protected".to_owned());
+        let orphan_job = JobId("scheduled-orphan".to_owned());
+        let mut memory = InMemoryStateStore::default();
+        for job_id in [&protected_job, &orphan_job] {
+            memory.submit_job(submit_request(&job_id.0, now)).unwrap();
+            memory.start_job(job_id, now).unwrap();
+            memory.cancel_job(job_id, now).unwrap();
+        }
+
+        let content =
+            RepositorySetContentV1::from_repositories(vec!["owner/repository".to_owned()]).unwrap();
+        let schedule_id = ScheduleId("retained-job".to_owned());
+        let mut control = ControlState::default();
+        control
+            .apply(control_command(
+                "create-retained-job",
+                now,
+                ControlActionV1::CreateSchedule {
+                    request: CreateScheduleV1 {
+                        schema_version: SCHEMA_VERSION_V1,
+                        schedule_id: schedule_id.clone(),
+                        enabled: true,
+                        definition: ScheduleDefinitionV1 {
+                            schema_version: SCHEMA_VERSION_V1,
+                            cron: UtcCronV1::parse("0 * * * *").unwrap(),
+                            scan_spec: submit_request("spec", now).spec,
+                            repository_source: RepositorySourceRefV1::Explicit {
+                                repository_set: content.repository_set.clone(),
+                            },
+                            priority: JobPriorityV1::Normal,
+                            max_run_age_seconds: 3_600,
+                        },
+                        created_at: now,
+                    },
+                    repository_set_content: Some(content),
+                },
+            ))
+            .unwrap();
+        let planned = control
+            .apply(control_command(
+                "trigger-retained-job",
+                now,
+                ControlActionV1::TriggerSchedule {
+                    schedule_id: schedule_id.clone(),
+                },
+            ))
+            .unwrap();
+        let ControlResultV1::OccurrencePlanned { plan } = planned.result else {
+            panic!("expected a planned occurrence")
+        };
+        control
+            .apply(control_command(
+                "claim-retained-job",
+                now,
+                ControlActionV1::ClaimOccurrence {
+                    schedule_id: schedule_id.clone(),
+                },
+            ))
+            .unwrap();
+        let occurrence = ScheduledOccurrenceRefV1 {
+            schedule_id,
+            occurrence_id: plan.occurrence.id,
+        };
+        control
+            .apply(control_command(
+                "materialize-retained-job",
+                now,
+                ControlActionV1::MaterializeOccurrence {
+                    occurrence: occurrence.clone(),
+                    refresh: None,
+                    last_complete: None,
+                    repository_set_content: None,
+                },
+            ))
+            .unwrap();
+        control
+            .apply(control_command(
+                "attach-retained-job",
+                now,
+                ControlActionV1::AttachOccurrenceJob {
+                    occurrence: occurrence.clone(),
+                    job_id: protected_job.clone(),
+                },
+            ))
+            .unwrap();
+
+        let artifacts = BTreeMap::new();
+        let failed_attempts = BTreeMap::new();
+        let DurableOutcomeV1::RunsPruned(first) = apply_to_state(
+            &mut memory,
+            &mut control,
+            &artifacts,
+            &failed_attempts,
+            &DurableCommandV1::PruneTerminalRunsBefore { cutoff },
+        )
+        .unwrap() else {
+            panic!("expected run-retention outcome")
+        };
+        assert_eq!(first.jobs, 1);
+        assert!(memory.job(&protected_job).is_some());
+        assert!(memory.job(&orphan_job).is_none());
+
+        control
+            .apply(control_command(
+                "finish-retained-job",
+                now + chrono::TimeDelta::seconds(1),
+                ControlActionV1::FinishOccurrence {
+                    occurrence,
+                    terminal_state: OccurrenceStateV1::Completed,
+                },
+            ))
+            .unwrap();
+        control
+            .apply(control_command(
+                "prune-retained-job",
+                cutoff,
+                ControlActionV1::PruneBefore { cutoff },
+            ))
+            .unwrap();
+        let DurableOutcomeV1::RunsPruned(second) = apply_to_state(
+            &mut memory,
+            &mut control,
+            &artifacts,
+            &failed_attempts,
+            &DurableCommandV1::PruneTerminalRunsBefore { cutoff },
+        )
+        .unwrap() else {
+            panic!("expected run-retention outcome")
+        };
+        assert_eq!(second.jobs, 1);
+        assert!(memory.job(&protected_job).is_none());
+    }
+
+    #[tokio::test]
     async fn replays_encrypted_journal_after_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("coordinator.db");
@@ -2109,6 +3609,95 @@ mod tests {
                 .created_at,
             now
         );
+    }
+
+    #[tokio::test]
+    async fn control_command_is_idempotent_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("coordinator.db");
+        let key_path = directory.path().join("key");
+        let key = EnvelopeKey::generate("test-key");
+        key.persist_new(&key_path).unwrap();
+        let command = register_repository_set("register-acme-repo", "acme/repo", Utc::now());
+
+        let store = TursoCoordinatorStore::open(&database_path, key)
+            .await
+            .unwrap();
+        let first = store.apply_control(command.clone()).await.unwrap();
+        let duplicate = store.apply_control(command).await.unwrap();
+        assert_eq!(duplicate, first);
+        assert_eq!(store.control_snapshot().await.unwrap().generation, 1);
+        assert_eq!(store.compact().await.unwrap().commands_compacted, 1);
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let reopened = TursoCoordinatorStore::open(
+            &database_path,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        let snapshot = reopened.control_snapshot().await.unwrap();
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(snapshot.repository_sets.len(), 1);
+        assert_eq!(snapshot.processed_commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn control_snapshot_replays_journal_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("coordinator.db");
+        let key_path = directory.path().join("key");
+        let key = EnvelopeKey::generate("test-key");
+        key.persist_new(&key_path).unwrap();
+        let now = Utc::now();
+
+        let store = TursoCoordinatorStore::open(&database_path, key)
+            .await
+            .unwrap();
+        store
+            .apply_control(register_repository_set("register-first", "acme/first", now))
+            .await
+            .unwrap();
+        store.compact().await.unwrap();
+        store
+            .apply_control(register_repository_set(
+                "register-second",
+                "acme/second",
+                now + chrono::TimeDelta::seconds(1),
+            ))
+            .await
+            .unwrap();
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let reopened = TursoCoordinatorStore::open(
+            &database_path,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        let snapshot = reopened.control_snapshot().await.unwrap();
+        assert_eq!(snapshot.generation, 2);
+        assert_eq!(snapshot.repository_sets.len(), 2);
+        assert_eq!(snapshot.processed_commands.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_without_control_field_decodes_as_empty_control_state() {
+        let snapshot = CoordinatorSnapshotV1 {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            command_count: 0,
+            state: InMemoryStateStore::default().snapshot(),
+            artifacts: Vec::new(),
+            failed_attempt_projections: Vec::new(),
+            control: Some(ControlState::default().snapshot()),
+        };
+        let mut encoded = serde_json::to_value(snapshot).unwrap();
+        encoded.as_object_mut().unwrap().remove("control");
+
+        let decoded: CoordinatorSnapshotV1 = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.control.is_none());
     }
 
     #[tokio::test]
@@ -2295,7 +3884,9 @@ mod tests {
         migrate(&connection).await.unwrap();
         let key = EnvelopeKey::generate("test-key");
         let mut memory = InMemoryStateStore::default();
+        let mut control = ControlState::default();
         let mut artifacts = BTreeMap::new();
+        let mut failed_attempt_projections = BTreeMap::new();
         let mut reuse_index = ReuseIndex::new();
         let mut journal = JournalState {
             total_commands: 0,
@@ -2307,7 +3898,9 @@ mod tests {
             &connection,
             &key,
             &mut memory,
+            &mut control,
             &mut artifacts,
+            &mut failed_attempt_projections,
             &mut reuse_index,
             &mut journal,
             &submit("rollback", Utc::now()),
@@ -2323,9 +3916,17 @@ mod tests {
             .unwrap();
 
         assert!(
-            compact_state(&connection, &key, &memory, &artifacts, &mut journal)
-                .await
-                .is_err()
+            compact_state(
+                &connection,
+                &key,
+                &memory,
+                &control,
+                &artifacts,
+                &failed_attempt_projections,
+                &mut journal,
+            )
+            .await
+            .is_err()
         );
         assert_eq!(
             scalar(&connection, "SELECT COUNT(*) FROM coordinator_snapshot").await,
@@ -2481,7 +4082,19 @@ mod tests {
             job_id: job_id.clone(),
             task_id: task_id.clone(),
             metadata,
+            inventory_projection: InventoryProjectionStateV1::Pending,
         };
+        let mut legacy_artifact = serde_json::to_value(&artifact).unwrap();
+        legacy_artifact
+            .as_object_mut()
+            .unwrap()
+            .remove("inventory_projection");
+        assert_eq!(
+            serde_json::from_value::<ArtifactRecordV1>(legacy_artifact)
+                .unwrap()
+                .inventory_projection,
+            InventoryProjectionStateV1::LegacyUnknown
+        );
 
         let store = TursoCoordinatorStore::open(&database, key).await.unwrap();
         store.apply(submit(&job_id.0, now)).await.unwrap();
@@ -2532,6 +4145,10 @@ mod tests {
             Some(artifact.clone())
         );
         assert_eq!(
+            store.pending_artifacts_page(None, 1).await.unwrap(),
+            vec![artifact.clone()]
+        );
+        assert_eq!(
             store
                 .reusable_artifact(CacheNamespaceV1::Public, reuse_fingerprint.clone(), now,)
                 .await
@@ -2558,6 +4175,56 @@ mod tests {
             store.task(task_id.clone()).await.unwrap().unwrap().result,
             Some(result)
         );
+        let wrong_digest = Sha256Digest::parse("ef".repeat(32)).unwrap();
+        assert!(
+            store
+                .apply(DurableCommandV1::MarkArtifactProjected {
+                    task_id: task_id.clone(),
+                    artifact_digest: wrong_digest,
+                    now,
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .artifact(task_id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .inventory_projection,
+            InventoryProjectionStateV1::Pending
+        );
+        let projected_at = now + chrono::TimeDelta::seconds(1);
+        assert_eq!(
+            store
+                .apply(DurableCommandV1::MarkArtifactProjected {
+                    task_id: task_id.clone(),
+                    artifact_digest: artifact.metadata.key.digest.clone(),
+                    now: projected_at,
+                })
+                .await
+                .unwrap(),
+            DurableOutcomeV1::ArtifactProjection(ArtifactProjectionOutcomeV1::Marked)
+        );
+        assert_eq!(
+            store
+                .apply(DurableCommandV1::MarkArtifactProjected {
+                    task_id: task_id.clone(),
+                    artifact_digest: artifact.metadata.key.digest.clone(),
+                    now: projected_at + chrono::TimeDelta::seconds(1),
+                })
+                .await
+                .unwrap(),
+            DurableOutcomeV1::ArtifactProjection(ArtifactProjectionOutcomeV1::AlreadyProjected)
+        );
+        assert!(
+            store
+                .pending_artifacts_page(None, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         drop(store);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2567,7 +4234,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(reopened.artifact(task_id.clone()).await.unwrap().is_some());
+        assert_eq!(
+            reopened
+                .artifact(task_id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .inventory_projection,
+            InventoryProjectionStateV1::Projected { at: projected_at }
+        );
         assert!(
             reopened
                 .reusable_artifact(CacheNamespaceV1::Public, reuse_fingerprint.clone(), now,)
@@ -2587,8 +4262,31 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            reopened.job(job_id).await.unwrap().unwrap().state,
+            reopened.job(job_id.clone()).await.unwrap().unwrap().state,
             ScanJobStateV1::Completed
+        );
+        let retention_page = reopened
+            .expired_artifacts_page(now + chrono::TimeDelta::days(366), 1)
+            .await
+            .unwrap();
+        assert_eq!(retention_page.total_candidates, 1);
+        let mut projected_artifact = artifact.clone();
+        projected_artifact.inventory_projection =
+            InventoryProjectionStateV1::Projected { at: projected_at };
+        assert_eq!(retention_page.candidates, vec![projected_artifact]);
+        assert!(
+            retention_page
+                .removable_blob_keys
+                .contains(&artifact.metadata.key)
+        );
+        assert_eq!(
+            reopened
+                .apply(DurableCommandV1::PruneTerminalRunsBefore {
+                    cutoff: now + chrono::TimeDelta::days(365),
+                })
+                .await
+                .unwrap(),
+            DurableOutcomeV1::RunsPruned(OperationalRetentionSummaryV1::default())
         );
         reopened
             .apply(DurableCommandV1::RemoveExpiredArtifact {
@@ -2598,6 +4296,18 @@ mod tests {
             .await
             .unwrap();
         assert!(reopened.artifact(task_id.clone()).await.unwrap().is_none());
+        let DurableOutcomeV1::RunsPruned(summary) = reopened
+            .apply(DurableCommandV1::PruneTerminalRunsBefore {
+                cutoff: now + chrono::TimeDelta::days(365),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("unexpected retention outcome")
+        };
+        assert_eq!(summary.jobs, 1);
+        assert_eq!(summary.tasks, 1);
+        reopened.compact().await.unwrap();
 
         drop(reopened);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2608,5 +4318,6 @@ mod tests {
         .await
         .unwrap();
         assert!(collected.artifact(task_id).await.unwrap().is_none());
+        assert!(collected.job(job_id).await.unwrap().is_none());
     }
 }

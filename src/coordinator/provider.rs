@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,11 @@ use super::domain::{PermitId, RepositoryScopeV1};
 
 const GITHUB_REPOSITORY_ANALYSIS_MAX_IN_FLIGHT: u32 = 16;
 const GITHUB_REPOSITORY_ANALYSIS_PERMIT_TTL_SECONDS: u64 = 10 * 60;
+const GITHUB_REQUEST_PERMIT_TTL_SECONDS: u64 = 60;
 const PUBLIC_GITHUB_PRINCIPAL: &str = "public";
+const COMPLETED_PERMIT_RETRY_HORIZON_SECONDS: u64 = 15 * 60;
+const MAX_COMPLETED_PERMITS: usize = 262_144;
+const COMPLETED_PERMIT_COMPACTION_TARGET: usize = 196_608;
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ProviderKeyV1 {
@@ -58,6 +62,18 @@ impl ProviderPolicyV1 {
         }
     }
 
+    /// Shared admission policy for individual GitHub HTTP requests. Expiring
+    /// permits make cancellation safe even when a worker disappears between
+    /// acquire and finish.
+    pub fn github_requests() -> Self {
+        Self {
+            max_in_flight: GITHUB_REPOSITORY_ANALYSIS_MAX_IN_FLIGHT,
+            minimum_interval_millis: 0,
+            permit_ttl_seconds: GITHUB_REQUEST_PERMIT_TTL_SECONDS,
+            circuit: CircuitPolicyV1::default(),
+        }
+    }
+
     pub fn crates_io_api() -> Self {
         Self {
             max_in_flight: 1,
@@ -101,6 +117,31 @@ impl ProviderKeyV1 {
                 .unwrap_or(PUBLIC_GITHUB_PRINCIPAL)
                 .to_owned(),
             resource: format!("repository_analysis:{scope}"),
+        }
+    }
+
+    pub fn github_request(
+        scope: RepositoryScopeV1,
+        credential_profile_id: Option<&str>,
+        resource: &str,
+    ) -> Self {
+        let scope = match scope {
+            RepositoryScopeV1::PublicOnly => "public_only",
+            RepositoryScopeV1::AllVisible => "all_visible",
+        };
+        let resource = match resource {
+            "core" => "core",
+            "search" => "search",
+            _ => "other",
+        };
+        Self {
+            provider: "github".to_owned(),
+            principal_id: credential_profile_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(PUBLIC_GITHUB_PRINCIPAL)
+                .to_owned(),
+            resource: format!("request:{scope}:{resource}"),
         }
     }
 }
@@ -198,14 +239,24 @@ struct ProviderEntry {
 pub struct ProviderGate {
     providers: BTreeMap<ProviderKeyV1, ProviderEntry>,
     active_permits: BTreeMap<PermitId, ProviderPermitV1>,
-    completed_permits: BTreeSet<PermitId>,
+    completed_permits: BTreeMap<PermitId, Option<DateTime<Utc>>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum CompletedPermitSnapshotV1 {
+    Timestamped {
+        id: PermitId,
+        completed_at: DateTime<Utc>,
+    },
+    Legacy(PermitId),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct ProviderGateSnapshotV1 {
     providers: Vec<(ProviderKeyV1, ProviderEntry)>,
     active_permits: Vec<ProviderPermitV1>,
-    completed_permits: Vec<PermitId>,
+    completed_permits: Vec<CompletedPermitSnapshotV1>,
 }
 
 impl ProviderGate {
@@ -217,7 +268,17 @@ impl ProviderGate {
                 .map(|(key, entry)| (key.clone(), entry.clone()))
                 .collect(),
             active_permits: self.active_permits.values().cloned().collect(),
-            completed_permits: self.completed_permits.iter().cloned().collect(),
+            completed_permits: self
+                .completed_permits
+                .iter()
+                .map(|(id, completed_at)| match completed_at {
+                    Some(completed_at) => CompletedPermitSnapshotV1::Timestamped {
+                        id: id.clone(),
+                        completed_at: *completed_at,
+                    },
+                    None => CompletedPermitSnapshotV1::Legacy(id.clone()),
+                })
+                .collect(),
         }
     }
 
@@ -239,13 +300,23 @@ impl ProviderGate {
                 return Err(ProviderError::InvalidSnapshot);
             }
         }
-        for permit_id in snapshot.completed_permits {
+        for completed in snapshot.completed_permits {
+            let (permit_id, completed_at) = match completed {
+                CompletedPermitSnapshotV1::Timestamped { id, completed_at } => {
+                    (id, Some(completed_at))
+                }
+                CompletedPermitSnapshotV1::Legacy(id) => (id, None),
+            };
             if gate.active_permits.contains_key(&permit_id)
-                || !gate.completed_permits.insert(permit_id)
+                || gate
+                    .completed_permits
+                    .insert(permit_id, completed_at)
+                    .is_some()
             {
                 return Err(ProviderError::InvalidSnapshot);
             }
         }
+        gate.prune_completed_permits_from_latest_observation();
         Ok(gate)
     }
 
@@ -255,7 +326,7 @@ impl ProviderGate {
         policy: ProviderPolicyV1,
     ) -> Result<(), ProviderError> {
         validate_policy(policy)?;
-        match self.providers.get(&key) {
+        let result = match self.providers.get(&key) {
             Some(existing) if existing.policy == policy => Ok(()),
             Some(_) => Err(ProviderError::ConflictingPolicy),
             None => {
@@ -268,7 +339,11 @@ impl ProviderGate {
                 );
                 Ok(())
             }
+        };
+        if result.is_ok() {
+            self.prune_completed_permits_from_latest_observation();
         }
+        result
     }
 
     pub fn state(&self, key: &ProviderKeyV1) -> Option<&ProviderRateStateV1> {
@@ -289,7 +364,7 @@ impl ProviderGate {
             }
             return Err(ProviderError::PermitIdConflict);
         }
-        if self.completed_permits.contains(&permit_id) {
+        if self.completed_permits.contains_key(&permit_id) {
             return Err(ProviderError::PermitAlreadyFinished);
         }
 
@@ -366,7 +441,7 @@ impl ProviderGate {
         now: DateTime<Utc>,
     ) -> Result<(), ProviderError> {
         self.reclaim_expired_permits(now);
-        if self.completed_permits.contains(permit_id) {
+        if self.completed_permits.contains_key(permit_id) {
             return Ok(());
         }
         let permit = self
@@ -387,7 +462,8 @@ impl ProviderGate {
 
         apply_rate_observation(&mut entry.rate, observation, now);
         update_circuit(&mut entry.rate, entry.policy.circuit, outcome, now);
-        self.completed_permits.insert(permit_id.clone());
+        self.completed_permits.insert(permit_id.clone(), Some(now));
+        self.prune_completed_permits(now);
         Ok(())
     }
 
@@ -410,9 +486,70 @@ impl ProviderGate {
                     now,
                 );
             }
-            self.completed_permits.insert(permit_id.clone());
+            self.completed_permits.insert(permit_id.clone(), Some(now));
         }
+        self.prune_completed_permits(now);
         expired
+    }
+
+    fn prune_completed_permits_from_latest_observation(&mut self) {
+        let latest = self.completed_permits.values().flatten().max().copied();
+        if let Some(latest) = latest {
+            self.prune_completed_permits(latest);
+        }
+    }
+
+    fn prune_completed_permits(&mut self, now: DateTime<Utc>) {
+        let retention_seconds = self
+            .providers
+            .values()
+            .map(|entry| {
+                entry
+                    .policy
+                    .permit_ttl_seconds
+                    .max(entry.policy.circuit.maximum_cooldown_seconds)
+            })
+            .max()
+            .unwrap_or(0)
+            .max(COMPLETED_PERMIT_RETRY_HORIZON_SECONDS);
+        let retention_seconds = i64::try_from(retention_seconds).unwrap_or(i64::MAX);
+        let cutoff = now
+            .checked_sub_signed(TimeDelta::seconds(retention_seconds))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        for completed_at in self.completed_permits.values_mut() {
+            if completed_at.is_none() {
+                *completed_at = Some(now);
+            }
+        }
+        self.completed_permits
+            .retain(|_, completed_at| completed_at.is_some_and(|instant| instant >= cutoff));
+        self.prune_completed_permit_capacity(
+            MAX_COMPLETED_PERMITS,
+            COMPLETED_PERMIT_COMPACTION_TARGET,
+        );
+    }
+
+    fn prune_completed_permit_capacity(&mut self, maximum: usize, target: usize) {
+        if self.completed_permits.len() <= maximum {
+            return;
+        }
+        debug_assert!(target < maximum);
+        let remove_count = self.completed_permits.len().saturating_sub(target);
+        let mut completed = self
+            .completed_permits
+            .iter()
+            .filter_map(|(permit_id, completed_at)| {
+                completed_at.map(|completed_at| (completed_at, permit_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        if remove_count < completed.len() {
+            completed.select_nth_unstable_by(remove_count - 1, |left, right| {
+                left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+            });
+        }
+        for (_, permit_id) in completed.into_iter().take(remove_count) {
+            self.completed_permits.remove(&permit_id);
+        }
     }
 }
 
@@ -621,6 +758,86 @@ mod tests {
     }
 
     #[test]
+    fn completed_permit_dedupe_is_retained_for_retries_then_pruned() {
+        let mut gate = ProviderGate::default();
+        gate.configure(
+            key(),
+            ProviderPolicyV1 {
+                minimum_interval_millis: 0,
+                ..ProviderPolicyV1::crates_io_api()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            gate.acquire(&key(), permit(1), "agent", time(0)).unwrap(),
+            PermitDecision::Granted(_)
+        ));
+        gate.finish(
+            &permit(1),
+            "agent",
+            ProviderOutcomeClassV1::Success,
+            &RateLimitObservationV1::default(),
+            time(0),
+        )
+        .unwrap();
+        gate.finish(
+            &permit(1),
+            "agent",
+            ProviderOutcomeClassV1::Success,
+            &RateLimitObservationV1::default(),
+            time(1),
+        )
+        .unwrap();
+        assert_eq!(gate.completed_permits.len(), 1);
+
+        let after_horizon = time(COMPLETED_PERMIT_RETRY_HORIZON_SECONDS as u32 + 1);
+        assert!(matches!(
+            gate.acquire(&key(), permit(1), "agent", after_horizon)
+                .unwrap(),
+            PermitDecision::Granted(_)
+        ));
+        assert!(gate.completed_permits.is_empty());
+    }
+
+    #[test]
+    fn legacy_completed_permit_snapshot_gets_a_bounded_migration_window() {
+        let mut gate = ProviderGate::default();
+        gate.configure(
+            key(),
+            ProviderPolicyV1 {
+                minimum_interval_millis: 0,
+                ..ProviderPolicyV1::crates_io_api()
+            },
+        )
+        .unwrap();
+        let mut snapshot = serde_json::to_value(gate.snapshot()).unwrap();
+        snapshot["completed_permits"] = serde_json::json!(["legacy-permit"]);
+        let snapshot: ProviderGateSnapshotV1 = serde_json::from_value(snapshot).unwrap();
+        let mut restored = ProviderGate::from_snapshot(snapshot).unwrap();
+
+        assert_eq!(
+            restored.acquire(
+                &key(),
+                PermitId("legacy-permit".to_owned()),
+                "agent",
+                time(0),
+            ),
+            Err(ProviderError::PermitAlreadyFinished)
+        );
+        assert!(matches!(
+            restored
+                .acquire(
+                    &key(),
+                    PermitId("legacy-permit".to_owned()),
+                    "agent",
+                    time(COMPLETED_PERMIT_RETRY_HORIZON_SECONDS as u32 + 1),
+                )
+                .unwrap(),
+            PermitDecision::Granted(_)
+        ));
+    }
+
+    #[test]
     fn circuit_opens_after_five_qualifying_failures() {
         let mut gate = ProviderGate::default();
         gate.configure(
@@ -638,6 +855,21 @@ mod tests {
             gate.acquire(&key(), permit(5), "agent", time(5)).unwrap(),
             PermitDecision::WaitUntil(time(34))
         );
+    }
+
+    #[test]
+    fn completed_permit_capacity_prunes_oldest_entries_in_batches() {
+        let mut gate = ProviderGate::default();
+        for value in 0..6 {
+            gate.completed_permits
+                .insert(PermitId(format!("permit-{value}")), Some(time(value)));
+        }
+        gate.prune_completed_permit_capacity(5, 3);
+        assert_eq!(gate.completed_permits.len(), 3);
+        assert!(!gate.completed_permits.contains_key(&permit(0)));
+        assert!(!gate.completed_permits.contains_key(&permit(1)));
+        assert!(!gate.completed_permits.contains_key(&permit(2)));
+        assert!(gate.completed_permits.contains_key(&permit(5)));
     }
 
     #[test]

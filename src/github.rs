@@ -22,8 +22,14 @@ use reqwest::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::Url;
 
+mod request_gate;
 mod tree_inventory;
 
+pub use request_gate::{
+    GitHubRateResourceV1, GitHubRequestAttemptV1, GitHubRequestGate, GitHubRequestGateError,
+    GitHubRequestOutcomeV1, GitHubRequestPermitV1, GitHubRequestRateLimitV1,
+    GitHubRequestResourceV1, GitHubRequestTransportV1, OutboundProviderV1,
+};
 pub use tree_inventory::{
     GitHubTreeInventory, GitHubTreeInventoryLimitation, GitHubTreeInventoryLimits,
 };
@@ -551,6 +557,7 @@ pub struct GitHubClient {
     api_base: Url,
     token: Option<Arc<str>>,
     usage: Arc<GitHubUsageCounters>,
+    request_gate: Option<Arc<dyn GitHubRequestGate>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -618,7 +625,15 @@ impl GitHubClient {
             api_base,
             token,
             usage: Arc::new(GitHubUsageCounters::default()),
+            request_gate: None,
         })
+    }
+
+    /// Attach admission and accounting for each HTTP attempt. An ordinary
+    /// client has no gate and retains the standalone request path.
+    pub fn with_gate(mut self, gate: Arc<dyn GitHubRequestGate>) -> Self {
+        self.request_gate = Some(gate);
+        self
     }
 
     pub fn usage(&self) -> GitHubUsage {
@@ -957,14 +972,41 @@ impl GitHubClient {
 
     async fn send_get(&self, url: Url, accept: &'static str) -> Result<Response> {
         for attempt in 0..MAX_ATTEMPTS {
-            self.usage.requests.fetch_add(1, Ordering::Relaxed);
-            let response = match self
-                .client
-                .get(url.clone())
-                .header(ACCEPT, accept)
-                .send()
-                .await
-            {
+            let response_result = match self.request_gate.as_deref() {
+                Some(gate) => {
+                    let request = GitHubRequestAttemptV1 {
+                        provider: OutboundProviderV1::GitHub,
+                        resource: request_resource(&url),
+                        attempt: (attempt + 1) as u8,
+                        max_attempts: MAX_ATTEMPTS as u8,
+                    };
+                    let permit = gate
+                        .acquire(request)
+                        .await
+                        .context("GitHub provider admission failed")?;
+                    let response_result = self.send_get_attempt(&url, accept).await;
+                    let outcome = match &response_result {
+                        Ok(response) => GitHubRequestOutcomeV1 {
+                            request,
+                            transport: GitHubRequestTransportV1::ResponseHeaders,
+                            status: Some(response.status().as_u16()),
+                            rate_limit: request_gate_rate_limit(response.headers()),
+                        },
+                        Err(error) => GitHubRequestOutcomeV1 {
+                            request,
+                            transport: request_transport(error),
+                            status: None,
+                            rate_limit: None,
+                        },
+                    };
+                    gate.finish(permit, outcome)
+                        .await
+                        .context("GitHub provider outcome accounting failed")?;
+                    response_result
+                }
+                None => self.send_get_attempt(&url, accept).await,
+            };
+            let response = match response_result {
                 Ok(response) => response,
                 Err(error)
                     if attempt + 1 < MAX_ATTEMPTS && (error.is_connect() || error.is_timeout()) =>
@@ -994,6 +1036,15 @@ impl GitHubClient {
             return Err(self.api_error(response).await.into());
         }
         unreachable!("GitHub request retry loop always returns")
+    }
+
+    async fn send_get_attempt(&self, url: &Url, accept: &'static str) -> reqwest::Result<Response> {
+        self.usage.requests.fetch_add(1, Ordering::Relaxed);
+        self.client
+            .get(url.clone())
+            .header(ACCEPT, accept)
+            .send()
+            .await
     }
 
     async fn api_error(&self, mut response: Response) -> GitHubApiError {
@@ -1042,6 +1093,63 @@ impl GitHubClient {
         drop(path);
         Ok(url)
     }
+}
+
+fn request_resource(url: &Url) -> GitHubRequestResourceV1 {
+    if let Some(mut segments) = url.path_segments() {
+        while let Some(segment) = segments.next() {
+            if segment == "search"
+                && segments.next().is_some_and(|kind| {
+                    matches!(kind, "code" | "repositories" | "commits" | "issues")
+                })
+            {
+                return GitHubRequestResourceV1::Search;
+            }
+        }
+    }
+    GitHubRequestResourceV1::Core
+}
+
+fn request_transport(error: &reqwest::Error) -> GitHubRequestTransportV1 {
+    if error.is_connect() {
+        GitHubRequestTransportV1::ConnectFailure
+    } else if error.is_timeout() {
+        GitHubRequestTransportV1::Timeout
+    } else {
+        GitHubRequestTransportV1::TransportFailure
+    }
+}
+
+fn request_gate_rate_limit(headers: &HeaderMap) -> Option<GitHubRequestRateLimitV1> {
+    let rate_limit = GitHubRateLimit::from_headers(headers)?;
+    let (retry_after_seconds, retry_after_at) = rate_limit
+        .retry_after
+        .as_deref()
+        .map(|value| {
+            if let Ok(seconds) = value.parse::<u64>() {
+                (Some(seconds), None)
+            } else {
+                (
+                    None,
+                    DateTime::parse_from_rfc2822(value)
+                        .ok()
+                        .map(|value| value.with_timezone(&Utc)),
+                )
+            }
+        })
+        .unwrap_or_default();
+    Some(GitHubRequestRateLimitV1 {
+        limit: rate_limit.limit,
+        remaining: rate_limit.remaining,
+        used: rate_limit.used,
+        reset_epoch: rate_limit.reset_epoch,
+        resource: rate_limit
+            .resource
+            .as_deref()
+            .map(GitHubRateResourceV1::from_header),
+        retry_after_seconds,
+        retry_after_at,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1274,12 +1382,69 @@ fn base64_value(byte: u8) -> Result<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
+
     use super::*;
+    use futures::FutureExt as _;
     use serde_json::json;
     use wiremock::{
-        Mock, MockServer, ResponseTemplate,
+        Mock, MockServer, Request, ResponseTemplate,
         matchers::{header, method, path, query_param, query_param_is_missing},
     };
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum GateEvent {
+        Acquire(GitHubRequestAttemptV1),
+        Finish(GitHubRequestOutcomeV1),
+    }
+
+    #[derive(Default)]
+    struct RecordingGate {
+        sequence: AtomicU64,
+        events: Mutex<Vec<GateEvent>>,
+    }
+
+    impl RecordingGate {
+        fn events(&self) -> Vec<GateEvent> {
+            self.events.lock().expect("gate event lock").clone()
+        }
+    }
+
+    impl GitHubRequestGate for RecordingGate {
+        fn acquire<'a>(
+            &'a self,
+            request: GitHubRequestAttemptV1,
+        ) -> futures::future::BoxFuture<'a, Result<GitHubRequestPermitV1, GitHubRequestGateError>>
+        {
+            async move {
+                self.events
+                    .lock()
+                    .expect("gate event lock")
+                    .push(GateEvent::Acquire(request));
+                let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+                GitHubRequestPermitV1::new(format!("permit-{sequence}"))
+            }
+            .boxed()
+        }
+
+        fn finish<'a>(
+            &'a self,
+            _permit: GitHubRequestPermitV1,
+            outcome: GitHubRequestOutcomeV1,
+        ) -> futures::future::BoxFuture<'a, Result<(), GitHubRequestGateError>> {
+            async move {
+                self.events
+                    .lock()
+                    .expect("gate event lock")
+                    .push(GateEvent::Finish(outcome));
+                Ok(())
+            }
+            .boxed()
+        }
+    }
 
     fn test_client(server: &MockServer, token: Option<String>) -> GitHubClient {
         GitHubClient::with_api_base(
@@ -1307,6 +1472,96 @@ mod tests {
             "private": false,
             "pushed_at": "2026-08-01T12:00:00Z"
         })
+    }
+
+    #[tokio::test]
+    async fn request_gate_acquires_and_finishes_every_retry_attempt() {
+        let server = MockServer::start().await;
+        let response_number = Arc::new(AtomicUsize::new(0));
+        let response_sequence = Arc::clone(&response_number);
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget"))
+            .respond_with(move |_: &Request| {
+                if response_sequence.fetch_add(1, Ordering::Relaxed) == 0 {
+                    ResponseTemplate::new(503)
+                        .insert_header("retry-after", "0")
+                        .insert_header("x-ratelimit-limit", "5")
+                        .insert_header("x-ratelimit-remaining", "0")
+                        .insert_header("x-ratelimit-resource", "core")
+                        .set_body_json(json!({"message": "temporarily unavailable"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(repository_json("acme", "widget", 42))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let gate = Arc::new(RecordingGate::default());
+        let repository = test_client(&server, None)
+            .with_gate(gate.clone())
+            .repository(&GitHubRepo::new("acme", "widget").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(repository.id, 42);
+
+        let events = gate.events();
+        assert_eq!(events.len(), 4);
+        for (index, expected_attempt) in [1_u8, 2].into_iter().enumerate() {
+            let GateEvent::Acquire(request) = &events[index * 2] else {
+                panic!("expected acquire before finish");
+            };
+            assert_eq!(request.provider, OutboundProviderV1::GitHub);
+            assert_eq!(request.resource, GitHubRequestResourceV1::Core);
+            assert_eq!(request.attempt, expected_attempt);
+            assert_eq!(request.max_attempts, MAX_ATTEMPTS as u8);
+            let GateEvent::Finish(outcome) = &events[index * 2 + 1] else {
+                panic!("expected finish after acquire");
+            };
+            assert_eq!(outcome.request, *request);
+            assert_eq!(
+                outcome.status,
+                Some(if expected_attempt == 1 { 503 } else { 200 })
+            );
+            assert_eq!(outcome.transport, GitHubRequestTransportV1::ResponseHeaders);
+        }
+        let GateEvent::Finish(first_outcome) = &events[1] else {
+            unreachable!();
+        };
+        assert_eq!(
+            first_outcome.rate_limit,
+            Some(GitHubRequestRateLimitV1 {
+                limit: Some(5),
+                remaining: Some(0),
+                resource: Some(GitHubRateResourceV1::Core),
+                retry_after_seconds: Some(0),
+                ..GitHubRequestRateLimitV1::default()
+            })
+        );
+        let rendered = format!("{events:?}");
+        assert!(!rendered.contains("acme"));
+        assert!(!rendered.contains("widget"));
+        assert_eq!(response_number.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn ungated_client_preserves_the_single_attempt_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widget"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(repository_json("acme", "widget", 42)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server, None);
+        client
+            .repository(&GitHubRepo::new("acme", "widget").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(client.usage().requests, 1);
     }
 
     #[test]

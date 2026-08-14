@@ -1,6 +1,9 @@
 pub mod advisory;
 pub mod cargo_evidence;
+pub mod catalog;
 pub mod cli;
+pub mod control_api;
+pub mod control_auth;
 pub mod coordinator;
 pub mod coordinator_api;
 pub mod crates_io;
@@ -22,6 +25,8 @@ pub mod secure_cache;
 pub mod telemetry;
 pub mod version_selector;
 
+#[cfg(test)]
+mod rollout_gates;
 #[cfg(test)]
 mod scan_acceptance;
 

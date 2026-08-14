@@ -28,6 +28,17 @@ policy decisions, and operational health as separate facts.
   and audit events.
 - **Agent**: an enrolled LAN worker authenticated with a client certificate. It
   leases idempotent tasks and never owns the coordinator database.
+- **Schedule revision**: an immutable UTC cadence, scan specification,
+  repository source, and execution policy used to create future occurrences.
+- **Schedule occurrence**: one idempotent nominal run of a schedule. It records
+  repository-set materialization, queue admission, and the resulting job.
+- **Saved inventory query**: a revisioned, typed repository query evaluated at
+  one inventory watermark and materialized before a scheduled job is queued.
+- **Inventory observation**: a retained, searchable projection of one accepted
+  repository attempt and its canonical evidence. The encrypted evidence bundle
+  remains authoritative and the projection is rebuildable.
+- **Control identity**: an OIDC subject or scoped service token authorized for
+  human and automation operations. Control identities never lease worker tasks.
 - **Public scope**: the compatibility default. Credentials do not widen it.
 - **All-visible scope**: an explicit authenticated opt-in that includes every
   public, private, or internal repository visible to the credential.
@@ -49,3 +60,11 @@ policy decisions, and operational health as separate facts.
    reject unsupported major schema versions.
 8. Range inventory never fans out repository work per matching release and does
    not reinterpret exact evidence or distributed-job protocols.
+9. Schedule ticks materialize an exact repository set before queue admission.
+   Saved-query failure may reuse only the last complete materialization and must
+   record that the membership is stale.
+10. Inventory authorization is applied before search ranking, aggregation, or
+    pagination. Private observations never cross credential-profile scopes.
+11. Forwarded OIDC claims establish identity only when the control listener
+    authenticates the explicitly allowlisted proxy certificate; headers alone
+    never create a trusted-proxy capability.

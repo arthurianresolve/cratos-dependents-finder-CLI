@@ -302,16 +302,22 @@ cargo run --locked -- data sync `
   --output security-data.json
 ```
 
-For larger self-hosted runs, initialize one coordinator, enroll up to 16 LAN
-workers, submit up to 25 concurrent jobs, and lease bounded repository tasks:
+For larger self-hosted runs, initialize one coordinator, enroll LAN workers,
+and issue control-API service tokens while the coordinator is stopped. The
+runtime admits at most 25 running jobs, retains a bounded queue behind them,
+and lets workers lease fairly across every job they are authorized to see:
 
 ```powershell
 cargo run --locked -- coordinator init --directory .cdr-state --server-name coordinator.lan
-cargo run --locked -- coordinator serve --directory .cdr-state --listen 0.0.0.0:8443
 cargo run --locked -- agent enroll --directory .cdr-state --agent-id worker-1 --output worker-1
 # Private jobs require an explicit per-profile worker grant:
 cargo run --locked -- agent enroll --directory .cdr-state --agent-id private-worker `
   --allow-credential-profile production --output private-worker
+cargo run --locked -- coordinator token issue --directory .cdr-state `
+  --role scan-operator --expires-hours 24
+
+cargo run --locked -- coordinator serve --directory .cdr-state `
+  --listen 0.0.0.0:8443 --control-listen 127.0.0.1:8444
 
 cargo run --locked -- job submit `
   --coordinator https://coordinator.lan:8443/ `
@@ -323,7 +329,7 @@ cargo run --locked -- job submit `
 cargo run --locked -- agent run `
   --coordinator https://coordinator.lan:8443/ `
   --ca worker-1/ca.pem --certificate worker-1/worker-1.pem `
-  --private-key worker-1/worker-1.key --agent-id worker-1 --job-id <job-id>
+  --private-key worker-1/worker-1.key --agent-id worker-1
 
 cargo run --locked -- job export `
   --coordinator https://coordinator.lan:8443/ `
@@ -342,6 +348,95 @@ cargo run --locked -- job export `
   --private-key .cdr-state/pki/operator.key `
   --format ndjson --output evidence-shards <job-id>
 ```
+
+Create a coherent offline recovery unit while the coordinator is stopped:
+
+```powershell
+cargo run --locked -- coordinator backup `
+  --directory .cdr-state --backup-set backups/cdr-2026-08-14
+
+cargo run --locked -- coordinator restore `
+  --backup-set backups/cdr-2026-08-14 `
+  --sidecars recovered-secrets --directory .cdr-state-restored
+```
+
+The versioned set contains the checkpointed database, the deployment manifest,
+and a sorted size/SHA-256 inventory of every encrypted artifact file. It does
+not contain the envelope key, inventory cursor key, CA key, server key,
+operator key, or their PKI files. Instead, `backup-set.json` records required
+role-bound fingerprints. `--sidecars` must provide those files in coordinator
+state layout (`envelope.key`, `inventory-cursor.key`, and `pki/*`); restore
+verifies every fingerprint before staging a new state directory and never
+overwrites an existing destination. Worker enrollment packages live outside
+the coordinator state directory and therefore require separate protected
+escrow or worker re-enrollment after recovery.
+
+The database itself is integrity-checked but is not wrapped in a second backup
+encryption layer. A backup set can contain normalized public or explicitly
+enabled private inventory metadata and must therefore be stored on access-
+controlled encrypted media. Secret sidecars require a separate protected
+recovery channel.
+
+The older database-only interface remains available with `backup --output DB
+--manifest JSON` and `restore --backup DB --manifest JSON --database NEW_DB`.
+It does not capture encrypted artifacts or external recovery dependencies and
+is retained only for compatibility. Neither mode is an online snapshot, secret
+escrow, or evidence that the one-hour RPO/four-hour RTO objectives have been
+met; those claims require a timed restore rehearsal.
+
+`agent run` leases globally by default. `--job-id` remains available for a
+compatibility worker pinned to one job. A lost lease response is retried with
+the same client-generated lease ID; provider waits and transient GitHub
+failures durably defer the task instead of sleeping while a lease is held.
+
+The product REST/JSON interface is served separately on `--control-listen`.
+Its OpenAPI 3.1 document is available at `/api/v1/openapi.json`. It provides
+schedule CRUD and manual triggers, bounded job submission/control, credential-
+profile metadata administration, saved inventory queries, and latest/history
+inventory search. Search cursors are opaque, authorization-bound, and pinned
+to one inventory watermark so newly completed scans cannot reorder later
+pages. Repository/package filters, completeness, evidence strength, relation,
+MSRV, revision, time, and freshness operate on normalized `EvidenceBundleV1`
+projections rather than CSV output.
+
+Schedules use five-field UTC cron, enforce a one-hour minimum cadence, allow
+one active occurrence, and coalesce missed instants to the newest occurrence.
+Each run materializes and records the exact repository-set digest from either
+an explicit list or a saved inventory-query revision before queueing work. A
+failed saved-query refresh may use only that schedule's last complete set, and
+the occurrence records that the membership is stale. Schedule priority is
+currently fixed to `normal`; unsupported values are rejected rather than
+silently ignored.
+
+The control API always requires mTLS plus either a scoped service token or an
+explicitly configured trusted OIDC proxy. Configure the latter with
+`--trusted-oidc-proxy FILE`; the JSON file binds a proxy ID and issuer/audience
+policy to one exact client-certificate SHA-256. The proxy must strip and
+replace `X-CDR-OIDC-Claims`; claims arriving over any other client certificate
+are rejected. Service-token secrets are shown once and only their SHA-256
+records are retained.
+
+```json
+{
+  "schema_version": 1,
+  "proxy_id": "corp-oidc-proxy",
+  "certificate_sha256": "<64 lowercase hex characters>",
+  "policy": {
+    "schema_version": 1,
+    "trusted_proxy_ids": ["corp-oidc-proxy"],
+    "issuer": "https://issuer.example",
+    "audience": "crate-dependent-repos",
+    "max_clock_skew_seconds": 30
+  }
+}
+```
+
+Private searchable metadata is disabled unless `--enable-private-inventory`
+is supplied. Enabling it deliberately stores normalized private repository and
+package metadata in the Turso read model, so the host must provide restrictive
+ACLs, full-disk encryption, encrypted backups, and explicit credential-profile
+authorization. Public and private namespaces are filtered before ranking,
+counts, and pagination.
 
 `job export` is available once a job is terminal, or while a paused job has a
 partial result. The coordinator enumerates tasks in stable, job-scoped pages;
@@ -371,15 +466,16 @@ The coordinator is the sole embedded-Turso owner. Its command journal and
 derived evidence artifacts are application-encrypted with AES-256-GCM; private
 artifacts use a credential-principal namespace. The retention policy reserves a
 30-day class for raw private content and retains derived evidence for 365 days.
+The same 365-day sweep prunes terminal jobs, tasks, quotas, schedule
+occurrences, obsolete revisions, unreferenced repository sets, and expired
+control-plane tombstones while preserving active and still-referenced state.
 Worker enrollments are public-only by default. Repeat
 `--allow-credential-profile PROFILE` during `agent enroll` to authorize a
 worker for specific all-visible job profiles. The coordinator checks this grant
 before returning job status, events, repository leases, task mutations, or a
 private provider permit, so an untrusted worker cannot learn a private job's
 repository names. The operator identity remains unrestricted.
-The current worker does not persist raw Cargo blobs. `coordinator backup`
-produces a verified database copy and manifest, while `coordinator restore`
-refuses to overwrite its destination. Authenticated `/metrics` exposes
+The current worker does not persist raw Cargo blobs. Authenticated `/metrics` exposes
 low-cardinality OpenMetrics data; setting `OTEL_EXPORTER_OTLP_ENDPOINT` enables
 OTLP/HTTP spans. `sla report` evaluates a versioned observation ledger and keeps
 platform unavailability separate from provider, user-limit, quota, and
@@ -400,6 +496,13 @@ Raw Cargo blobs are deliberately not retained, which is stricter than the
 reserved 30-day raw-content retention class and minimizes private source data.
 The raw class remains available for a future operator-approved workflow; only
 derived evidence currently enters the encrypted cache.
+
+The configured scale ceiling is 10,000 repositories per job, 25 running jobs,
+1,000 schedules, and 16 enrolled agents. It is a design target—not a supported
+capacity claim—until the documented 250,000-task restart, compaction, search,
+backup, and restore load gate passes. The recovery objectives are RPO at most
+one hour and RTO at most four hours, likewise contingent on a successful
+restore rehearsal.
 
 The client uses the current versioned GitHub REST API, pins repository content to
 an immutable commit, and treats search caps, `incomplete_results`, rate limits,

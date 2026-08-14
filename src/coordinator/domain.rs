@@ -281,6 +281,7 @@ pub enum JobEventKindV1 {
     TaskLeased,
     TaskHeartbeat,
     TaskReclaimed,
+    TaskDeferred,
     TaskSucceeded,
     TaskFailed,
     QuotaReserved,

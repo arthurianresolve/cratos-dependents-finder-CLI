@@ -22,6 +22,17 @@ pub struct CoordinatorMetrics {
     pub tasks_completed: Counter,
     pub tasks_failed: Counter,
     pub active_agents: Gauge,
+    pub queue_depth: Gauge,
+    pub running_jobs: Gauge,
+    pub dead_letter_tasks: Gauge,
+    pub schedule_occurrences_created: Counter,
+    pub schedule_occurrences_coalesced: Counter,
+    pub schedule_materialization_failures: Counter,
+    pub inventory_projection_failures: Counter,
+    pub inventory_projection_pending: Gauge,
+    pub inventory_watermark: Gauge,
+    pub provider_deferrals: Counter,
+    pub credential_broker_failures: Counter,
     pub retention_runs: Counter,
     pub retention_failures: Counter,
     pub retention_metadata_removed: Counter,
@@ -40,6 +51,17 @@ impl CoordinatorMetrics {
         let tasks_completed = Counter::default();
         let tasks_failed = Counter::default();
         let active_agents = Gauge::default();
+        let queue_depth = Gauge::default();
+        let running_jobs = Gauge::default();
+        let dead_letter_tasks = Gauge::default();
+        let schedule_occurrences_created = Counter::default();
+        let schedule_occurrences_coalesced = Counter::default();
+        let schedule_materialization_failures = Counter::default();
+        let inventory_projection_failures = Counter::default();
+        let inventory_projection_pending = Gauge::default();
+        let inventory_watermark = Gauge::default();
+        let provider_deferrals = Counter::default();
+        let credential_broker_failures = Counter::default();
         let retention_runs = Counter::default();
         let retention_failures = Counter::default();
         let retention_metadata_removed = Counter::default();
@@ -49,32 +71,32 @@ impl CoordinatorMetrics {
         let retention_pending_candidates = Gauge::default();
         let mut registry = Registry::default();
         registry.register(
-            "coordinator_api_requests_total",
+            "coordinator_api_requests",
             "Authenticated coordinator API requests",
             api_requests.clone(),
         );
         registry.register(
-            "coordinator_authentication_failures_total",
+            "coordinator_authentication_failures",
             "Rejected coordinator API identities",
             authentication_failures.clone(),
         );
         registry.register(
-            "coordinator_jobs_submitted_total",
+            "coordinator_jobs_submitted",
             "Durable scan jobs submitted",
             jobs_submitted.clone(),
         );
         registry.register(
-            "coordinator_tasks_leased_total",
+            "coordinator_tasks_leased",
             "Repository task leases granted",
             tasks_leased.clone(),
         );
         registry.register(
-            "coordinator_tasks_completed_total",
+            "coordinator_tasks_completed",
             "Repository tasks completed",
             tasks_completed.clone(),
         );
         registry.register(
-            "coordinator_tasks_failed_total",
+            "coordinator_tasks_failed",
             "Repository task attempts failed",
             tasks_failed.clone(),
         );
@@ -82,6 +104,61 @@ impl CoordinatorMetrics {
             "coordinator_active_agents",
             "Currently enrolled non-revoked agent identities",
             active_agents.clone(),
+        );
+        registry.register(
+            "coordinator_queue_depth",
+            "Durable scan jobs waiting for an execution slot",
+            queue_depth.clone(),
+        );
+        registry.register(
+            "coordinator_running_jobs",
+            "Durable scan jobs currently admitted for execution",
+            running_jobs.clone(),
+        );
+        registry.register(
+            "coordinator_dead_letter_tasks",
+            "Repository tasks awaiting explicit dead-letter replay",
+            dead_letter_tasks.clone(),
+        );
+        registry.register(
+            "coordinator_schedule_occurrences_created",
+            "Durable schedule occurrences created",
+            schedule_occurrences_created.clone(),
+        );
+        registry.register(
+            "coordinator_schedule_occurrences_coalesced",
+            "Missed schedule instants coalesced into a newer occurrence",
+            schedule_occurrences_coalesced.clone(),
+        );
+        registry.register(
+            "coordinator_schedule_materialization_failures",
+            "Schedule occurrences whose repository source could not be materialized",
+            schedule_materialization_failures.clone(),
+        );
+        registry.register(
+            "coordinator_inventory_projection_failures",
+            "Accepted artifacts whose searchable projection was deferred after an error",
+            inventory_projection_failures.clone(),
+        );
+        registry.register(
+            "coordinator_inventory_projection_pending",
+            "Accepted artifacts still awaiting a searchable projection",
+            inventory_projection_pending.clone(),
+        );
+        registry.register(
+            "coordinator_inventory_watermark",
+            "Latest committed searchable-inventory projection sequence",
+            inventory_watermark.clone(),
+        );
+        registry.register(
+            "coordinator_provider_deferrals",
+            "Outbound provider requests deferred by shared admission state",
+            provider_deferrals.clone(),
+        );
+        registry.register(
+            "coordinator_credential_broker_failures",
+            "Short-lived credential requests rejected or unavailable",
+            credential_broker_failures.clone(),
         );
         registry.register(
             "coordinator_retention_runs",
@@ -127,6 +204,17 @@ impl CoordinatorMetrics {
             tasks_completed,
             tasks_failed,
             active_agents,
+            queue_depth,
+            running_jobs,
+            dead_letter_tasks,
+            schedule_occurrences_created,
+            schedule_occurrences_coalesced,
+            schedule_materialization_failures,
+            inventory_projection_failures,
+            inventory_projection_pending,
+            inventory_watermark,
+            provider_deferrals,
+            credential_broker_failures,
             retention_runs,
             retention_failures,
             retention_metadata_removed,
@@ -240,11 +328,17 @@ mod tests {
     #[test]
     fn renders_retention_outcome_metrics() {
         let metrics = CoordinatorMetrics::new();
+        metrics.queue_depth.set(3);
+        metrics.schedule_occurrences_created.inc();
+        metrics.inventory_projection_pending.set(2);
         metrics.retention_runs.inc();
         metrics.retention_last_run_succeeded.set(1);
         metrics.retention_pending_candidates.set(7);
 
         let rendered = metrics.render().unwrap();
+        assert!(rendered.contains("coordinator_queue_depth 3"));
+        assert!(rendered.contains("coordinator_schedule_occurrences_created_total 1"));
+        assert!(rendered.contains("coordinator_inventory_projection_pending 2"));
         assert!(rendered.contains("coordinator_retention_runs_total 1"));
         assert!(rendered.contains("coordinator_retention_last_run_succeeded 1"));
         assert!(rendered.contains("coordinator_retention_pending_candidates 7"));

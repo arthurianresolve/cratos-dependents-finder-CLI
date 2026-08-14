@@ -3,29 +3,40 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::{self, BufWriter, Write as _},
+    io::{self, BufReader, BufWriter, Read as _, Write as _},
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
+use aes_gcm::{Aes256Gcm, Key, aead::Generate as _};
 use anyhow::{Context as _, Result, bail, ensure};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use clap::{Args, Subcommand, ValueEnum};
 use futures::{StreamExt as _, stream};
 use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 use url::Url;
+use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
     advisory::DataSnapshotV1,
     cargo_evidence::PackageIdentityV1,
+    catalog::TursoInventoryStore,
+    control_auth::{
+        ControlRoleV1, CredentialProfileAccessV1, CredentialProfileIdV1, PrincipalGrantV1,
+        RepositoryAccessV1, ServiceTokenEntropyError, ServiceTokenEntropySourceV1,
+        ServiceTokenIdV1, issue_service_token,
+    },
     coordinator::{
-        AgentAuthorizationV1, AgentRecordV1, BackupManifestV1, JobEventKindV1, JobId,
-        RepositoryScopeV1, RepositoryTaskStateV1, RepositoryTaskV1, RetentionPolicyV1,
-        SCHEMA_VERSION_V1, ScanBoundsV1, ScanJobStateV1, ScanJobV1, ScanSpecV1, ScanTargetV1,
-        TaskId, TursoCoordinatorStore,
+        AgentAuthorizationV1, AgentRecordV1, ArtifactRecordV1, BackupManifestV1,
+        CacheContentKindV1, CacheNamespaceV1, CacheProtectionV1, ControlActionV1, ControlCommandV1,
+        JobEventKindV1, JobId, RepositoryScopeV1, RepositoryTaskStateV1, RepositoryTaskV1,
+        RetentionPolicyV1, SCHEMA_VERSION_V1, ScanBoundsV1, ScanJobStateV1, ScanJobV1, ScanSpecV1,
+        ScanTargetV1, TaskId, TursoCoordinatorStore, artifacts_from_checkpoint,
     },
     coordinator_api::{
         CoordinatorServerConfig, EVIDENCE_MEDIA_TYPE_V1, JobEventPageV1, RepositoryTaskPageV1,
@@ -37,10 +48,11 @@ use crate::{
         EvidenceShardRecordV1, EvidenceShardV1, SHARDED_EXPORT_MANIFEST,
         SHARDED_EXPORT_SCHEMA_VERSION_V1, ShardedEvidenceManifestV1,
     },
-    secure_cache::{EnvelopeKey, sha256_hex},
+    secure_cache::{EnvelopeKey, SecureBlobCache, SecureCacheNamespace, sha256_hex},
 };
 
 const ENVELOPE_KEY_ID: &str = "coordinator-journal-v1";
+const CATALOG_CURSOR_KEY_ID: &str = "inventory-cursor-v1";
 const MAX_REPOSITORIES_PER_JOB: u64 = 10_000;
 const DEFAULT_PROVIDER_REQUEST_LIMIT: u64 = 250_000;
 const DEFAULT_DOWNLOAD_BYTE_LIMIT: u64 = 50 * 1024 * 1024 * 1024;
@@ -52,6 +64,17 @@ const MAX_EVIDENCE_EXPORT_BYTES: u64 = 128 * 1024 * 1024;
 const EVIDENCE_EXPORT_CONCURRENCY: usize = 8;
 const COORDINATOR_PAGE_SIZE: usize = 1_000;
 const EVIDENCE_SHARD_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+const BACKUP_SET_SCHEMA_VERSION_V2: u16 = 2;
+const BACKUP_SET_MANIFEST: &str = "backup-set.json";
+const BACKUP_SET_DATABASE: &str = "coordinator.db";
+const BACKUP_SET_DEPLOYMENT_MANIFEST: &str = "deployment-manifest.json";
+const BACKUP_SET_ARTIFACT_DIRECTORY: &str = "artifacts";
+const MAX_BACKUP_SET_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DEPLOYMENT_MANIFEST_BYTES: u64 = 1024 * 1024;
+const EXTERNAL_REFERENCE_FINGERPRINT_DOMAIN: &[u8] =
+    b"crate-dependent-repos/backup-external-reference/v1\0";
+const CATALOG_CURSOR_KEY_FINGERPRINT_DOMAIN: &[u8] =
+    b"crate-dependent-repos/inventory-cursor-key/v1";
 
 #[derive(Debug, Args)]
 pub struct CoordinatorArgs {
@@ -65,10 +88,74 @@ enum CoordinatorCommand {
     Init(CoordinatorInitArgs),
     /// Serve the authenticated coordinator API as the sole database owner.
     Serve(CoordinatorServeArgs),
-    /// Checkpoint and copy the embedded database with an integrity manifest.
+    /// Create an offline database backup or a coherent versioned backup set.
     Backup(CoordinatorBackupArgs),
-    /// Verify and restore a database backup without overwriting a destination.
+    /// Verify and restore a legacy database backup or a versioned backup set.
     Restore(CoordinatorRestoreArgs),
+    /// Issue or revoke digest-only control API service tokens.
+    Token(CoordinatorTokenArgs),
+}
+
+#[derive(Debug, Args)]
+struct CoordinatorTokenArgs {
+    #[command(subcommand)]
+    command: CoordinatorTokenCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CoordinatorTokenCommand {
+    /// Issue one token and print its secret exactly once.
+    Issue(CoordinatorTokenIssueArgs),
+    /// Revoke a token by its non-secret identifier.
+    Revoke(CoordinatorTokenRevokeArgs),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CoordinatorTokenRole {
+    Admin,
+    ScanOperator,
+    InventoryReader,
+    Auditor,
+}
+
+impl From<CoordinatorTokenRole> for ControlRoleV1 {
+    fn from(value: CoordinatorTokenRole) -> Self {
+        match value {
+            CoordinatorTokenRole::Admin => Self::Admin,
+            CoordinatorTokenRole::ScanOperator => Self::ScanOperator,
+            CoordinatorTokenRole::InventoryReader => Self::InventoryReader,
+            CoordinatorTokenRole::Auditor => Self::Auditor,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct CoordinatorTokenIssueArgs {
+    /// Initialized coordinator state directory. The server must be stopped.
+    #[arg(long)]
+    directory: PathBuf,
+    /// Product API role granted to the token.
+    #[arg(long, value_enum, default_value = "admin")]
+    role: CoordinatorTokenRole,
+    /// Token lifetime in hours.
+    #[arg(long, default_value_t = 24, value_parser = parse_token_lifetime_hours)]
+    expires_hours: u32,
+    /// Grant access to one private credential-profile inventory namespace.
+    #[arg(long = "allow-private-profile")]
+    private_profiles: Vec<String>,
+    /// Grant access to every registered private credential-profile namespace.
+    #[arg(long, conflicts_with = "private_profiles")]
+    allow_all_private: bool,
+}
+
+#[derive(Debug, Args)]
+struct CoordinatorTokenRevokeArgs {
+    /// Initialized coordinator state directory. The server must be stopped.
+    #[arg(long)]
+    directory: PathBuf,
+    /// Public token identifier (`st_...`), never the token secret.
+    #[arg(long)]
+    token_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -92,6 +179,23 @@ struct CoordinatorServeArgs {
     /// LAN address on which to accept mutual-TLS connections.
     #[arg(long, default_value = "127.0.0.1:8443")]
     listen: SocketAddr,
+    /// Separate mutual-TLS listener for product automation and inventory
+    /// search. Keeping it distinct prevents worker routes from being exposed
+    /// through a user-facing reverse proxy.
+    #[arg(long, default_value = "127.0.0.1:8444")]
+    control_listen: SocketAddr,
+    /// Permit normalized private-repository metadata in the searchable
+    /// inventory. Private projection is disabled by default.
+    #[arg(long)]
+    enable_private_inventory: bool,
+    /// HTTPS endpoint that mints short-lived GitHub App installation tokens
+    /// from registered credential-profile metadata. Required for private jobs.
+    #[arg(long, value_name = "HTTPS_URL")]
+    credential_broker_endpoint: Option<Url>,
+    /// JSON trust configuration for one mTLS-authenticated OIDC reverse proxy.
+    /// Omit to expose service-token authentication only.
+    #[arg(long, value_name = "FILE")]
+    trusted_oidc_proxy: Option<PathBuf>,
     /// Emit structured JSON logs.
     #[arg(long)]
     json_logs: bool,
@@ -105,28 +209,70 @@ struct CoordinatorServeArgs {
 
 #[derive(Debug, Args)]
 struct CoordinatorBackupArgs {
-    /// Initialized coordinator state directory.
+    /// Initialized coordinator state directory. The server must be stopped.
     #[arg(long)]
     directory: PathBuf,
-    /// New database backup path. Existing files are never overwritten.
-    #[arg(long)]
-    output: PathBuf,
-    /// New JSON integrity-manifest path.
-    #[arg(long)]
-    manifest: PathBuf,
+    /// New legacy database backup path. Existing files are never overwritten.
+    #[arg(
+        long,
+        required_unless_present = "backup_set",
+        requires = "manifest",
+        conflicts_with = "backup_set"
+    )]
+    output: Option<PathBuf>,
+    /// New legacy JSON integrity-manifest path.
+    #[arg(
+        long,
+        required_unless_present = "backup_set",
+        requires = "output",
+        conflicts_with = "backup_set"
+    )]
+    manifest: Option<PathBuf>,
+    /// New versioned backup-set directory. Secret keys remain external.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["output", "manifest"])]
+    backup_set: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct CoordinatorRestoreArgs {
-    /// Database backup produced by `coordinator backup`.
-    #[arg(long)]
-    backup: PathBuf,
-    /// JSON integrity manifest produced with the backup.
-    #[arg(long)]
-    manifest: PathBuf,
-    /// New destination database path. Existing files are never overwritten.
-    #[arg(long)]
-    database: PathBuf,
+    /// Legacy database backup produced by `coordinator backup`.
+    #[arg(
+        long,
+        required_unless_present = "backup_set",
+        requires_all = ["manifest", "database"],
+        conflicts_with_all = ["backup_set", "directory", "sidecars"]
+    )]
+    backup: Option<PathBuf>,
+    /// Legacy JSON integrity manifest produced with the database backup.
+    #[arg(
+        long,
+        required_unless_present = "backup_set",
+        requires_all = ["backup", "database"],
+        conflicts_with_all = ["backup_set", "directory", "sidecars"]
+    )]
+    manifest: Option<PathBuf>,
+    /// New legacy destination database path. Existing files are never overwritten.
+    #[arg(
+        long,
+        required_unless_present = "backup_set",
+        requires_all = ["backup", "manifest"],
+        conflicts_with_all = ["backup_set", "directory", "sidecars"]
+    )]
+    database: Option<PathBuf>,
+    /// Versioned backup-set directory.
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires_all = ["directory", "sidecars"],
+        conflicts_with_all = ["backup", "manifest", "database"]
+    )]
+    backup_set: Option<PathBuf>,
+    /// New coordinator state directory. It must not already exist.
+    #[arg(long, value_name = "DIR", requires = "backup_set")]
+    directory: Option<PathBuf>,
+    /// Recovered external sidecar tree containing the exact keys and coordinator PKI files.
+    #[arg(long, value_name = "DIR", requires = "backup_set")]
+    sidecars: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -175,9 +321,10 @@ struct AgentRevokeArgs {
 struct AgentRunArgs {
     #[command(flatten)]
     connection: AgentConnectionArgs,
-    /// Durable job from which this worker should lease tasks.
+    /// Restrict leases to one durable job. Omit to consume the authorized
+    /// global queue across all running jobs.
     #[arg(long)]
-    job_id: String,
+    job_id: Option<String>,
     /// Lease duration requested from the coordinator.
     #[arg(long, default_value_t = 120, value_parser = parse_lease_seconds)]
     lease_seconds: u64,
@@ -425,14 +572,84 @@ pub enum SlaStatusV1 {
     Indeterminate,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct CoordinatorDeploymentV1 {
     schema_version: u16,
     created_at: DateTime<Utc>,
     server_name: String,
     database: String,
     envelope_key: String,
+    catalog_cursor_key: String,
     pki_directory: String,
+}
+
+/// Portable inventory for one offline coordinator recovery unit.
+///
+/// Encrypted artifacts are copied byte-for-byte. Secret sidecars are never
+/// members of the ordinary backup set; only their role-bound fingerprints are
+/// retained so restore can fail closed unless the exact recovery material is
+/// supplied separately.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct CoordinatorBackupSetV1 {
+    schema_version: u16,
+    created_at: DateTime<Utc>,
+    database_manifest: BackupManifestV1,
+    database_file: BackupSetFileV1,
+    deployment_manifest: BackupSetFileV1,
+    artifacts: Vec<BackupSetFileV1>,
+    artifact_references: Vec<BackupArtifactReferenceV1>,
+    catalog_cursor_key_fingerprint: String,
+    external_references: Vec<BackupExternalReferenceV1>,
+    agent_pki_recovery: AgentPkiRecoveryV1,
+}
+
+/// One durable task-to-object edge captured from the checkpointed database.
+/// Multiple task records may intentionally refer to the same immutable cache
+/// object, while the ordinary `artifacts` inventory contains each encrypted
+/// object exactly once.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct BackupArtifactReferenceV1 {
+    job_id: JobId,
+    task_id: TaskId,
+    relative_path: String,
+    plaintext_sha256: String,
+    plaintext_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct BackupSetFileV1 {
+    relative_path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BackupExternalRoleV1 {
+    EnvelopeKey,
+    CatalogCursorKey,
+    PkiManifest,
+    CertificateAuthorityCertificate,
+    CertificateAuthorityPrivateKey,
+    ServerCertificate,
+    ServerPrivateKey,
+    OperatorCertificate,
+    OperatorPrivateKey,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct BackupExternalReferenceV1 {
+    role: BackupExternalRoleV1,
+    relative_path: String,
+    fingerprint: String,
+    bytes: u64,
+    secret_material: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentPkiRecoveryV1 {
+    ExternalEnrollmentPackagesOrReenrollmentRequired,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -463,8 +680,100 @@ pub async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
         CoordinatorCommand::Init(args) => initialize_coordinator(args).await,
         CoordinatorCommand::Serve(args) => serve_coordinator(args).await,
         CoordinatorCommand::Backup(args) => backup_coordinator(args).await,
-        CoordinatorCommand::Restore(args) => restore_coordinator(args),
+        CoordinatorCommand::Restore(args) => restore_coordinator(args).await,
+        CoordinatorCommand::Token(args) => manage_control_token(args).await,
     }
+}
+
+struct OperatingSystemTokenEntropy;
+
+impl ServiceTokenEntropySourceV1 for OperatingSystemTokenEntropy {
+    fn fill_token_entropy(
+        &mut self,
+        output: &mut [u8; 32],
+    ) -> std::result::Result<(), ServiceTokenEntropyError> {
+        let key = Key::<Aes256Gcm>::generate();
+        output.copy_from_slice(key.as_slice());
+        Ok(())
+    }
+}
+
+async fn manage_control_token(args: CoordinatorTokenArgs) -> Result<()> {
+    match args.command {
+        CoordinatorTokenCommand::Issue(args) => issue_control_token(args).await,
+        CoordinatorTokenCommand::Revoke(args) => revoke_control_token(args).await,
+    }
+}
+
+async fn issue_control_token(args: CoordinatorTokenIssueArgs) -> Result<()> {
+    let paths = StatePaths::new(&args.directory);
+    require_initialized(&paths)?;
+    let store = open_store(&paths).await?;
+    let credential_profiles = if args.allow_all_private {
+        CredentialProfileAccessV1::All
+    } else if args.private_profiles.is_empty() {
+        CredentialProfileAccessV1::None
+    } else {
+        CredentialProfileAccessV1::Selected {
+            credential_profile_ids: args
+                .private_profiles
+                .into_iter()
+                .map(CredentialProfileIdV1::parse)
+                .collect::<std::result::Result<_, _>>()?,
+        }
+    };
+    let grant = PrincipalGrantV1::for_roles(
+        BTreeSet::from([args.role.into()]),
+        RepositoryAccessV1 {
+            public: true,
+            credential_profiles,
+        },
+    )?;
+    let issued_at = Utc::now();
+    let expires_at = issued_at
+        .checked_add_signed(TimeDelta::hours(i64::from(args.expires_hours)))
+        .context("service-token expiry is outside the supported time range")?;
+    let issued = issue_service_token(
+        &mut OperatingSystemTokenEntropy,
+        grant,
+        issued_at,
+        expires_at,
+    )?;
+    let token_id = issued.record.id.clone();
+    store
+        .apply_control(ControlCommandV1 {
+            schema_version: SCHEMA_VERSION_V1,
+            command_id: format!("token-issue-{}", Uuid::new_v4().simple()),
+            expected_generation: None,
+            issued_at,
+            action: ControlActionV1::UpsertServiceToken {
+                record: issued.record,
+            },
+        })
+        .await?;
+    println!("token_id: {}", token_id.as_str());
+    println!("expires_at: {expires_at}");
+    println!("token: {}", issued.secret.expose());
+    Ok(())
+}
+
+async fn revoke_control_token(args: CoordinatorTokenRevokeArgs) -> Result<()> {
+    let paths = StatePaths::new(&args.directory);
+    require_initialized(&paths)?;
+    let store = open_store(&paths).await?;
+    store
+        .apply_control(ControlCommandV1 {
+            schema_version: SCHEMA_VERSION_V1,
+            command_id: format!("token-revoke-{}", Uuid::new_v4().simple()),
+            expected_generation: None,
+            issued_at: Utc::now(),
+            action: ControlActionV1::RevokeServiceToken {
+                token_id: ServiceTokenIdV1::parse(args.token_id)?,
+            },
+        })
+        .await?;
+    println!("service token revoked");
+    Ok(())
 }
 
 pub async fn run_agent_command(args: AgentArgs) -> Result<()> {
@@ -479,7 +788,7 @@ pub async fn run_agent_command(args: AgentArgs) -> Result<()> {
                 client_certificate: args.connection.certificate,
                 client_private_key: args.connection.private_key,
                 agent_id: args.connection.agent_id,
-                job_id: JobId(args.job_id),
+                job_id: args.job_id.map(JobId),
                 lease_seconds: args.lease_seconds,
                 idle_poll: Duration::from_secs(args.idle_poll_seconds),
                 once: args.once,
@@ -551,6 +860,7 @@ async fn initialize_coordinator(args: CoordinatorInitArgs) -> Result<()> {
     let pki_manifest = crate::pki::initialize(&paths.pki_directory, &args.server_name)?;
     let key = EnvelopeKey::generate(ENVELOPE_KEY_ID);
     key.persist_new(&paths.envelope_key)?;
+    EnvelopeKey::generate(CATALOG_CURSOR_KEY_ID).persist_new(&paths.catalog_cursor_key)?;
     let store = TursoCoordinatorStore::open(&paths.database, key).await?;
     store
         .register_agent(AgentRecordV1 {
@@ -567,6 +877,7 @@ async fn initialize_coordinator(args: CoordinatorInitArgs) -> Result<()> {
         server_name: args.server_name,
         database: paths.database.display().to_string(),
         envelope_key: paths.envelope_key.display().to_string(),
+        catalog_cursor_key: paths.catalog_cursor_key.display().to_string(),
         pki_directory: paths.pki_directory.display().to_string(),
     };
     write_json_new(&paths.deployment_manifest, &manifest)?;
@@ -588,12 +899,35 @@ async fn serve_coordinator(args: CoordinatorServeArgs) -> Result<()> {
     let paths = StatePaths::new(&args.directory);
     require_initialized(&paths)?;
     let store = open_store(&paths).await?;
-    crate::coordinator_api::serve(
+    ensure_catalog_cursor_key(&paths)?;
+    let inventory = Arc::new(
+        TursoInventoryStore::open(&paths.database, read_key_32(&paths.catalog_cursor_key)?).await?,
+    );
+    ensure!(
+        args.listen != args.control_listen,
+        "worker and control listeners must use different addresses"
+    );
+    let trusted_oidc_proxy = args
+        .trusted_oidc_proxy
+        .as_deref()
+        .map(read_trusted_oidc_proxy)
+        .transpose()?;
+    let control_state = crate::control_api::CoordinatorControlApiState::new(
+        store.clone(),
+        inventory.clone(),
+        trusted_oidc_proxy
+            .as_ref()
+            .map(|configuration| configuration.policy.clone()),
+        args.enable_private_inventory,
+    )
+    .map_err(anyhow::Error::new)?;
+    let metrics = crate::telemetry::CoordinatorMetrics::new();
+    let worker = crate::coordinator_api::serve(
         CoordinatorServerConfig {
             listen: args.listen,
-            ca_certificate: paths.ca_certificate,
-            server_certificate: paths.server_certificate,
-            server_private_key: paths.server_private_key,
+            ca_certificate: paths.ca_certificate.clone(),
+            server_certificate: paths.server_certificate.clone(),
+            server_private_key: paths.server_private_key.clone(),
             artifact_cache_directory: paths.artifact_cache,
             envelope_key: paths.envelope_key,
             envelope_key_id: ENVELOPE_KEY_ID.to_owned(),
@@ -601,51 +935,1163 @@ async fn serve_coordinator(args: CoordinatorServeArgs) -> Result<()> {
                 raw_content_days: args.raw_content_retention_days,
                 derived_evidence_days: args.evidence_retention_days,
             },
+            credential_broker_endpoint: args.credential_broker_endpoint,
+            private_inventory_enabled: args.enable_private_inventory,
         },
         store,
-        crate::telemetry::CoordinatorMetrics::new(),
-    )
-    .await
+        inventory,
+        metrics.clone(),
+    );
+    let scheduler_state = control_state.clone();
+    let control = crate::control_api::serve(
+        crate::control_api::ControlServerConfig {
+            listen: args.control_listen,
+            ca_certificate: paths.ca_certificate,
+            server_certificate: paths.server_certificate,
+            server_private_key: paths.server_private_key,
+            trusted_oidc_proxy,
+        },
+        control_state,
+    );
+    let (_scheduler_shutdown, scheduler_shutdown) = tokio::sync::watch::channel(false);
+    let scheduler = async move {
+        crate::control_api::DurableSchedulerRunner::new(scheduler_state)
+            .with_metrics(metrics)
+            .run(scheduler_shutdown)
+            .await;
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::try_join!(worker, control, scheduler)?;
+    Ok(())
 }
 
 async fn backup_coordinator(args: CoordinatorBackupArgs) -> Result<()> {
+    if let Some(backup_set) = args.backup_set.as_deref() {
+        ensure!(
+            args.output.is_none() && args.manifest.is_none(),
+            "--backup-set cannot be combined with legacy backup paths"
+        );
+        return backup_coordinator_set(&args.directory, backup_set).await;
+    }
+    let output = args
+        .output
+        .as_deref()
+        .context("legacy backup requires --output")?;
+    let manifest_path = args
+        .manifest
+        .as_deref()
+        .context("legacy backup requires --manifest")?;
     ensure!(
-        !paths_conflict(&args.output, &args.manifest)?,
+        !paths_conflict(output, manifest_path)?,
         "--output and --manifest must refer to different files"
     );
     ensure!(
-        !args.manifest.exists(),
+        !manifest_path.exists(),
         "backup manifest {} already exists",
-        args.manifest.display()
+        manifest_path.display()
     );
     let paths = StatePaths::new(&args.directory);
     require_initialized(&paths)?;
     let store = open_store(&paths).await?;
-    let manifest = store.backup(&args.output).await?;
-    if let Err(error) = write_json_new(&args.manifest, &manifest) {
+    let manifest = store.backup(output).await?;
+    if let Err(error) = write_json_new(manifest_path, &manifest) {
         bail!(
             "database backup {} was created, but writing manifest {} failed: {error:#}",
-            args.output.display(),
-            args.manifest.display()
+            output.display(),
+            manifest_path.display()
         );
     }
     println!(
         "backed up {} bytes and {} commands to {}",
         manifest.database_bytes,
         manifest.journal_commands,
-        args.output.display()
+        output.display()
     );
     Ok(())
 }
 
-fn restore_coordinator(args: CoordinatorRestoreArgs) -> Result<()> {
-    let input = fs::read_to_string(&args.manifest)
-        .with_context(|| format!("reading backup manifest {}", args.manifest.display()))?;
+async fn restore_coordinator(args: CoordinatorRestoreArgs) -> Result<()> {
+    if let Some(backup_set) = args.backup_set.as_deref() {
+        ensure!(
+            args.backup.is_none() && args.manifest.is_none() && args.database.is_none(),
+            "--backup-set cannot be combined with legacy restore paths"
+        );
+        let directory = args
+            .directory
+            .as_deref()
+            .context("backup-set restore requires --directory")?;
+        let sidecars = args
+            .sidecars
+            .as_deref()
+            .context("backup-set restore requires --sidecars")?;
+        return restore_coordinator_set(backup_set, directory, sidecars).await;
+    }
+    let backup = args
+        .backup
+        .as_deref()
+        .context("legacy restore requires --backup")?;
+    let manifest_path = args
+        .manifest
+        .as_deref()
+        .context("legacy restore requires --manifest")?;
+    let database = args
+        .database
+        .as_deref()
+        .context("legacy restore requires --database")?;
+    let input = fs::read_to_string(manifest_path)
+        .with_context(|| format!("reading backup manifest {}", manifest_path.display()))?;
     let manifest: BackupManifestV1 = serde_json::from_str(&input)
-        .with_context(|| format!("parsing backup manifest {}", args.manifest.display()))?;
-    TursoCoordinatorStore::restore(&args.backup, &manifest, &args.database)?;
-    println!("restored verified database to {}", args.database.display());
+        .with_context(|| format!("parsing backup manifest {}", manifest_path.display()))?;
+    TursoCoordinatorStore::restore(backup, &manifest, database)?;
+    println!("restored verified database to {}", database.display());
     Ok(())
+}
+
+async fn backup_coordinator_set(directory: &Path, backup_set: &Path) -> Result<()> {
+    ensure!(
+        !backup_set.exists(),
+        "backup-set destination {} already exists",
+        backup_set.display()
+    );
+    ensure!(
+        !path_is_within(backup_set, directory)?,
+        "backup-set destination must be outside coordinator state {}",
+        directory.display()
+    );
+    let paths = StatePaths::new(directory);
+    require_initialized(&paths)?;
+    let (deployment, pki_manifest) = read_source_manifests(&paths)?;
+    ensure!(
+        deployment.server_name == pki_manifest.server_name,
+        "deployment and PKI manifests disagree on server name"
+    );
+    let external_references = external_reference_inventory(&paths)?;
+    let catalog_cursor_key_fingerprint = catalog_cursor_key_fingerprint(&paths.catalog_cursor_key)?;
+
+    let parent = usable_parent(backup_set);
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating backup-set parent {}", parent.display()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".coordinator-backup-")
+        .tempdir_in(parent)
+        .with_context(|| {
+            format!(
+                "creating backup-set staging directory in {}",
+                parent.display()
+            )
+        })?;
+    let store = open_store(&paths).await?;
+    let database_path = staging.path().join(BACKUP_SET_DATABASE);
+    let database_manifest = store.backup(&database_path).await?;
+    let database_file = file_inventory_entry(&database_path, BACKUP_SET_DATABASE)?;
+    ensure!(
+        database_file.sha256 == database_manifest.database_sha256
+            && database_file.bytes == database_manifest.database_bytes,
+        "checkpointed database changed while its backup inventory was recorded"
+    );
+    let deployment_manifest = copy_file_hashed_new(
+        &paths.deployment_manifest,
+        &staging.path().join(BACKUP_SET_DEPLOYMENT_MANIFEST),
+        BACKUP_SET_DEPLOYMENT_MANIFEST,
+    )?;
+    // The offline owner lock excludes a serving coordinator and this command
+    // owns the only actor handle, so no mutation can interleave between the
+    // checkpoint and this deterministic index read.
+    let artifact_records = store.artifacts().await?;
+    let (artifacts, artifact_references) = copy_referenced_artifacts(
+        &artifact_records,
+        &paths.artifact_cache,
+        staging.path(),
+        &EnvelopeKey::load(&paths.envelope_key, ENVELOPE_KEY_ID)?,
+    )?;
+    let manifest = CoordinatorBackupSetV1 {
+        schema_version: BACKUP_SET_SCHEMA_VERSION_V2,
+        created_at: database_manifest.created_at,
+        database_manifest,
+        database_file,
+        deployment_manifest,
+        artifacts,
+        artifact_references,
+        catalog_cursor_key_fingerprint,
+        external_references,
+        agent_pki_recovery: AgentPkiRecoveryV1::ExternalEnrollmentPackagesOrReenrollmentRequired,
+    };
+    validate_backup_set_manifest(&manifest)?;
+    write_json_new(&staging.path().join(BACKUP_SET_MANIFEST), &manifest)?;
+    verify_backup_set_members(staging.path(), &manifest)?;
+    ensure!(
+        !backup_set.exists(),
+        "backup-set destination {} appeared during backup",
+        backup_set.display()
+    );
+    fs::rename(staging.path(), backup_set).with_context(|| {
+        format!(
+            "publishing staged backup set to {} without overwrite",
+            backup_set.display()
+        )
+    })?;
+    println!(
+        "created offline backup set with {} artifact files at {}",
+        manifest.artifacts.len(),
+        backup_set.display()
+    );
+    println!(
+        "secret keys remain external and must match the fingerprints in {}",
+        backup_set.join(BACKUP_SET_MANIFEST).display()
+    );
+    Ok(())
+}
+
+async fn restore_coordinator_set(
+    backup_set: &Path,
+    destination: &Path,
+    sidecars: &Path,
+) -> Result<()> {
+    ensure!(
+        !destination.exists(),
+        "restore destination {} already exists; restore never overwrites",
+        destination.display()
+    );
+    ensure!(
+        !path_is_within(destination, backup_set)?,
+        "restore destination must be outside the backup set"
+    );
+    ensure!(
+        !path_is_within(destination, sidecars)?,
+        "restore destination must be outside the recovered sidecar tree"
+    );
+    let manifest_path = backup_set.join(BACKUP_SET_MANIFEST);
+    let manifest: CoordinatorBackupSetV1 =
+        read_json_bounded(&manifest_path, MAX_BACKUP_SET_MANIFEST_BYTES)?;
+    validate_backup_set_manifest(&manifest)?;
+    verify_backup_set_members(backup_set, &manifest)?;
+    let deployment: CoordinatorDeploymentV1 = read_json_bounded(
+        &backup_set.join(&manifest.deployment_manifest.relative_path),
+        MAX_DEPLOYMENT_MANIFEST_BYTES,
+    )?;
+    ensure!(
+        deployment.schema_version == SCHEMA_VERSION_V1,
+        "unsupported deployment manifest schema {}",
+        deployment.schema_version
+    );
+    let recovered_pki = verify_external_sidecars(sidecars, &manifest)?;
+    ensure!(
+        deployment.server_name == recovered_pki.server_name,
+        "backup deployment and recovered PKI sidecars disagree on server name"
+    );
+    let parent = usable_parent(destination);
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating restore parent {}", parent.display()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".coordinator-restore-")
+        .tempdir_in(parent)
+        .with_context(|| format!("creating restore staging directory in {}", parent.display()))?;
+    let staged_paths = StatePaths::new(staging.path());
+    let final_paths = StatePaths::new(destination);
+    TursoCoordinatorStore::restore(
+        &backup_set.join(&manifest.database_file.relative_path),
+        &manifest.database_manifest,
+        &staged_paths.database,
+    )?;
+    let recovery_key = EnvelopeKey::load(&sidecars.join("envelope.key"), ENVELOPE_KEY_ID)?;
+    let checkpoint_artifacts =
+        artifacts_from_checkpoint(&staged_paths.database, &recovery_key).await?;
+    verify_referenced_artifacts(
+        &checkpoint_artifacts,
+        &backup_set.join(BACKUP_SET_ARTIFACT_DIRECTORY),
+        &manifest,
+        &recovery_key,
+    )?;
+    fs::create_dir_all(&staged_paths.artifact_cache).with_context(|| {
+        format!(
+            "creating restored artifact directory {}",
+            staged_paths.artifact_cache.display()
+        )
+    })?;
+    for artifact in &manifest.artifacts {
+        let source = backup_set.join(manifest_relative_path(&artifact.relative_path)?);
+        let target = staging
+            .path()
+            .join(manifest_relative_path(&artifact.relative_path)?);
+        let copied = copy_file_hashed_new(&source, &target, &artifact.relative_path)?;
+        ensure!(copied == *artifact, "restored artifact digest changed");
+    }
+    restore_external_sidecars(sidecars, &staged_paths, &manifest)?;
+    verify_referenced_artifacts(
+        &checkpoint_artifacts,
+        &staged_paths.artifact_cache,
+        &manifest,
+        &EnvelopeKey::load(&staged_paths.envelope_key, ENVELOPE_KEY_ID)?,
+    )?;
+    write_relocated_manifests(&deployment, &recovered_pki, &staged_paths, &final_paths)?;
+    require_coherent_backup_state(&staged_paths)?;
+    ensure!(
+        !destination.exists(),
+        "restore destination {} appeared during restore",
+        destination.display()
+    );
+    fs::rename(staging.path(), destination).with_context(|| {
+        format!(
+            "publishing staged coordinator restore to {} without overwrite",
+            destination.display()
+        )
+    })?;
+    println!(
+        "restored verified offline backup set to {}",
+        destination.display()
+    );
+    println!("external recovery sidecars were fingerprint-verified; RPO/RTO are not measured");
+    Ok(())
+}
+
+fn copy_referenced_artifacts(
+    records: &[ArtifactRecordV1],
+    source_root: &Path,
+    backup_root: &Path,
+    key: &EnvelopeKey,
+) -> Result<(Vec<BackupSetFileV1>, Vec<BackupArtifactReferenceV1>)> {
+    let destination_root = backup_root.join(BACKUP_SET_ARTIFACT_DIRECTORY);
+    fs::create_dir_all(&destination_root).with_context(|| {
+        format!(
+            "creating backup artifact directory {}",
+            destination_root.display()
+        )
+    })?;
+    if records.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    ensure_real_directory(source_root, "artifact cache")?;
+    let cache = SecureBlobCache::new(source_root);
+    let mut ordered_records = records.iter().collect::<Vec<_>>();
+    ordered_records.sort_unstable_by(|left, right| left.task_id.cmp(&right.task_id));
+    let mut references = Vec::with_capacity(ordered_records.len());
+    let mut inventory = BTreeMap::new();
+    let mut previous_task = None;
+    for record in ordered_records {
+        if let Some(previous) = previous_task {
+            ensure!(previous < &record.task_id, "duplicate artifact task ID");
+        }
+        previous_task = Some(&record.task_id);
+        let (reference, source) = verified_artifact_reference(record, source_root, &cache, key)?;
+        if !inventory.contains_key(&reference.relative_path) {
+            let copied = copy_file_hashed_new(
+                &source,
+                &backup_root.join(manifest_relative_path(&reference.relative_path)?),
+                &reference.relative_path,
+            )?;
+            inventory.insert(reference.relative_path.clone(), copied);
+        }
+        references.push(reference);
+    }
+    Ok((inventory.into_values().collect(), references))
+}
+
+fn verified_artifact_reference(
+    record: &ArtifactRecordV1,
+    cache_root: &Path,
+    cache: &SecureBlobCache,
+    key: &EnvelopeKey,
+) -> Result<(BackupArtifactReferenceV1, PathBuf)> {
+    ensure!(
+        record.metadata.schema_version == SCHEMA_VERSION_V1,
+        "unsupported artifact metadata schema {}",
+        record.metadata.schema_version
+    );
+    ensure!(
+        record.metadata.content_kind == CacheContentKindV1::DerivedEvidence,
+        "task artifacts must contain derived evidence"
+    );
+    match &record.metadata.protection {
+        CacheProtectionV1::EnvelopeEncrypted {
+            algorithm,
+            wrapping_key_id,
+        } => ensure!(
+            algorithm == "AES-256-GCM" && wrapping_key_id == key.key_id(),
+            "artifact protection metadata does not match the recovery envelope key"
+        ),
+        CacheProtectionV1::Plaintext => bail!("durable task artifact is not envelope encrypted"),
+    }
+    let namespace = match &record.metadata.key.namespace {
+        CacheNamespaceV1::Public => SecureCacheNamespace::Public,
+        CacheNamespaceV1::Private { principal_id } => SecureCacheNamespace::Private {
+            tenant_id: principal_id,
+        },
+    };
+    let digest = record.metadata.key.digest.as_str();
+    let source = cache
+        .verify_object(
+            &namespace,
+            "evidence",
+            digest,
+            record.metadata.content_length,
+            key,
+        )
+        .with_context(|| format!("verifying durable artifact for task {}", record.task_id.0))?;
+    let cache_relative = source
+        .strip_prefix(cache_root)
+        .context("verified artifact escaped its cache root")?;
+    let relative_path = format!(
+        "{BACKUP_SET_ARTIFACT_DIRECTORY}/{}",
+        portable_relative_path(cache_relative)?
+    );
+    Ok((
+        BackupArtifactReferenceV1 {
+            job_id: record.job_id.clone(),
+            task_id: record.task_id.clone(),
+            relative_path,
+            plaintext_sha256: digest.to_owned(),
+            plaintext_bytes: record.metadata.content_length,
+        },
+        source,
+    ))
+}
+
+fn verify_referenced_artifacts(
+    records: &[ArtifactRecordV1],
+    cache_root: &Path,
+    manifest: &CoordinatorBackupSetV1,
+    key: &EnvelopeKey,
+) -> Result<()> {
+    if !records.is_empty() {
+        ensure_real_directory(cache_root, "backup artifact cache")?;
+    }
+    let cache = SecureBlobCache::new(cache_root);
+    let mut ordered_records = records.iter().collect::<Vec<_>>();
+    ordered_records.sort_unstable_by(|left, right| left.task_id.cmp(&right.task_id));
+    let mut references = Vec::with_capacity(ordered_records.len());
+    for record in ordered_records {
+        references.push(verified_artifact_reference(record, cache_root, &cache, key)?.0);
+    }
+    ensure!(
+        references == manifest.artifact_references,
+        "backup artifact references disagree with the checkpointed database"
+    );
+    let referenced_paths = references
+        .iter()
+        .map(|reference| reference.relative_path.as_str())
+        .collect::<BTreeSet<_>>();
+    let inventoried_paths = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.relative_path.as_str())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        referenced_paths == inventoried_paths,
+        "backup artifact inventory is not the exact referenced object set"
+    );
+    Ok(())
+}
+
+fn copy_file_hashed_new(
+    source: &Path,
+    destination: &Path,
+    relative_path: &str,
+) -> Result<BackupSetFileV1> {
+    let (sha256, bytes) = copy_file_new(source, destination, false)?;
+    Ok(BackupSetFileV1 {
+        relative_path: relative_path.to_owned(),
+        sha256,
+        bytes,
+    })
+}
+
+fn copy_file_new(source: &Path, destination: &Path, secret: bool) -> Result<(String, u64)> {
+    ensure_real_file(source, "backup source")?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating backup directory {}", parent.display()))?;
+    }
+    let input = fs::File::open(source)
+        .with_context(|| format!("opening backup source {}", source.display()))?;
+    let mut input = BufReader::new(input);
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .with_context(|| format!("creating backup member {}", destination.display()))?;
+    if secret {
+        restrict_restored_secret_permissions(destination)?;
+    }
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        bytes = bytes
+            .checked_add(read as u64)
+            .context("backup member length overflow")?;
+    }
+    output.sync_all()?;
+    Ok((encode_digest(&hasher.finalize()), bytes))
+}
+
+fn file_inventory_entry(path: &Path, relative_path: &str) -> Result<BackupSetFileV1> {
+    let (sha256, bytes) = digest_regular_file(path, &[])?;
+    Ok(BackupSetFileV1 {
+        relative_path: relative_path.to_owned(),
+        sha256,
+        bytes,
+    })
+}
+
+fn external_reference_inventory(paths: &StatePaths) -> Result<Vec<BackupExternalReferenceV1>> {
+    external_sidecar_specs(paths)
+        .into_iter()
+        .map(|(role, path, relative_path, secret_material)| {
+            let (fingerprint, bytes) = fingerprint_external_reference(role, path)?;
+            Ok(BackupExternalReferenceV1 {
+                role,
+                relative_path: relative_path.to_owned(),
+                fingerprint,
+                bytes,
+                secret_material,
+            })
+        })
+        .collect()
+}
+
+fn external_sidecar_specs(
+    paths: &StatePaths,
+) -> Vec<(BackupExternalRoleV1, &Path, &'static str, bool)> {
+    vec![
+        (
+            BackupExternalRoleV1::EnvelopeKey,
+            &paths.envelope_key,
+            "envelope.key",
+            true,
+        ),
+        (
+            BackupExternalRoleV1::CatalogCursorKey,
+            &paths.catalog_cursor_key,
+            "inventory-cursor.key",
+            true,
+        ),
+        (
+            BackupExternalRoleV1::PkiManifest,
+            &paths.pki_manifest,
+            "pki/manifest.json",
+            false,
+        ),
+        (
+            BackupExternalRoleV1::CertificateAuthorityCertificate,
+            &paths.ca_certificate,
+            "pki/ca.pem",
+            false,
+        ),
+        (
+            BackupExternalRoleV1::CertificateAuthorityPrivateKey,
+            &paths.ca_private_key,
+            "pki/ca.key",
+            true,
+        ),
+        (
+            BackupExternalRoleV1::ServerCertificate,
+            &paths.server_certificate,
+            "pki/server.pem",
+            false,
+        ),
+        (
+            BackupExternalRoleV1::ServerPrivateKey,
+            &paths.server_private_key,
+            "pki/server.key",
+            true,
+        ),
+        (
+            BackupExternalRoleV1::OperatorCertificate,
+            &paths.operator_certificate,
+            "pki/operator.pem",
+            false,
+        ),
+        (
+            BackupExternalRoleV1::OperatorPrivateKey,
+            &paths.operator_private_key,
+            "pki/operator.key",
+            true,
+        ),
+    ]
+}
+
+fn external_role_contract(role: BackupExternalRoleV1) -> (&'static str, bool) {
+    match role {
+        BackupExternalRoleV1::EnvelopeKey => ("envelope.key", true),
+        BackupExternalRoleV1::CatalogCursorKey => ("inventory-cursor.key", true),
+        BackupExternalRoleV1::PkiManifest => ("pki/manifest.json", false),
+        BackupExternalRoleV1::CertificateAuthorityCertificate => ("pki/ca.pem", false),
+        BackupExternalRoleV1::CertificateAuthorityPrivateKey => ("pki/ca.key", true),
+        BackupExternalRoleV1::ServerCertificate => ("pki/server.pem", false),
+        BackupExternalRoleV1::ServerPrivateKey => ("pki/server.key", true),
+        BackupExternalRoleV1::OperatorCertificate => ("pki/operator.pem", false),
+        BackupExternalRoleV1::OperatorPrivateKey => ("pki/operator.key", true),
+    }
+}
+
+fn fingerprint_external_reference(
+    role: BackupExternalRoleV1,
+    path: &Path,
+) -> Result<(String, u64)> {
+    let role_json = serde_json::to_vec(&role).context("serializing external sidecar role")?;
+    let mut prefix = Vec::with_capacity(
+        EXTERNAL_REFERENCE_FINGERPRINT_DOMAIN.len() + std::mem::size_of::<u64>() + role_json.len(),
+    );
+    prefix.extend_from_slice(EXTERNAL_REFERENCE_FINGERPRINT_DOMAIN);
+    prefix.extend_from_slice(&(role_json.len() as u64).to_be_bytes());
+    prefix.extend_from_slice(&role_json);
+    digest_regular_file(path, &prefix)
+}
+
+fn catalog_cursor_key_fingerprint(path: &Path) -> Result<String> {
+    ensure_real_file(path, "catalog cursor key")?;
+    let bytes = Zeroizing::new(
+        fs::read(path).with_context(|| format!("reading catalog cursor key {}", path.display()))?,
+    );
+    ensure!(
+        bytes.len() == 32,
+        "catalog cursor key {} must contain exactly 32 bytes",
+        path.display()
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(CATALOG_CURSOR_KEY_FINGERPRINT_DOMAIN);
+    hasher.update(bytes.as_slice());
+    Ok(encode_digest(&hasher.finalize()))
+}
+
+fn digest_regular_file(path: &Path, prefix: &[u8]) -> Result<(String, u64)> {
+    ensure_real_file(path, "backup input")?;
+    let input =
+        fs::File::open(path).with_context(|| format!("opening backup input {}", path.display()))?;
+    let mut input = BufReader::new(input);
+    let mut hasher = Sha256::new();
+    hasher.update(prefix);
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes = bytes
+            .checked_add(read as u64)
+            .context("backup input length overflow")?;
+    }
+    Ok((encode_digest(&hasher.finalize()), bytes))
+}
+
+fn encode_digest(digest: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
+}
+
+fn read_source_manifests(
+    paths: &StatePaths,
+) -> Result<(CoordinatorDeploymentV1, crate::pki::PkiManifestV1)> {
+    let deployment: CoordinatorDeploymentV1 =
+        read_json_bounded(&paths.deployment_manifest, MAX_DEPLOYMENT_MANIFEST_BYTES)?;
+    ensure!(
+        deployment.schema_version == SCHEMA_VERSION_V1,
+        "unsupported deployment manifest schema {}",
+        deployment.schema_version
+    );
+    let pki_manifest: crate::pki::PkiManifestV1 =
+        read_json_bounded(&paths.pki_manifest, MAX_DEPLOYMENT_MANIFEST_BYTES)?;
+    ensure!(
+        pki_manifest.schema_version == SCHEMA_VERSION_V1,
+        "unsupported PKI manifest schema {}",
+        pki_manifest.schema_version
+    );
+    Ok((deployment, pki_manifest))
+}
+
+fn read_json_bounded<T: DeserializeOwned>(path: &Path, max_bytes: u64) -> Result<T> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading JSON metadata {}", path.display()))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "JSON input {} is not a regular file",
+        path.display()
+    );
+    ensure!(
+        metadata.len() <= max_bytes,
+        "JSON input {} exceeds {} bytes",
+        path.display(),
+        max_bytes
+    );
+    let bytes = fs::read(path).with_context(|| format!("reading JSON input {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parsing JSON input {}", path.display()))
+}
+
+fn validate_backup_set_manifest(manifest: &CoordinatorBackupSetV1) -> Result<()> {
+    ensure!(
+        manifest.schema_version == BACKUP_SET_SCHEMA_VERSION_V2,
+        "unsupported backup-set schema {}",
+        manifest.schema_version
+    );
+    validate_file_inventory(&manifest.database_file)?;
+    validate_file_inventory(&manifest.deployment_manifest)?;
+    ensure!(
+        manifest.database_file.relative_path == BACKUP_SET_DATABASE,
+        "backup set has an unexpected database member path"
+    );
+    ensure!(
+        manifest.deployment_manifest.relative_path == BACKUP_SET_DEPLOYMENT_MANIFEST,
+        "backup set has an unexpected deployment-manifest member path"
+    );
+    ensure!(
+        manifest.database_file.sha256 == manifest.database_manifest.database_sha256
+            && manifest.database_file.bytes == manifest.database_manifest.database_bytes,
+        "backup-set database inventory disagrees with its database manifest"
+    );
+    ensure_sha256_text(&manifest.catalog_cursor_key_fingerprint)?;
+    ensure!(
+        manifest.agent_pki_recovery
+            == AgentPkiRecoveryV1::ExternalEnrollmentPackagesOrReenrollmentRequired,
+        "backup set has an unsupported agent PKI recovery contract"
+    );
+
+    let mut previous_artifact = None;
+    for artifact in &manifest.artifacts {
+        validate_file_inventory(artifact)?;
+        let relative = manifest_relative_path(&artifact.relative_path)?;
+        ensure!(
+            relative.starts_with(BACKUP_SET_ARTIFACT_DIRECTORY),
+            "backup artifact is outside the artifact directory"
+        );
+        ensure!(
+            artifact.relative_path != BACKUP_SET_ARTIFACT_DIRECTORY,
+            "backup artifact path names the directory itself"
+        );
+        if let Some(previous) = previous_artifact {
+            ensure!(
+                previous < artifact.relative_path.as_str(),
+                "backup artifact inventory is not strictly sorted and unique"
+            );
+        }
+        previous_artifact = Some(artifact.relative_path.as_str());
+    }
+
+    let mut previous_task = None;
+    let mut referenced_paths = BTreeSet::new();
+    for reference in &manifest.artifact_references {
+        ensure!(
+            !reference.job_id.0.is_empty(),
+            "backup artifact job ID is empty"
+        );
+        ensure!(
+            !reference.task_id.0.is_empty(),
+            "backup artifact task ID is empty"
+        );
+        if let Some(previous) = previous_task {
+            ensure!(
+                previous < &reference.task_id,
+                "backup artifact references are not strictly task-sorted and unique"
+            );
+        }
+        previous_task = Some(&reference.task_id);
+        let relative = manifest_relative_path(&reference.relative_path)?;
+        ensure!(
+            relative.starts_with(BACKUP_SET_ARTIFACT_DIRECTORY)
+                && reference.relative_path != BACKUP_SET_ARTIFACT_DIRECTORY,
+            "backup artifact reference is outside the artifact directory"
+        );
+        ensure_sha256_text(&reference.plaintext_sha256)?;
+        ensure!(
+            reference.plaintext_bytes > 0,
+            "backup artifact plaintext length is zero"
+        );
+        referenced_paths.insert(reference.relative_path.as_str());
+    }
+    let inventoried_paths = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.relative_path.as_str())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        referenced_paths == inventoried_paths,
+        "backup artifact inventory is not the exact referenced object set"
+    );
+
+    let expected_roles = [
+        BackupExternalRoleV1::EnvelopeKey,
+        BackupExternalRoleV1::CatalogCursorKey,
+        BackupExternalRoleV1::PkiManifest,
+        BackupExternalRoleV1::CertificateAuthorityCertificate,
+        BackupExternalRoleV1::CertificateAuthorityPrivateKey,
+        BackupExternalRoleV1::ServerCertificate,
+        BackupExternalRoleV1::ServerPrivateKey,
+        BackupExternalRoleV1::OperatorCertificate,
+        BackupExternalRoleV1::OperatorPrivateKey,
+    ];
+    ensure!(
+        manifest.external_references.len() == expected_roles.len(),
+        "backup set does not declare every required external sidecar"
+    );
+    for (reference, expected_role) in manifest.external_references.iter().zip(expected_roles) {
+        ensure!(
+            reference.role == expected_role,
+            "backup external sidecars are not canonical and complete"
+        );
+        let (relative_path, secret_material) = external_role_contract(reference.role);
+        ensure!(
+            reference.relative_path == relative_path
+                && reference.secret_material == secret_material,
+            "backup external-sidecar contract is invalid"
+        );
+        manifest_relative_path(&reference.relative_path)?;
+        ensure_sha256_text(&reference.fingerprint)?;
+        ensure!(reference.bytes > 0, "backup external sidecar is empty");
+        if matches!(
+            reference.role,
+            BackupExternalRoleV1::EnvelopeKey | BackupExternalRoleV1::CatalogCursorKey
+        ) {
+            ensure!(
+                reference.bytes == 32,
+                "backup external envelope and cursor keys must be 32 bytes"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_file_inventory(file: &BackupSetFileV1) -> Result<()> {
+    manifest_relative_path(&file.relative_path)?;
+    ensure!(
+        file.relative_path != BACKUP_SET_MANIFEST,
+        "backup-set manifest cannot inventory itself"
+    );
+    ensure_sha256_text(&file.sha256)
+}
+
+fn ensure_sha256_text(value: &str) -> Result<()> {
+    ensure!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "invalid lowercase SHA-256 value"
+    );
+    Ok(())
+}
+
+fn verify_backup_set_members(root: &Path, manifest: &CoordinatorBackupSetV1) -> Result<()> {
+    ensure_real_directory(root, "backup set")?;
+    ensure_real_file(&root.join(BACKUP_SET_MANIFEST), "backup-set manifest")?;
+    let mut expected = BTreeMap::new();
+    for file in std::iter::once(&manifest.database_file)
+        .chain(std::iter::once(&manifest.deployment_manifest))
+        .chain(manifest.artifacts.iter())
+    {
+        ensure!(
+            expected.insert(file.relative_path.clone(), file).is_none(),
+            "duplicate backup-set member {}",
+            file.relative_path
+        );
+    }
+    for (relative_path, path) in collect_regular_files(root)? {
+        if relative_path == BACKUP_SET_MANIFEST {
+            continue;
+        }
+        let expected_file = expected
+            .remove(&relative_path)
+            .with_context(|| format!("unexpected backup-set member {relative_path}"))?;
+        let actual = file_inventory_entry(&path, &relative_path)?;
+        ensure!(
+            actual == *expected_file,
+            "backup-set member {} failed size or digest verification",
+            relative_path
+        );
+    }
+    ensure!(
+        expected.is_empty(),
+        "backup set is missing inventoried member(s): {}",
+        expected.keys().cloned().collect::<Vec<_>>().join(", ")
+    );
+    Ok(())
+}
+
+fn collect_regular_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory)
+            .with_context(|| format!("reading backup directory {}", directory.display()))?
+        {
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("reading backup member metadata {}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                bail!("backup set contains a symbolic link: {}", path.display());
+            }
+            if metadata.is_dir() {
+                directories.push(path);
+            } else if metadata.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .context("backup member escaped the set root")?;
+                files.push((portable_relative_path(relative)?, path));
+            } else {
+                bail!("backup set contains a non-regular file: {}", path.display());
+            }
+        }
+    }
+    files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
+}
+
+fn verify_external_sidecars(
+    sidecars: &Path,
+    manifest: &CoordinatorBackupSetV1,
+) -> Result<crate::pki::PkiManifestV1> {
+    ensure_real_directory(sidecars, "recovered sidecar tree")?;
+    for reference in &manifest.external_references {
+        let path = sidecars.join(manifest_relative_path(&reference.relative_path)?);
+        let (fingerprint, bytes) = fingerprint_external_reference(reference.role, &path)
+            .with_context(|| format!("verifying recovered sidecar {}", path.display()))?;
+        ensure!(
+            fingerprint == reference.fingerprint && bytes == reference.bytes,
+            "recovered sidecar {} does not match the backup fingerprint",
+            reference.relative_path
+        );
+    }
+    ensure!(
+        catalog_cursor_key_fingerprint(&sidecars.join("inventory-cursor.key"))?
+            == manifest.catalog_cursor_key_fingerprint,
+        "recovered catalog cursor key has the wrong catalog fingerprint"
+    );
+    let pki_manifest: crate::pki::PkiManifestV1 = read_json_bounded(
+        &sidecars.join("pki/manifest.json"),
+        MAX_DEPLOYMENT_MANIFEST_BYTES,
+    )?;
+    ensure!(
+        pki_manifest.schema_version == SCHEMA_VERSION_V1,
+        "unsupported recovered PKI manifest schema {}",
+        pki_manifest.schema_version
+    );
+    Ok(pki_manifest)
+}
+
+fn restore_external_sidecars(
+    sidecars: &Path,
+    destination: &StatePaths,
+    manifest: &CoordinatorBackupSetV1,
+) -> Result<()> {
+    for reference in &manifest.external_references {
+        if reference.role == BackupExternalRoleV1::PkiManifest {
+            continue;
+        }
+        let relative = manifest_relative_path(&reference.relative_path)?;
+        let source = sidecars.join(&relative);
+        let target = destination.root.join(&relative);
+        copy_file_new(&source, &target, reference.secret_material)?;
+        let (fingerprint, bytes) = fingerprint_external_reference(reference.role, &target)?;
+        ensure!(
+            fingerprint == reference.fingerprint && bytes == reference.bytes,
+            "restored sidecar {} failed post-copy verification",
+            reference.relative_path
+        );
+    }
+    ensure!(
+        catalog_cursor_key_fingerprint(&destination.catalog_cursor_key)?
+            == manifest.catalog_cursor_key_fingerprint,
+        "restored catalog cursor key fingerprint changed"
+    );
+    Ok(())
+}
+
+fn write_relocated_manifests(
+    deployment: &CoordinatorDeploymentV1,
+    pki: &crate::pki::PkiManifestV1,
+    staging: &StatePaths,
+    final_paths: &StatePaths,
+) -> Result<()> {
+    let relocated_pki = crate::pki::PkiManifestV1 {
+        schema_version: pki.schema_version,
+        server_name: pki.server_name.clone(),
+        ca_certificate: final_paths.ca_certificate.display().to_string(),
+        server_certificate: final_paths.server_certificate.display().to_string(),
+        server_private_key: final_paths.server_private_key.display().to_string(),
+        operator_certificate: final_paths.operator_certificate.display().to_string(),
+        operator_private_key: final_paths.operator_private_key.display().to_string(),
+        operator_certificate_sha256: pki.operator_certificate_sha256.clone(),
+    };
+    write_json_new(&staging.pki_manifest, &relocated_pki)?;
+    let relocated_deployment = CoordinatorDeploymentV1 {
+        schema_version: deployment.schema_version,
+        created_at: deployment.created_at,
+        server_name: deployment.server_name.clone(),
+        database: final_paths.database.display().to_string(),
+        envelope_key: final_paths.envelope_key.display().to_string(),
+        catalog_cursor_key: final_paths.catalog_cursor_key.display().to_string(),
+        pki_directory: final_paths.pki_directory.display().to_string(),
+    };
+    write_json_new(&staging.deployment_manifest, &relocated_deployment)
+}
+
+fn require_coherent_backup_state(paths: &StatePaths) -> Result<()> {
+    for path in [
+        &paths.deployment_manifest,
+        &paths.database,
+        &paths.envelope_key,
+        &paths.catalog_cursor_key,
+        &paths.pki_manifest,
+        &paths.ca_certificate,
+        &paths.ca_private_key,
+        &paths.server_certificate,
+        &paths.server_private_key,
+        &paths.operator_certificate,
+        &paths.operator_private_key,
+    ] {
+        ensure_real_file(path, "restored coordinator state")?;
+    }
+    ensure_real_directory(&paths.artifact_cache, "restored artifact cache")?;
+    let _ = EnvelopeKey::load(&paths.envelope_key, ENVELOPE_KEY_ID)?;
+    let _ = read_key_32(&paths.catalog_cursor_key)?;
+    let _ = crate::pki::server_config(
+        &paths.ca_certificate,
+        &paths.server_certificate,
+        &paths.server_private_key,
+    )?;
+    let _ = crate::pki::authenticated_client(
+        &paths.ca_certificate,
+        &paths.operator_certificate,
+        &paths.operator_private_key,
+    )?;
+    Ok(())
+}
+
+fn ensure_real_file(path: &Path, description: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading {description} metadata {}", path.display()))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "{description} {} is not a regular file",
+        path.display()
+    );
+    Ok(())
+}
+
+fn ensure_real_directory(path: &Path, description: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading {description} metadata {}", path.display()))?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "{description} {} is not a real directory",
+        path.display()
+    );
+    Ok(())
+}
+
+fn portable_relative_path(path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            bail!("backup member path is not relative and normalized");
+        };
+        let part = part
+            .to_str()
+            .context("backup member path is not valid UTF-8")?;
+        ensure!(
+            safe_manifest_path_segment(part),
+            "backup member path contains an unsafe segment"
+        );
+        parts.push(part);
+    }
+    ensure!(!parts.is_empty(), "backup member path is empty");
+    Ok(parts.join("/"))
+}
+
+fn manifest_relative_path(value: &str) -> Result<PathBuf> {
+    ensure!(
+        !value.is_empty() && !value.contains('\\'),
+        "backup member path is not canonical"
+    );
+    let mut path = PathBuf::new();
+    for segment in value.split('/') {
+        ensure!(
+            safe_manifest_path_segment(segment),
+            "backup member path contains an unsafe segment"
+        );
+        path.push(segment);
+    }
+    ensure!(
+        portable_relative_path(&path)? == value,
+        "backup member path is not canonical"
+    );
+    Ok(path)
+}
+
+fn safe_manifest_path_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains(':')
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control)
+}
+
+fn usable_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn path_is_within(candidate: &Path, root: &Path) -> Result<bool> {
+    let candidate = lexical_path_identity(candidate)?;
+    let root = lexical_path_identity(root)?;
+    if candidate == root {
+        return Ok(true);
+    }
+    let separator = std::path::MAIN_SEPARATOR;
+    let prefix = if root.ends_with(separator) {
+        root
+    } else {
+        format!("{root}{separator}")
+    };
+    Ok(candidate.starts_with(&prefix))
+}
+
+#[cfg(unix)]
+fn restrict_restored_secret_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting restored secret {}", path.display()))
+}
+
+#[cfg(windows)]
+fn restrict_restored_secret_permissions(path: &Path) -> Result<()> {
+    let identity =
+        std::env::var("USERNAME").context("USERNAME is required to restrict restored secrets")?;
+    let status = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{identity}:(F)"))
+        .args(["/grant:r", "*S-1-5-18:(F)", "/Q"])
+        .status()
+        .with_context(|| format!("restricting Windows ACL on {}", path.display()))?;
+    ensure!(
+        status.success(),
+        "icacls failed while restricting {}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restrict_restored_secret_permissions(path: &Path) -> Result<()> {
+    bail!(
+        "cannot enforce restored secret permissions on this platform for {}",
+        path.display()
+    )
 }
 
 async fn enroll_agent(args: AgentEnrollArgs) -> Result<()> {
@@ -1774,6 +3220,7 @@ fn event_kind(kind: &JobEventKindV1) -> &'static str {
         JobEventKindV1::TaskLeased => "task_leased",
         JobEventKindV1::TaskHeartbeat => "task_heartbeat",
         JobEventKindV1::TaskReclaimed => "task_reclaimed",
+        JobEventKindV1::TaskDeferred => "task_deferred",
         JobEventKindV1::TaskSucceeded => "task_succeeded",
         JobEventKindV1::TaskFailed => "task_failed",
         JobEventKindV1::QuotaReserved => "quota_reserved",
@@ -1928,6 +3375,50 @@ fn require_initialized(paths: &StatePaths) -> Result<()> {
     Ok(())
 }
 
+fn ensure_catalog_cursor_key(paths: &StatePaths) -> Result<()> {
+    if !paths.catalog_cursor_key.exists() {
+        EnvelopeKey::generate(CATALOG_CURSOR_KEY_ID).persist_new(&paths.catalog_cursor_key)?;
+    }
+    Ok(())
+}
+
+fn read_key_32(path: &Path) -> Result<[u8; 32]> {
+    let bytes =
+        Zeroizing::new(fs::read(path).with_context(|| format!("reading key {}", path.display()))?);
+    ensure!(
+        bytes.len() == 32,
+        "key {} must contain exactly 32 bytes",
+        path.display()
+    );
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(bytes.as_slice());
+    Ok(key)
+}
+
+fn read_trusted_oidc_proxy(path: &Path) -> Result<crate::control_api::TrustedOidcProxyConfigV1> {
+    let bytes = fs::read(path).with_context(|| {
+        format!(
+            "reading OIDC trusted-proxy configuration {}",
+            path.display()
+        )
+    })?;
+    ensure!(
+        bytes.len() <= 64 * 1024,
+        "OIDC trusted-proxy configuration exceeds 64 KiB"
+    );
+    let configuration: crate::control_api::TrustedOidcProxyConfigV1 =
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "parsing OIDC trusted-proxy configuration {}",
+                path.display()
+            )
+        })?;
+    configuration
+        .validate()
+        .map_err(|_| anyhow::anyhow!("invalid OIDC trusted-proxy configuration"))?;
+    Ok(configuration)
+}
+
 async fn open_store(paths: &StatePaths) -> Result<TursoCoordinatorStore> {
     TursoCoordinatorStore::open(
         &paths.database,
@@ -1937,14 +3428,19 @@ async fn open_store(paths: &StatePaths) -> Result<TursoCoordinatorStore> {
 }
 
 struct StatePaths {
+    root: PathBuf,
     deployment_manifest: PathBuf,
     database: PathBuf,
     envelope_key: PathBuf,
+    catalog_cursor_key: PathBuf,
     pki_directory: PathBuf,
+    pki_manifest: PathBuf,
     ca_certificate: PathBuf,
+    ca_private_key: PathBuf,
     server_certificate: PathBuf,
     server_private_key: PathBuf,
     operator_certificate: PathBuf,
+    operator_private_key: PathBuf,
     artifact_cache: PathBuf,
 }
 
@@ -1952,13 +3448,18 @@ impl StatePaths {
     fn new(directory: &Path) -> Self {
         let pki_directory = directory.join("pki");
         Self {
+            root: directory.to_path_buf(),
             deployment_manifest: directory.join("manifest.json"),
             database: directory.join("coordinator.db"),
             envelope_key: directory.join("envelope.key"),
+            catalog_cursor_key: directory.join("inventory-cursor.key"),
+            pki_manifest: pki_directory.join("manifest.json"),
             ca_certificate: pki_directory.join("ca.pem"),
+            ca_private_key: pki_directory.join("ca.key"),
             server_certificate: pki_directory.join("server.pem"),
             server_private_key: pki_directory.join("server.key"),
             operator_certificate: pki_directory.join("operator.pem"),
+            operator_private_key: pki_directory.join("operator.key"),
             artifact_cache: directory.join("artifacts"),
             pki_directory,
         }
@@ -1981,6 +3482,13 @@ fn parse_positive_u32(value: &str) -> std::result::Result<u32, String> {
     (parsed > 0)
         .then_some(parsed)
         .ok_or_else(|| "value must be greater than zero".to_owned())
+}
+
+fn parse_token_lifetime_hours(value: &str) -> std::result::Result<u32, String> {
+    let parsed = parse_positive_u32(value)?;
+    (parsed <= 24 * 365)
+        .then_some(parsed)
+        .ok_or_else(|| "token lifetime must be at most 8760 hours".to_owned())
 }
 
 fn parse_repository_limit(value: &str) -> std::result::Result<u64, String> {
@@ -2009,6 +3517,10 @@ fn parse_percentage(value: &str) -> std::result::Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordinator::{
+        CacheKeyV1, CacheMetadataV1, EvidenceCompletenessV1, InventoryProjectionStateV1,
+        Sha256Digest,
+    };
 
     fn job(state: ScanJobStateV1, partial_reasons: BTreeSet<String>) -> ScanJobV1 {
         ScanJobV1 {
@@ -2186,6 +3698,306 @@ mod tests {
     fn lexical_path_aliases_conflict() {
         assert!(paths_conflict(Path::new("backup.db"), Path::new("./backup.db")).unwrap());
         assert!(!paths_conflict(Path::new("backup.db"), Path::new("backup.json")).unwrap());
+    }
+
+    #[test]
+    fn backup_member_paths_are_relative_and_portable() {
+        assert_eq!(
+            manifest_relative_path("artifacts/public/evidence/blob").unwrap(),
+            PathBuf::from("artifacts")
+                .join("public")
+                .join("evidence")
+                .join("blob")
+        );
+        for invalid in [
+            "",
+            "../coordinator.db",
+            "artifacts/./blob",
+            "artifacts//blob",
+            "C:/secret",
+            "artifacts\\secret",
+        ] {
+            assert!(manifest_relative_path(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn backup_set_inventory_detects_tampering_and_unexpected_secret_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = write_test_backup_set(directory.path());
+        verify_backup_set_members(directory.path(), &manifest).unwrap();
+
+        fs::write(directory.path().join(BACKUP_SET_DATABASE), b"tampered").unwrap();
+        assert!(verify_backup_set_members(directory.path(), &manifest).is_err());
+        fs::write(directory.path().join(BACKUP_SET_DATABASE), b"database").unwrap();
+        fs::write(directory.path().join("envelope.key"), [7_u8; 32]).unwrap();
+        assert!(verify_backup_set_members(directory.path(), &manifest).is_err());
+    }
+
+    #[test]
+    fn referenced_artifact_backup_authenticates_and_copies_the_exact_object_set() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let key = EnvelopeKey::generate(ENVELOPE_KEY_ID);
+        let cache = SecureBlobCache::new(source.path());
+        let stored = cache
+            .put(
+                SecureCacheNamespace::Public,
+                "evidence",
+                b"canonical evidence",
+                &key,
+            )
+            .unwrap();
+        let record = test_artifact_record("task-a", &stored.sha256, stored.bytes);
+        fs::write(source.path().join("unreferenced.tmp"), b"orphan").unwrap();
+
+        let (files, references) = copy_referenced_artifacts(
+            std::slice::from_ref(&record),
+            source.path(),
+            backup.path(),
+            &key,
+        )
+        .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(references.len(), 1);
+        assert!(!backup.path().join("artifacts/unreferenced.tmp").exists());
+
+        let mut manifest = write_test_backup_set(backup.path());
+        manifest.artifacts = files;
+        manifest.artifact_references = references;
+        validate_backup_set_manifest(&manifest).unwrap();
+        verify_backup_set_members(backup.path(), &manifest).unwrap();
+        verify_referenced_artifacts(&[record], &backup.path().join("artifacts"), &manifest, &key)
+            .unwrap();
+    }
+
+    #[test]
+    fn referenced_artifact_backup_rejects_a_missing_object() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let key = EnvelopeKey::generate(ENVELOPE_KEY_ID);
+        let stored = SecureBlobCache::new(source.path())
+            .put(
+                SecureCacheNamespace::Public,
+                "evidence",
+                b"canonical evidence",
+                &key,
+            )
+            .unwrap();
+        let record = test_artifact_record("task-a", &stored.sha256, stored.bytes);
+        fs::remove_file(stored.path).unwrap();
+
+        assert!(copy_referenced_artifacts(&[record], source.path(), backup.path(), &key).is_err());
+    }
+
+    #[test]
+    fn referenced_artifact_backup_rejects_tampered_ciphertext() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let key = EnvelopeKey::generate(ENVELOPE_KEY_ID);
+        let stored = SecureBlobCache::new(source.path())
+            .put(
+                SecureCacheNamespace::Public,
+                "evidence",
+                b"canonical evidence",
+                &key,
+            )
+            .unwrap();
+        let record = test_artifact_record("task-a", &stored.sha256, stored.bytes);
+        let mut ciphertext = fs::read(&stored.path).unwrap();
+        *ciphertext.last_mut().unwrap() ^= 1;
+        fs::write(&stored.path, ciphertext).unwrap();
+
+        assert!(copy_referenced_artifacts(&[record], source.path(), backup.path(), &key).is_err());
+    }
+
+    #[test]
+    fn referenced_artifact_backup_rejects_the_wrong_envelope_key() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let key = EnvelopeKey::generate(ENVELOPE_KEY_ID);
+        let stored = SecureBlobCache::new(source.path())
+            .put(
+                SecureCacheNamespace::Public,
+                "evidence",
+                b"canonical evidence",
+                &key,
+            )
+            .unwrap();
+        let record = test_artifact_record("task-a", &stored.sha256, stored.bytes);
+        let wrong_key = EnvelopeKey::generate(ENVELOPE_KEY_ID);
+
+        assert!(
+            copy_referenced_artifacts(&[record], source.path(), backup.path(), &wrong_key).is_err()
+        );
+    }
+
+    #[test]
+    fn referenced_artifact_backup_rejects_a_false_durable_digest() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let key = EnvelopeKey::generate(ENVELOPE_KEY_ID);
+        let stored = SecureBlobCache::new(source.path())
+            .put(
+                SecureCacheNamespace::Public,
+                "evidence",
+                b"canonical evidence",
+                &key,
+            )
+            .unwrap();
+        let false_digest = if stored.sha256.starts_with('0') {
+            "1".repeat(64)
+        } else {
+            "0".repeat(64)
+        };
+        let false_path = source
+            .path()
+            .join("public/evidence")
+            .join(&false_digest[..2])
+            .join(format!("{false_digest}.cdr"));
+        fs::create_dir_all(false_path.parent().unwrap()).unwrap();
+        fs::copy(&stored.path, false_path).unwrap();
+        let record = test_artifact_record("task-a", &false_digest, stored.bytes);
+
+        assert!(copy_referenced_artifacts(&[record], source.path(), backup.path(), &key).is_err());
+    }
+
+    fn test_artifact_record(task_id: &str, digest: &str, bytes: u64) -> ArtifactRecordV1 {
+        ArtifactRecordV1 {
+            job_id: JobId("job-a".to_owned()),
+            task_id: TaskId(task_id.to_owned()),
+            metadata: CacheMetadataV1 {
+                schema_version: SCHEMA_VERSION_V1,
+                key: CacheKeyV1 {
+                    namespace: CacheNamespaceV1::Public,
+                    digest: Sha256Digest::parse(digest).unwrap(),
+                },
+                content_kind: CacheContentKindV1::DerivedEvidence,
+                content_length: bytes,
+                github_blob_sha: None,
+                protection: CacheProtectionV1::EnvelopeEncrypted {
+                    algorithm: "AES-256-GCM".to_owned(),
+                    wrapping_key_id: ENVELOPE_KEY_ID.to_owned(),
+                },
+                completeness: EvidenceCompletenessV1::Complete,
+                reuse_fingerprint: None,
+                created_at: timestamp(10),
+                last_accessed_at: timestamp(10),
+                retain_until: timestamp(20),
+                reference_count: 0,
+            },
+            inventory_projection: InventoryProjectionStateV1::Pending,
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_fails_before_creating_destination_when_sidecars_are_missing() {
+        let backup_set = tempfile::tempdir().unwrap();
+        write_test_backup_set(backup_set.path());
+        let sidecars = tempfile::tempdir().unwrap();
+        let restore_parent = tempfile::tempdir().unwrap();
+        let destination = restore_parent.path().join("restored-state");
+
+        assert!(
+            restore_coordinator_set(backup_set.path(), &destination, sidecars.path())
+                .await
+                .is_err()
+        );
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn backup_set_restore_never_accepts_an_existing_destination() {
+        let backup_set = tempfile::tempdir().unwrap();
+        let sidecars = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        assert!(
+            restore_coordinator_set(backup_set.path(), destination.path(), sidecars.path())
+                .await
+                .is_err()
+        );
+    }
+
+    fn write_test_backup_set(root: &Path) -> CoordinatorBackupSetV1 {
+        fs::write(root.join(BACKUP_SET_DATABASE), b"database").unwrap();
+        let deployment = CoordinatorDeploymentV1 {
+            schema_version: SCHEMA_VERSION_V1,
+            created_at: timestamp(10),
+            server_name: "coordinator.test".to_owned(),
+            database: "old/coordinator.db".to_owned(),
+            envelope_key: "old/envelope.key".to_owned(),
+            catalog_cursor_key: "old/inventory-cursor.key".to_owned(),
+            pki_directory: "old/pki".to_owned(),
+        };
+        fs::write(
+            root.join(BACKUP_SET_DEPLOYMENT_MANIFEST),
+            serde_json::to_vec_pretty(&deployment).unwrap(),
+        )
+        .unwrap();
+        let database_file =
+            file_inventory_entry(&root.join(BACKUP_SET_DATABASE), BACKUP_SET_DATABASE).unwrap();
+        let deployment_manifest = file_inventory_entry(
+            &root.join(BACKUP_SET_DEPLOYMENT_MANIFEST),
+            BACKUP_SET_DEPLOYMENT_MANIFEST,
+        )
+        .unwrap();
+        let external_references = [
+            BackupExternalRoleV1::EnvelopeKey,
+            BackupExternalRoleV1::CatalogCursorKey,
+            BackupExternalRoleV1::PkiManifest,
+            BackupExternalRoleV1::CertificateAuthorityCertificate,
+            BackupExternalRoleV1::CertificateAuthorityPrivateKey,
+            BackupExternalRoleV1::ServerCertificate,
+            BackupExternalRoleV1::ServerPrivateKey,
+            BackupExternalRoleV1::OperatorCertificate,
+            BackupExternalRoleV1::OperatorPrivateKey,
+        ]
+        .into_iter()
+        .map(|role| {
+            let (relative_path, secret_material) = external_role_contract(role);
+            BackupExternalReferenceV1 {
+                role,
+                relative_path: relative_path.to_owned(),
+                fingerprint: "a".repeat(64),
+                bytes: if matches!(
+                    role,
+                    BackupExternalRoleV1::EnvelopeKey | BackupExternalRoleV1::CatalogCursorKey
+                ) {
+                    32
+                } else {
+                    1
+                },
+                secret_material,
+            }
+        })
+        .collect();
+        let manifest = CoordinatorBackupSetV1 {
+            schema_version: BACKUP_SET_SCHEMA_VERSION_V2,
+            created_at: timestamp(20),
+            database_manifest: BackupManifestV1 {
+                schema_version: SCHEMA_VERSION_V1,
+                created_at: timestamp(20),
+                source_database: "old/coordinator.db".to_owned(),
+                database_sha256: database_file.sha256.clone(),
+                database_bytes: database_file.bytes,
+                journal_commands: 7,
+            },
+            database_file,
+            deployment_manifest,
+            artifacts: Vec::new(),
+            artifact_references: Vec::new(),
+            catalog_cursor_key_fingerprint: "b".repeat(64),
+            external_references,
+            agent_pki_recovery:
+                AgentPkiRecoveryV1::ExternalEnrollmentPackagesOrReenrollmentRequired,
+        };
+        validate_backup_set_manifest(&manifest).unwrap();
+        fs::write(
+            root.join(BACKUP_SET_MANIFEST),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        manifest
     }
 
     #[test]

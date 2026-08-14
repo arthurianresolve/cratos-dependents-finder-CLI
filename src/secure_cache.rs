@@ -356,6 +356,26 @@ impl SecureBlobCache {
         self.get_unlocked(namespace, content_kind, digest, key, &path)
     }
 
+    /// Authenticate one stored object and verify its durable plaintext
+    /// metadata without returning the potentially sensitive plaintext to the
+    /// caller. The returned path is the canonical content-addressed location
+    /// below this cache root.
+    pub(crate) fn verify_object(
+        &self,
+        namespace: &SecureCacheNamespace<'_>,
+        content_kind: &str,
+        digest: &str,
+        expected_plaintext_bytes: u64,
+        key: &EnvelopeKey,
+    ) -> Result<PathBuf> {
+        let plaintext = Zeroizing::new(self.get(namespace, content_kind, digest, key)?);
+        ensure!(
+            u64::try_from(plaintext.len()).ok() == Some(expected_plaintext_bytes),
+            "cache plaintext length does not match durable metadata"
+        );
+        Ok(self.object_path(namespace, content_kind, digest))
+    }
+
     fn get_unlocked(
         &self,
         namespace: &SecureCacheNamespace<'_>,
