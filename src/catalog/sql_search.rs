@@ -964,7 +964,7 @@ async fn hydrate_attempt_candidate_batch(
                 snapshots.first_observed_at, snapshots.last_observed_at,\n\
                 0 AS package_count,\n\
                 attempts.namespace_kind, attempts.credential_profile_id,\n\
-                requested_attempts.request_ordinal\n\
+                attempts.request_ordinal\n\
            FROM requested_attempts AS attempts\n\
           CROSS JOIN catalog_repositories AS repositories\n\
                      INDEXED BY sqlite_autoindex_catalog_repositories_1\n\
