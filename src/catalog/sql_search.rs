@@ -1016,7 +1016,7 @@ fn requested_candidates_sql(candidates: &[Candidate]) -> Result<SqlBuilder, Cata
             sql.push(",");
         }
         sql.push("(");
-        sql.push(&ordinal.to_string());
+        sql.bind(to_i64(ordinal as u64)?);
         sql.push(",");
         sql.bind(candidate.namespace_kind.clone());
         sql.push(",");
