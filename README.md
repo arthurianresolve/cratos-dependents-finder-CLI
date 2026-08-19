@@ -569,5 +569,8 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 ```
 
+For release confidence, also run the explicit rollout gates in
+[`docs/release-readiness-checklist.md`](docs/release-readiness-checklist.md).
+
 Live network smoke tests should never assert a fixed public result count: crates,
 repository heads, indexes, and search totals change over time.
