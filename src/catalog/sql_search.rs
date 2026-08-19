@@ -954,10 +954,13 @@ fn attempt_candidates_sql(candidates: &[Candidate]) -> CandidateSql {
                 repositories.first_observed_at, repositories.last_observed_at,\n\
                 snapshots.first_observed_at, snapshots.last_observed_at, 0 AS package_count,\n\
                 attempts.namespace_kind, attempts.credential_profile_id,\n\
-                ?\n\
-           FROM catalog_attempts AS attempts\n\
-                INDEXED BY sqlite_autoindex_catalog_attempts_1\n\
-          CROSS JOIN catalog_repositories AS repositories\n\
+                ",
+        );
+        sql.bind(index as i64);
+        sql.push(
+            "\n           FROM catalog_attempts AS attempts\n\
+                 INDEXED BY sqlite_autoindex_catalog_attempts_1\n\
+           CROSS JOIN catalog_repositories AS repositories\n\
                 INDEXED BY sqlite_autoindex_catalog_repositories_1\n\
              ON repositories.namespace_kind = attempts.namespace_kind\n\
             AND repositories.credential_profile_id = attempts.credential_profile_id\n\
@@ -969,15 +972,13 @@ fn attempt_candidates_sql(candidates: &[Candidate]) -> CandidateSql {
              AND snapshots.commit_sha = attempts.snapshot_commit_sha\n\
              AND snapshots.tree_sha = attempts.snapshot_tree_sha\n\
              AND snapshots.analyzer_profile_digest = attempts.snapshot_analyzer_profile_digest\n\
-          WHERE attempts.namespace_kind = ",
+           WHERE attempts.namespace_kind = ",
         );
         sql.bind(candidate.namespace_kind.clone());
         sql.push(" AND attempts.credential_profile_id = ");
         sql.bind(candidate.credential_profile_id.clone());
         sql.push(" AND attempts.attempt_id = ");
         sql.bind(candidate.attempt_id.clone());
-        sql.push(" ");
-        sql.bind(index as i64);
     }
     sql.finish()
 }
@@ -1887,7 +1888,7 @@ fn to_i64(value: u64) -> Result<i64, CatalogError> {
     i64::try_from(value).map_err(unavailable)
 }
 
-fn unavailable<E>(_error: E) -> CatalogError {
+fn unavailable<E: std::fmt::Debug>(_error: E) -> CatalogError {
     CatalogError::StoreUnavailable
 }
 
