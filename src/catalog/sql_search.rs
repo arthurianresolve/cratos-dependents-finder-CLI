@@ -1,6 +1,6 @@
 //! Indexed durable search for the Turso inventory Adapter.
 
-use std::collections::{BTreeSet, HashMap, hash_map::Entry};
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 use semver::Version;
@@ -25,8 +25,9 @@ const MAX_DYNAMIC_BINDINGS: usize = 900;
 const HYDRATION_BINDINGS_PER_CANDIDATE: usize = 3;
 const MAX_CANDIDATES_PER_HYDRATION: usize =
     (MAX_DYNAMIC_BINDINGS - 1) / HYDRATION_BINDINGS_PER_CANDIDATE;
+const ATTEMPT_BINDINGS_PER_CANDIDATE: usize = 4;
 const MAX_ATTEMPT_CANDIDATES_PER_HYDRATION: usize =
-    MAX_DYNAMIC_BINDINGS / HYDRATION_BINDINGS_PER_CANDIDATE;
+    MAX_DYNAMIC_BINDINGS / ATTEMPT_BINDINGS_PER_CANDIDATE;
 pub(crate) const REBUILD_SEARCH_DOCUMENT_BATCH_SIZE: usize = 4_096;
 pub(crate) const REBUILD_SEARCH_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
 
@@ -952,7 +953,8 @@ fn attempt_candidates_sql(candidates: &[Candidate]) -> CandidateSql {
                     AND aliases.repository_id = attempts.repository_id),\n\
                 repositories.first_observed_at, repositories.last_observed_at,\n\
                 snapshots.first_observed_at, snapshots.last_observed_at, 0 AS package_count,\n\
-                attempts.namespace_kind, attempts.credential_profile_id\n\
+                attempts.namespace_kind, attempts.credential_profile_id,\n\
+                ?\n\
            FROM catalog_attempts AS attempts\n\
                 INDEXED BY sqlite_autoindex_catalog_attempts_1\n\
           CROSS JOIN catalog_repositories AS repositories\n\
@@ -974,6 +976,8 @@ fn attempt_candidates_sql(candidates: &[Candidate]) -> CandidateSql {
         sql.bind(candidate.credential_profile_id.clone());
         sql.push(" AND attempts.attempt_id = ");
         sql.bind(candidate.attempt_id.clone());
+        sql.push(" ");
+        sql.bind(index as i64);
     }
     sql.finish()
 }
@@ -983,26 +987,29 @@ async fn collect_attempt_rows(
     query: CandidateSql,
     candidates: &[Candidate],
 ) -> Result<Vec<InventorySearchResultV1>, CatalogError> {
-    let metadata = candidate_metadata(candidates);
+    let metadata = candidate_metadata_by_ordinal(candidates);
     let mut statement = connection
         .prepare_cached(&query.statement)
         .await
         .map_err(unavailable)?;
     let mut rows = statement.query(query.params).await.map_err(unavailable)?;
-    let mut groups = HashMap::with_capacity(candidates.len());
+    let mut groups: Vec<Option<CandidateGroup>> = std::iter::repeat_with(|| None)
+        .take(candidates.len())
+        .collect();
     while let Some(row) = rows.next().await.map_err(unavailable)? {
-        let key = candidate_key_from_row(&row)?;
-        let values = metadata
-            .get(&(key.0.as_str(), key.1.as_str(), key.2.as_str()))
-            .copied()
-            .ok_or(CatalogError::StoreUnavailable)?;
-        let mut group = CandidateGroup::from_row(&row, values)?;
-        group.push_package(&row)?;
-        if groups.insert(key, group).is_some() {
+        let ordinal = request_ordinal_from_row(&row)?;
+        let Some((relevance, freshness)) = metadata.get(ordinal).copied() else {
             return Err(CatalogError::StoreUnavailable);
+        };
+        if groups[ordinal].is_none() {
+            groups[ordinal] = Some(CandidateGroup::from_row(&row, (relevance, freshness))?);
         }
+        let group = groups[ordinal]
+            .as_mut()
+            .ok_or(CatalogError::StoreUnavailable)?;
+        group.push_package(&row)?;
     }
-    ordered_groups(candidates, groups)
+    ordered_groups_from_ordinal(groups)
 }
 
 fn requested_candidates_sql(candidates: &[Candidate]) -> Result<SqlBuilder, CatalogError> {
@@ -1059,7 +1066,8 @@ async fn hydrate_candidate_batch(
                 repositories.first_observed_at, repositories.last_observed_at,\n\
                  snapshots.first_observed_at, snapshots.last_observed_at,\n\
                  COALESCE(package_counts.package_count, 0),\n\
-                 attempts.namespace_kind, attempts.credential_profile_id\n\
+                 attempts.namespace_kind, attempts.credential_profile_id,\n\
+                 requested.request_ordinal\n\
            FROM requested\n\
           CROSS JOIN catalog_attempts AS attempts\n\
                      INDEXED BY sqlite_autoindex_catalog_attempts_1\n\
@@ -1104,76 +1112,49 @@ async fn collect_hydrated_rows(
         .query(&query.statement, query.params)
         .await
         .map_err(unavailable)?;
-    let metadata = candidate_metadata(candidates);
-    let mut groups = HashMap::with_capacity(candidates.len());
+    let metadata = candidate_metadata_by_ordinal(candidates);
+    let mut groups: Vec<Option<CandidateGroup>> = std::iter::repeat_with(|| None)
+        .take(candidates.len())
+        .collect();
     while let Some(row) = rows.next().await.map_err(unavailable)? {
-        let key = candidate_key_from_row(&row)?;
-        let group = match groups.entry(key) {
-            Entry::Occupied(occupied) => occupied.into_mut(),
-            Entry::Vacant(vacant) => {
-                let metadata = metadata
-                    .get(&(
-                        vacant.key().0.as_str(),
-                        vacant.key().1.as_str(),
-                        vacant.key().2.as_str(),
-                    ))
-                    .copied()
-                    .ok_or(CatalogError::StoreUnavailable)?;
-                vacant.insert(CandidateGroup::from_row(&row, metadata)?)
-            }
-        };
-        group.push_package(&row)?;
+        let ordinal = request_ordinal_from_row(&row)?;
+        let (relevance, freshness) = metadata
+            .get(ordinal)
+            .copied()
+            .ok_or(CatalogError::StoreUnavailable)?;
+        if groups[ordinal].is_none() {
+            groups[ordinal] = Some(CandidateGroup::from_row(&row, (relevance, freshness))?);
+        }
+        groups[ordinal]
+            .as_mut()
+            .expect("group must exist")
+            .push_package(&row)?;
     }
-    ordered_groups(candidates, groups)
+    ordered_groups_from_ordinal(groups)
 }
 
-type CandidateKey = (String, String, String);
-type CandidateMetadata<'a> = HashMap<(&'a str, &'a str, &'a str), (u32, InventoryFreshnessV1)>;
+type CandidateMetadata = Vec<(u32, InventoryFreshnessV1)>;
 
-fn candidate_metadata(candidates: &[Candidate]) -> CandidateMetadata<'_> {
-    candidates
-        .iter()
-        .map(|candidate| {
-            (
-                (
-                    candidate.namespace_kind.as_str(),
-                    candidate.credential_profile_id.as_str(),
-                    candidate.attempt_id.as_str(),
-                ),
-                (candidate.relevance, candidate.freshness),
-            )
-        })
-        .collect()
+fn candidate_metadata_by_ordinal(candidates: &[Candidate]) -> CandidateMetadata {
+    let mut metadata = Vec::with_capacity(candidates.len());
+    metadata.extend(
+        candidates
+            .iter()
+            .map(|candidate| (candidate.relevance, candidate.freshness)),
+    );
+    metadata
 }
 
-fn candidate_key_from_row(row: &turso::Row) -> Result<CandidateKey, CatalogError> {
-    Ok((
-        row.get(12).map_err(unavailable)?,
-        row.get(13).map_err(unavailable)?,
-        row.get(0).map_err(unavailable)?,
-    ))
+fn request_ordinal_from_row(row: &turso::Row) -> Result<usize, CatalogError> {
+    usize::try_from(row.get::<i64>(14).map_err(unavailable)?).map_err(unavailable)
 }
 
-fn ordered_groups(
-    candidates: &[Candidate],
-    mut groups: HashMap<CandidateKey, CandidateGroup>,
+fn ordered_groups_from_ordinal(
+    mut groups: Vec<Option<CandidateGroup>>,
 ) -> Result<Vec<InventorySearchResultV1>, CatalogError> {
-    let mut ordered = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let key = (
-            candidate.namespace_kind.clone(),
-            candidate.credential_profile_id.clone(),
-            candidate.attempt_id.clone(),
-        );
-        ordered.push(
-            groups
-                .remove(&key)
-                .ok_or(CatalogError::StoreUnavailable)?
-                .finish(),
-        );
-    }
-    if !groups.is_empty() {
-        return Err(CatalogError::StoreUnavailable);
+    let mut ordered = Vec::with_capacity(groups.len());
+    for group in groups.iter_mut() {
+        ordered.push(group.take().ok_or(CatalogError::StoreUnavailable)?.finish());
     }
     Ok(ordered)
 }
@@ -2045,7 +2026,7 @@ mod tests {
                     > MAX_DYNAMIC_BINDINGS
             );
             assert!(
-                MAX_ATTEMPT_CANDIDATES_PER_HYDRATION * HYDRATION_BINDINGS_PER_CANDIDATE
+                MAX_ATTEMPT_CANDIDATES_PER_HYDRATION * ATTEMPT_BINDINGS_PER_CANDIDATE
                     == MAX_DYNAMIC_BINDINGS
             );
         }
@@ -2066,7 +2047,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].params.len(), MAX_DYNAMIC_BINDINGS);
-        assert_eq!(chunks[1].params.len(), HYDRATION_BINDINGS_PER_CANDIDATE);
+        assert_eq!(chunks[1].params.len(), ATTEMPT_BINDINGS_PER_CANDIDATE);
         assert!(
             chunks[0]
                 .statement
