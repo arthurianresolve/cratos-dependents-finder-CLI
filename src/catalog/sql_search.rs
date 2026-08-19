@@ -929,88 +929,57 @@ async fn hydrate_attempt_candidates(
 ) -> Result<Vec<InventorySearchResultV1>, CatalogError> {
     let mut results = Vec::with_capacity(candidates.len());
     for candidates in candidates.chunks(MAX_ATTEMPT_CANDIDATES_PER_HYDRATION) {
-        results.extend(
-            collect_attempt_rows(connection, attempt_candidates_sql(candidates), candidates)
-                .await?,
-        );
+        results.extend(hydrate_attempt_candidate_batch(connection, candidates).await?);
     }
     Ok(results)
 }
 
-fn attempt_candidates_sql(candidates: &[Candidate]) -> CandidateSql {
-    let mut sql = SqlBuilder::new();
-    for (index, candidate) in candidates.iter().enumerate() {
-        if index > 0 {
-            sql.push(" UNION ALL ");
-        }
-        sql.push(
-            "SELECT attempts.attempt_id, attempts.attempt_json, repositories.repository_json,\n\
-                snapshots.snapshot_json, NULL AS observation_json, NULL AS package_json,\n\
+async fn hydrate_attempt_candidate_batch(
+    connection: &turso::Connection,
+    candidates: &[Candidate],
+) -> Result<Vec<InventorySearchResultV1>, CatalogError> {
+    let mut sql = requested_candidates_sql(candidates)?;
+    sql.push(
+        "), requested_attempts AS (\n\
+         SELECT requested.request_ordinal, attempts.attempt_id, attempts.attempt_json,\n\
+                attempts.snapshot_commit_sha, attempts.snapshot_tree_sha,\n\
+                attempts.snapshot_analyzer_profile_digest,\n\
+                attempts.namespace_kind, attempts.credential_profile_id,\n\
+                attempts.observation_id, attempts.repository_id\n\
+           FROM requested\n\
+          CROSS JOIN catalog_attempts AS attempts\n\
+                     INDEXED BY sqlite_autoindex_catalog_attempts_1\n\
+             ON attempts.namespace_kind = requested.namespace_kind\n\
+            AND attempts.credential_profile_id = requested.credential_profile_id\n\
+            AND attempts.attempt_id = requested.attempt_id)\n\
+         SELECT attempts.attempt_id, attempts.attempt_json, repositories.repository_json,\n\
+                snapshots.snapshot_json,\n\
+                NULL AS observation_json, NULL AS package_json,\n\
                 (SELECT group_concat(aliases.normalized_alias, char(31))\n\
                    FROM catalog_repository_aliases AS aliases\n\
                   WHERE aliases.namespace_kind = attempts.namespace_kind\n\
                     AND aliases.credential_profile_id = attempts.credential_profile_id\n\
                     AND aliases.repository_id = attempts.repository_id),\n\
                 repositories.first_observed_at, repositories.last_observed_at,\n\
-                snapshots.first_observed_at, snapshots.last_observed_at, 0 AS package_count,\n\
+                snapshots.first_observed_at, snapshots.last_observed_at,\n\
+                0 AS package_count,\n\
                 attempts.namespace_kind, attempts.credential_profile_id,\n\
-                ",
-        );
-        sql.bind(index as i64);
-        sql.push(
-            "\n           FROM catalog_attempts AS attempts\n\
-                 INDEXED BY sqlite_autoindex_catalog_attempts_1\n\
-           CROSS JOIN catalog_repositories AS repositories\n\
-                INDEXED BY sqlite_autoindex_catalog_repositories_1\n\
+                requested_attempts.request_ordinal\n\
+           FROM requested_attempts AS attempts\n\
+          CROSS JOIN catalog_repositories AS repositories\n\
+                     INDEXED BY sqlite_autoindex_catalog_repositories_1\n\
              ON repositories.namespace_kind = attempts.namespace_kind\n\
             AND repositories.credential_profile_id = attempts.credential_profile_id\n\
             AND repositories.repository_id = attempts.repository_id\n\
            LEFT JOIN catalog_snapshots AS snapshots\n\
              ON snapshots.namespace_kind = attempts.namespace_kind\n\
             AND snapshots.credential_profile_id = attempts.credential_profile_id\n\
-             AND snapshots.repository_id = attempts.repository_id\n\
-             AND snapshots.commit_sha = attempts.snapshot_commit_sha\n\
-             AND snapshots.tree_sha = attempts.snapshot_tree_sha\n\
-             AND snapshots.analyzer_profile_digest = attempts.snapshot_analyzer_profile_digest\n\
-           WHERE attempts.namespace_kind = ",
-        );
-        sql.bind(candidate.namespace_kind.clone());
-        sql.push(" AND attempts.credential_profile_id = ");
-        sql.bind(candidate.credential_profile_id.clone());
-        sql.push(" AND attempts.attempt_id = ");
-        sql.bind(candidate.attempt_id.clone());
-    }
-    sql.finish()
-}
-
-async fn collect_attempt_rows(
-    connection: &turso::Connection,
-    query: CandidateSql,
-    candidates: &[Candidate],
-) -> Result<Vec<InventorySearchResultV1>, CatalogError> {
-    let metadata = candidate_metadata_by_ordinal(candidates);
-    let mut statement = connection
-        .prepare_cached(&query.statement)
-        .await
-        .map_err(unavailable)?;
-    let mut rows = statement.query(query.params).await.map_err(unavailable)?;
-    let mut groups: Vec<Option<CandidateGroup>> = std::iter::repeat_with(|| None)
-        .take(candidates.len())
-        .collect();
-    while let Some(row) = rows.next().await.map_err(unavailable)? {
-        let ordinal = request_ordinal_from_row(&row)?;
-        let Some((relevance, freshness)) = metadata.get(ordinal).copied() else {
-            return Err(CatalogError::StoreUnavailable);
-        };
-        if groups[ordinal].is_none() {
-            groups[ordinal] = Some(CandidateGroup::from_row(&row, (relevance, freshness))?);
-        }
-        let group = groups[ordinal]
-            .as_mut()
-            .ok_or(CatalogError::StoreUnavailable)?;
-        group.push_package(&row)?;
-    }
-    ordered_groups_from_ordinal(groups)
+            AND snapshots.repository_id = attempts.repository_id\n\
+            AND snapshots.commit_sha = attempts.snapshot_commit_sha\n\
+            AND snapshots.tree_sha = attempts.snapshot_tree_sha\n\
+            AND snapshots.analyzer_profile_digest = attempts.snapshot_analyzer_profile_digest\n",
+    );
+    collect_hydrated_rows(connection, sql.finish(), candidates).await
 }
 
 fn requested_candidates_sql(candidates: &[Candidate]) -> Result<SqlBuilder, CatalogError> {
@@ -2044,20 +2013,15 @@ mod tests {
             .collect::<Vec<_>>();
         let chunks = candidates
             .chunks(MAX_ATTEMPT_CANDIDATES_PER_HYDRATION)
-            .map(attempt_candidates_sql)
+            .map(|chunk| requested_candidates_sql(chunk).expect("valid request sql"))
             .collect::<Vec<_>>();
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].params.len(), MAX_DYNAMIC_BINDINGS);
         assert_eq!(chunks[1].params.len(), ATTEMPT_BINDINGS_PER_CANDIDATE);
         assert!(
-            chunks[0]
+            !chunks[0]
                 .statement
                 .contains(" UNION ALL SELECT attempts.attempt_id")
-        );
-        assert!(
-            chunks[0]
-                .statement
-                .contains("INDEXED BY sqlite_autoindex_catalog_attempts_1")
         );
     }
 
