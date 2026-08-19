@@ -646,10 +646,10 @@ fn push_ranked_ctes(sql: &mut SqlBuilder, query: &InventoryQueryV1) -> Result<()
         InventorySearchFieldV1::Package => "terms.field = 'package'",
     };
     if query.match_mode == InventoryMatchModeV1::Fuzzy && search.chars().count() >= 3 {
-        let postings_field_predicate = match query.search_field {
+        let terms_field_predicate = match query.search_field {
             InventorySearchFieldV1::Any => "1 = 1",
-            InventorySearchFieldV1::Repository => "postings.field = 'repository'",
-            InventorySearchFieldV1::Package => "postings.field = 'package'",
+            InventorySearchFieldV1::Repository => "terms.field = 'repository'",
+            InventorySearchFieldV1::Package => "terms.field = 'package'",
         };
         let trigrams = trigrams(&search);
         sql.push(", query_trigrams(trigram) AS (VALUES ");
@@ -663,21 +663,21 @@ fn push_ranked_ctes(sql: &mut SqlBuilder, query: &InventoryQueryV1) -> Result<()
         }
         sql.push(
             "), term_intersections AS (\n\
-             SELECT postings.namespace_kind, postings.credential_profile_id,\n\
-                    postings.attempt_id, postings.field, postings.term,\n\
+             SELECT terms.namespace_kind, terms.credential_profile_id,\n\
+                    terms.attempt_id, terms.field, terms.term,\n\
                     COUNT(query_trigrams.trigram) AS intersection_count\n\
                FROM query_trigrams\n\
                CROSS JOIN authorized\n\
-               CROSS JOIN catalog_search_trigrams AS postings\n\
-                    INDEXED BY sqlite_autoindex_catalog_search_trigrams_1\n\
-              WHERE postings.namespace_kind = authorized.namespace_kind\n\
-                AND postings.credential_profile_id = authorized.credential_profile_id\n\
-                AND postings.trigram = query_trigrams.trigram AND ",
+               CROSS JOIN catalog_search_terms AS terms\n\
+               CROSS JOIN json_each(terms.trigrams_json) AS term_trigrams\n\
+              WHERE terms.namespace_kind = authorized.namespace_kind\n\
+                AND terms.credential_profile_id = authorized.credential_profile_id\n\
+                AND term_trigrams.value = query_trigrams.trigram AND ",
         );
-        sql.push(postings_field_predicate);
+        sql.push(terms_field_predicate);
         sql.push(
-            " GROUP BY postings.namespace_kind, postings.credential_profile_id,\n\
-                       postings.attempt_id, postings.field, postings.term),\n\
+            " GROUP BY terms.namespace_kind, terms.credential_profile_id,\n\
+                       terms.attempt_id, terms.field, terms.term),\n\
              search_scores AS (\n\
              SELECT intersections.namespace_kind,\n\
                     intersections.credential_profile_id, intersections.attempt_id,\n\
@@ -707,25 +707,16 @@ fn push_ranked_ctes(sql: &mut SqlBuilder, query: &InventoryQueryV1) -> Result<()
     }
 
     if query.match_mode == InventoryMatchModeV1::Substring && search.chars().count() >= 3 {
-        let anchor = trailing_trigram(&search).expect("length checked above");
         sql.push(
             ", search_scores AS (\n\
              SELECT terms.namespace_kind, terms.credential_profile_id, terms.attempt_id,\n\
                     MAX(MAX(0, 2000000 - terms.term_byte_len)) AS relevance\n\
                FROM authorized\n\
-               CROSS JOIN catalog_search_trigrams AS postings\n\
-                    INDEXED BY sqlite_autoindex_catalog_search_trigrams_1\n\
                JOIN catalog_search_terms AS terms\n\
-                 ON terms.namespace_kind = postings.namespace_kind\n\
-                AND terms.credential_profile_id = postings.credential_profile_id\n\
-                AND terms.attempt_id = postings.attempt_id\n\
-                AND terms.field = postings.field AND terms.term = postings.term\n\
-              WHERE postings.namespace_kind = authorized.namespace_kind\n\
-                AND postings.credential_profile_id = authorized.credential_profile_id\n\
-                AND postings.trigram = ",
+                 ON terms.namespace_kind = authorized.namespace_kind\n\
+                AND terms.credential_profile_id = authorized.credential_profile_id\n\
+              WHERE ",
         );
-        sql.bind(anchor);
-        sql.push(" AND ");
         sql.push(field_predicate);
         sql.push(" AND instr(terms.term, ");
         sql.bind(search);
@@ -1380,6 +1371,7 @@ struct RebuildSearchTerm {
     field: &'static str,
     term: String,
     trigram_count: usize,
+    trigrams_json: String,
 }
 
 pub(crate) async fn persist_rebuild_search_documents(
@@ -1441,12 +1433,16 @@ async fn persist_rebuild_search_batch(
             (SEARCH_FIELD_REPOSITORY, &projection.repository_terms),
             (SEARCH_FIELD_PACKAGE, &projection.package_terms),
         ] {
-            terms.extend(values.iter().map(|term| RebuildSearchTerm {
-                document,
-                field,
-                term: term.clone(),
-                trigram_count: trigrams(term).len(),
-            }));
+            for term in values {
+                let term_trigrams = trigrams(term);
+                terms.push(RebuildSearchTerm {
+                    document,
+                    field,
+                    term: term.clone(),
+                    trigram_count: term_trigrams.len(),
+                    trigrams_json: serde_json::to_string(&term_trigrams).map_err(unavailable)?,
+                });
+            }
         }
     }
     terms.sort_unstable_by(|left, right| {
@@ -1467,7 +1463,7 @@ async fn persist_rebuild_search_batch(
                 right.term.as_str(),
             ))
     });
-    for terms in terms.chunks(MAX_DYNAMIC_BINDINGS / 7) {
+    for terms in terms.chunks(MAX_DYNAMIC_BINDINGS / 8) {
         let rows = terms
             .iter()
             .map(|term| {
@@ -1480,6 +1476,7 @@ async fn persist_rebuild_search_batch(
                     turso::Value::Text(term.term.clone()),
                     turso::Value::Integer(to_i64(term.term.len() as u64)?),
                     turso::Value::Integer(to_i64(term.trigram_count as u64)?),
+                    turso::Value::Text(term.trigrams_json.clone()),
                 ])
             })
             .collect::<Result<Vec<_>, CatalogError>>()?;
@@ -1487,97 +1484,13 @@ async fn persist_rebuild_search_batch(
             connection,
             "INSERT OR IGNORE INTO catalog_search_terms (
                  namespace_kind, credential_profile_id, attempt_id, field,
-                 term, term_byte_len, trigram_count
+                 term, term_byte_len, trigram_count, trigrams_json
              )",
-            7,
+            8,
             rows,
         )
         .await?;
     }
-    let mut postings = Vec::new();
-    let mut estimated_posting_bytes = 0_usize;
-    for (term_index, term) in terms.iter().enumerate() {
-        let term_posting_bytes = term.trigram_count.saturating_mul(64);
-        if !postings.is_empty()
-            && estimated_posting_bytes.saturating_add(term_posting_bytes)
-                > REBUILD_SEARCH_WORKING_SET_BYTES
-        {
-            persist_rebuild_search_postings(connection, documents, &terms, &mut postings).await?;
-            estimated_posting_bytes = 0;
-        }
-        postings.extend(
-            trigrams(&term.term)
-                .into_iter()
-                .map(|trigram| (term_index, trigram)),
-        );
-        estimated_posting_bytes = estimated_posting_bytes.saturating_add(term_posting_bytes);
-    }
-    persist_rebuild_search_postings(connection, documents, &terms, &mut postings).await
-}
-
-async fn persist_rebuild_search_postings(
-    connection: &turso::Connection,
-    documents: &[RebuildSearchDocument],
-    terms: &[RebuildSearchTerm],
-    postings: &mut Vec<(usize, String)>,
-) -> Result<(), CatalogError> {
-    postings.sort_unstable_by(|(left_term, left_trigram), (right_term, right_trigram)| {
-        let left = &terms[*left_term];
-        let right = &terms[*right_term];
-        let left_document = &documents[left.document];
-        let right_document = &documents[right.document];
-        (
-            left_document.namespace_kind.as_str(),
-            left_document.credential_profile_id.as_str(),
-            left_trigram.as_str(),
-            left_document.attempt_id.as_str(),
-            left.field,
-            left.term.as_str(),
-        )
-            .cmp(&(
-                right_document.namespace_kind.as_str(),
-                right_document.credential_profile_id.as_str(),
-                right_trigram.as_str(),
-                right_document.attempt_id.as_str(),
-                right.field,
-                right.term.as_str(),
-            ))
-    });
-    let capacity = MAX_DYNAMIC_BINDINGS / 6;
-    let mut rows = Vec::with_capacity(capacity);
-    for (term, trigram) in postings.drain(..) {
-        let term = &terms[term];
-        let document = &documents[term.document];
-        rows.push(vec![
-            turso::Value::Text(document.namespace_kind.clone()),
-            turso::Value::Text(document.credential_profile_id.clone()),
-            turso::Value::Text(document.attempt_id.clone()),
-            turso::Value::Text(term.field.to_owned()),
-            turso::Value::Text(term.term.clone()),
-            turso::Value::Text(trigram),
-        ]);
-        if rows.len() == capacity {
-            execute_rebuild_rows(
-                connection,
-                "INSERT OR IGNORE INTO catalog_search_trigrams (
-                         namespace_kind, credential_profile_id, attempt_id, field, term, trigram
-                     )",
-                6,
-                std::mem::take(&mut rows),
-            )
-            .await?;
-            rows = Vec::with_capacity(capacity);
-        }
-    }
-    execute_rebuild_rows(
-        connection,
-        "INSERT OR IGNORE INTO catalog_search_trigrams (
-             namespace_kind, credential_profile_id, attempt_id, field, term, trigram
-         )",
-        6,
-        rows,
-    )
-    .await?;
     Ok(())
 }
 
@@ -1635,12 +1548,13 @@ async fn persist_terms<'a>(
         .collect::<BTreeSet<_>>();
     for term in terms {
         let term_trigrams = trigrams(&term);
+        let trigrams_json = serde_json::to_string(&term_trigrams).map_err(unavailable)?;
         connection
             .execute(
                 "INSERT OR IGNORE INTO catalog_search_terms (
                      namespace_kind, credential_profile_id, attempt_id, field,
-                     term, term_byte_len, trigram_count
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     term, term_byte_len, trigram_count, trigrams_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 turso::params![
                     namespace_kind,
                     credential_profile_id,
@@ -1648,49 +1562,12 @@ async fn persist_terms<'a>(
                     field,
                     term.as_str(),
                     to_i64(term.len() as u64)?,
-                    to_i64(term_trigrams.len() as u64)?
+                    to_i64(term_trigrams.len() as u64)?,
+                    trigrams_json
                 ],
             )
             .await
             .map_err(unavailable)?;
-        let mut statement = String::from(
-            "INSERT OR IGNORE INTO catalog_search_trigrams (
-                 namespace_kind, credential_profile_id, attempt_id, field, term, trigram
-             ) VALUES ",
-        );
-        let mut params = Vec::new();
-        for trigram in term_trigrams {
-            if params.len() + 6 > MAX_DYNAMIC_BINDINGS {
-                connection
-                    .execute(&statement, params)
-                    .await
-                    .map_err(unavailable)?;
-                statement.truncate(
-                    statement
-                        .find(" VALUES ")
-                        .map_or(statement.len(), |p| p + 8),
-                );
-                params = Vec::new();
-            }
-            if !params.is_empty() {
-                statement.push(',');
-            }
-            statement.push_str("(?,?,?,?,?,?)");
-            params.extend([
-                turso::Value::Text(namespace_kind.to_owned()),
-                turso::Value::Text(credential_profile_id.to_owned()),
-                turso::Value::Text(attempt_id.to_owned()),
-                turso::Value::Text(field.to_owned()),
-                turso::Value::Text(term.clone()),
-                turso::Value::Text(trigram),
-            ]);
-        }
-        if !params.is_empty() {
-            connection
-                .execute(&statement, params)
-                .await
-                .map_err(unavailable)?;
-        }
     }
     Ok(())
 }
@@ -1792,6 +1669,7 @@ fn prefix_upper_bound(value: &str) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn trailing_trigram(value: &str) -> Option<String> {
     let characters = value.chars().collect::<Vec<_>>();
     (characters.len() >= 3).then(|| characters[characters.len() - 3..].iter().collect())
@@ -1930,22 +1808,20 @@ mod tests {
         let sql = CandidateSql::build(&namespaces, &query, None, 42, true, 100).unwrap();
         let trigrams = sql.statement.find("FROM query_trigrams").unwrap();
         let authorized = sql.statement.find("CROSS JOIN authorized").unwrap();
-        let postings = sql
+        let terms = sql
             .statement
-            .find("CROSS JOIN catalog_search_trigrams")
+            .find("CROSS JOIN catalog_search_terms AS terms")
             .unwrap();
         assert!(
-            trigrams < authorized && authorized < postings,
-            "query trigrams must remain the outer loop for fuzzy candidate generation"
+            trigrams < authorized && authorized < terms,
+            "query trigrams and authorized namespaces must precede term expansion"
         );
+        assert!(sql.statement.contains("json_each(terms.trigrams_json)"));
         assert!(
-            sql.statement
-                .contains("INDEXED BY sqlite_autoindex_catalog_search_trigrams_1")
+            !sql.statement
+                .contains("catalog_search_trigrams AS postings")
         );
-        let grouped = sql
-            .statement
-            .find("GROUP BY postings.namespace_kind")
-            .unwrap();
+        let grouped = sql.statement.find("GROUP BY terms.namespace_kind").unwrap();
         let intersections = sql
             .statement
             .find("FROM term_intersections AS intersections")
@@ -1963,10 +1839,9 @@ mod tests {
         query.search = Some("owner/repository".to_owned());
         let sql = CandidateSql::build(&namespaces, &query, None, 42, true, 100).unwrap();
         assert!(
-            sql.statement
-                .contains("INDEXED BY sqlite_autoindex_catalog_search_trigrams_1")
+            !sql.statement
+                .contains("catalog_search_trigrams AS postings")
         );
-        assert!(sql.statement.contains("postings.trigram = ?"));
         assert!(sql.statement.contains("instr(terms.term, ?) > 0"));
     }
 

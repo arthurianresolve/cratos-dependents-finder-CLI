@@ -27,7 +27,8 @@ use super::{
     sql_search,
 };
 
-const DURABLE_SCHEMA_VERSION: u16 = 1;
+const PREVIOUS_DURABLE_SCHEMA_VERSION: u16 = 1;
+const DURABLE_SCHEMA_VERSION: u16 = 2;
 const MAX_BULK_BINDINGS: usize = 900;
 
 struct DatabaseState {
@@ -725,6 +726,7 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
                  term TEXT NOT NULL,
                  term_byte_len INTEGER NOT NULL,
                  trigram_count INTEGER NOT NULL,
+                 trigrams_json TEXT NOT NULL,
                  PRIMARY KEY (
                      namespace_kind, credential_profile_id, attempt_id, field, term
                  ),
@@ -778,7 +780,7 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
              CREATE INDEX IF NOT EXISTS catalog_saved_query_identity
                  ON catalog_saved_query_revisions (query_id, revision);
              INSERT OR IGNORE INTO catalog_metadata (key, value)
-                 VALUES ('schema_version', '1');
+                 VALUES ('schema_version', '2');
              INSERT OR IGNORE INTO catalog_metadata (key, value)
                  VALUES ('watermark', '0');
              INSERT OR IGNORE INTO catalog_metadata (key, value)
@@ -787,12 +789,78 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
         .await
         .map_err(unavailable)?;
     let schema_version = metadata_u64(connection, "schema_version").await?;
-    if schema_version != u64::from(DURABLE_SCHEMA_VERSION) {
-        return Err(CatalogError::UnsupportedSchemaVersion(
-            u16::try_from(schema_version).unwrap_or(u16::MAX),
-        ));
+    match u16::try_from(schema_version).unwrap_or(u16::MAX) {
+        PREVIOUS_DURABLE_SCHEMA_VERSION => migrate_search_terms(connection).await?,
+        DURABLE_SCHEMA_VERSION => {}
+        version => return Err(CatalogError::UnsupportedSchemaVersion(version)),
     }
     Ok(())
+}
+
+async fn migrate_search_terms(connection: &turso::Connection) -> Result<(), CatalogError> {
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .await
+        .map_err(unavailable)?;
+    let migrated = async {
+        connection
+            .execute(
+                "ALTER TABLE catalog_search_terms
+                 ADD COLUMN trigrams_json TEXT NOT NULL DEFAULT '[]'",
+                (),
+            )
+            .await
+            .map_err(unavailable)?;
+        connection
+            .execute(
+                "CREATE TEMP TABLE catalog_search_term_trigram_json AS
+                 SELECT namespace_kind, credential_profile_id, attempt_id, field, term,
+                        json_group_array(trigram) AS trigrams_json
+                 FROM catalog_search_trigrams
+                 GROUP BY namespace_kind, credential_profile_id, attempt_id, field, term",
+                (),
+            )
+            .await
+            .map_err(unavailable)?;
+        connection
+            .execute(
+                "CREATE INDEX catalog_search_term_trigram_json_key
+                 ON catalog_search_term_trigram_json
+                    (namespace_kind, credential_profile_id, attempt_id, field, term)",
+                (),
+            )
+            .await
+            .map_err(unavailable)?;
+        connection
+            .execute(
+                "UPDATE catalog_search_terms AS terms
+                 SET trigrams_json = COALESCE((
+                     SELECT grouped.trigrams_json
+                     FROM catalog_search_term_trigram_json AS grouped
+                     WHERE grouped.namespace_kind = terms.namespace_kind
+                       AND grouped.credential_profile_id = terms.credential_profile_id
+                       AND grouped.attempt_id = terms.attempt_id
+                       AND grouped.field = terms.field
+                       AND grouped.term = terms.term
+                 ), '[]')",
+                (),
+            )
+            .await
+            .map_err(unavailable)?;
+        connection
+            .execute("DROP TABLE catalog_search_term_trigram_json", ())
+            .await
+            .map_err(unavailable)?;
+        set_metadata_u64(
+            connection,
+            "schema_version",
+            u64::from(DURABLE_SCHEMA_VERSION),
+        )
+        .await?;
+        Ok::<(), CatalogError>(())
+    }
+    .await;
+    finish_transaction(connection, migrated).await
 }
 
 fn unavailable<E>(_error: E) -> CatalogError {
@@ -3347,6 +3415,61 @@ mod tests {
                 .unwrap()
                 .items
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn json_trigram_terms_drive_fuzzy_and_substring_search() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("coordinator.db");
+        let store = TursoInventoryStore::open(&path, [27; 32]).await.unwrap();
+        store
+            .project(failed(InventoryNamespaceV1::Public))
+            .await
+            .unwrap();
+        let access = access_for_namespace(&InventoryNamespaceV1::Public);
+
+        let mut fuzzy = InventoryQueryV1::new();
+        fuzzy.search = Some("owner/repositorx".to_owned());
+        fuzzy.search_field = InventorySearchFieldV1::Repository;
+        fuzzy.match_mode = InventoryMatchModeV1::Fuzzy;
+        assert_eq!(
+            store
+                .search(&access, &fuzzy, &InventoryPageRequestV1::default())
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        let mut substring = InventoryQueryV1::new();
+        substring.search = Some("repository".to_owned());
+        substring.search_field = InventorySearchFieldV1::Repository;
+        substring.match_mode = InventoryMatchModeV1::Substring;
+        assert_eq!(
+            store
+                .search(&access, &substring, &InventoryPageRequestV1::default())
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        let database = store.database.lock().await;
+        let connection = &database.connection;
+        assert_eq!(
+            scalar_i64(connection, "SELECT COUNT(*) FROM catalog_search_trigrams").await,
+            0
+        );
+        assert_eq!(
+            scalar_i64(
+                connection,
+                "SELECT COUNT(*) FROM catalog_search_terms WHERE trigrams_json <> '[]'",
+            )
+            .await,
+            2
         );
     }
 
