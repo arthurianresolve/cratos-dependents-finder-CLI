@@ -380,9 +380,9 @@ recovery channel.
 The older database-only interface remains available with `backup --output DB
 --manifest JSON` and `restore --backup DB --manifest JSON --database NEW_DB`.
 It does not capture encrypted artifacts or external recovery dependencies and
-is retained only for compatibility. Neither mode is an online snapshot, secret
-escrow, or evidence that the one-hour RPO/four-hour RTO objectives have been
-met; those claims require a timed restore rehearsal.
+is retained only for compatibility. Neither mode is an online snapshot or
+secret escrow. It is also not evidence that any RPO/RTO target has been met;
+that claim requires repeated timed restore rehearsals.
 
 `agent run` leases globally by default. `--job-id` remains available for a
 compatibility worker pinned to one job. A lost lease response is retried with
@@ -500,9 +500,9 @@ derived evidence currently enters the encrypted cache.
 The configured scale ceiling is 10,000 repositories per job, 25 running jobs,
 1,000 schedules, and 16 enrolled agents. It is a design target—not a supported
 capacity claim—until the documented 250,000-task restart, compaction, search,
-backup, and restore load gate passes. The recovery objectives are RPO at most
-one hour and RTO at most four hours, likewise contingent on a successful
-restore rehearsal.
+backup, and restore load gate passes. Recovery objectives (RPO/RTO) are currently
+aspirational and must be demonstrated through repeated timed restore rehearsals
+before claiming a specific bound.
 
 The client uses the current versioned GitHub REST API, pins repository content to
 an immutable commit, and treats search caps, `incomplete_results`, rate limits,

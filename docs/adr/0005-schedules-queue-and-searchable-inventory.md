@@ -71,5 +71,5 @@ backup, and restore load gate passes. Evidence and inventory observations retain
 for 365 days by default. Terminal execution and control-plane state follows the
 same reference-aware retention boundary; active runs and state referenced by a
 retained schedule or artifact are preserved. Distributed provider admission
-uses retry-safe per-request permit identities. The recovery objectives are
-one-hour RPO and four-hour RTO, validated by restore rehearsal.
+uses retry-safe per-request permit identities. Recovery targets (RPO/RTO) are
+currently aspirational and should be validated by repeated restore rehearsals.
