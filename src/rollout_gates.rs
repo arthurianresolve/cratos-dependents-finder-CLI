@@ -812,11 +812,13 @@ async fn verify_catalog_term_search(inventory: &TursoInventoryStore, count: usiz
         inventory,
         &access,
         InventoryMatchModeV1::Substring,
-        "tools-123456",
+        &format!("tools-{exact_index:06}"),
         10,
         1,
     )
-    .await
+    .await?;
+
+    Ok(())
 }
 
 async fn verify_search(
