@@ -29,7 +29,8 @@ use super::{
 
 const FIRST_DURABLE_SCHEMA_VERSION: u16 = 1;
 const SECOND_DURABLE_SCHEMA_VERSION: u16 = 2;
-const DURABLE_SCHEMA_VERSION: u16 = 3;
+const THIRD_DURABLE_SCHEMA_VERSION: u16 = 3;
+const DURABLE_SCHEMA_VERSION: u16 = 4;
 const MAX_BULK_BINDINGS: usize = 900;
 
 struct DatabaseState {
@@ -760,8 +761,9 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
                  namespace_kind TEXT NOT NULL,
                  credential_profile_id TEXT NOT NULL,
                  trigram TEXT NOT NULL,
+                 shard INTEGER NOT NULL,
                  postings_json TEXT NOT NULL,
-                 PRIMARY KEY (namespace_kind, credential_profile_id, trigram)
+                 PRIMARY KEY (namespace_kind, credential_profile_id, trigram, shard)
              );
              CREATE TABLE IF NOT EXISTS catalog_latest (
                  namespace_kind TEXT NOT NULL,
@@ -788,7 +790,7 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
              CREATE INDEX IF NOT EXISTS catalog_saved_query_identity
                  ON catalog_saved_query_revisions (query_id, revision);
              INSERT OR IGNORE INTO catalog_metadata (key, value)
-                 VALUES ('schema_version', '3');
+                 VALUES ('schema_version', '4');
              INSERT OR IGNORE INTO catalog_metadata (key, value)
                  VALUES ('watermark', '0');
              INSERT OR IGNORE INTO catalog_metadata (key, value)
@@ -800,9 +802,14 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
     match u16::try_from(schema_version).unwrap_or(u16::MAX) {
         FIRST_DURABLE_SCHEMA_VERSION => {
             migrate_search_terms(connection).await?;
-            migrate_search_buckets(connection).await?;
+            migrate_search_buckets_legacy(connection).await?;
+            migrate_search_bucket_shards(connection).await?;
         }
-        SECOND_DURABLE_SCHEMA_VERSION => migrate_search_buckets(connection).await?,
+        SECOND_DURABLE_SCHEMA_VERSION => {
+            migrate_search_buckets_legacy(connection).await?;
+            migrate_search_bucket_shards(connection).await?;
+        }
+        THIRD_DURABLE_SCHEMA_VERSION => migrate_search_bucket_shards(connection).await?,
         DURABLE_SCHEMA_VERSION => {}
         version => return Err(CatalogError::UnsupportedSchemaVersion(version)),
     }
@@ -875,7 +882,7 @@ async fn migrate_search_terms(connection: &turso::Connection) -> Result<(), Cata
     finish_transaction(connection, migrated).await
 }
 
-async fn migrate_search_buckets(connection: &turso::Connection) -> Result<(), CatalogError> {
+async fn migrate_search_buckets_legacy(connection: &turso::Connection) -> Result<(), CatalogError> {
     connection
         .execute_batch("BEGIN IMMEDIATE")
         .await
@@ -897,6 +904,102 @@ async fn migrate_search_buckets(connection: &turso::Connection) -> Result<(), Ca
                  GROUP BY terms.namespace_kind, terms.credential_profile_id, trigrams.value",
                 (),
             )
+            .await
+            .map_err(unavailable)?;
+        set_metadata_u64(
+            connection,
+            "schema_version",
+            u64::from(THIRD_DURABLE_SCHEMA_VERSION),
+        )
+        .await?;
+        Ok::<(), CatalogError>(())
+    }
+    .await;
+    finish_transaction(connection, migrated).await
+}
+
+async fn migrate_search_bucket_shards(connection: &turso::Connection) -> Result<(), CatalogError> {
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .await
+        .map_err(unavailable)?;
+    let migrated = async {
+        connection
+            .execute(
+                "ALTER TABLE catalog_search_trigram_buckets
+                 RENAME TO catalog_search_trigram_buckets_v3",
+                (),
+            )
+            .await
+            .map_err(unavailable)?;
+        connection
+            .execute(
+                "CREATE TABLE catalog_search_trigram_buckets (
+                     namespace_kind TEXT NOT NULL,
+                     credential_profile_id TEXT NOT NULL,
+                     trigram TEXT NOT NULL,
+                     shard INTEGER NOT NULL,
+                     postings_json TEXT NOT NULL,
+                     PRIMARY KEY (namespace_kind, credential_profile_id, trigram, shard)
+                 )",
+                (),
+            )
+            .await
+            .map_err(unavailable)?;
+
+        let mut rows = connection
+            .query(
+                "SELECT namespace_kind, credential_profile_id, trigram, postings_json
+                 FROM catalog_search_trigram_buckets_v3",
+                (),
+            )
+            .await
+            .map_err(unavailable)?;
+        while let Some(row) = rows.next().await.map_err(unavailable)? {
+            let namespace_kind: String = row.get(0).map_err(unavailable)?;
+            let credential_profile_id: String = row.get(1).map_err(unavailable)?;
+            let trigram: String = row.get(2).map_err(unavailable)?;
+            let encoded: String = row.get(3).map_err(unavailable)?;
+            let postings: Vec<Vec<String>> = serde_json::from_str(&encoded).map_err(unavailable)?;
+            let mut shards = BTreeMap::<u8, Vec<serde_json::Value>>::new();
+            for posting in postings {
+                if posting.len() != 5 {
+                    return Err(CatalogError::StoreUnavailable);
+                }
+                let attempt_id = posting.get(2).ok_or(CatalogError::StoreUnavailable)?;
+                let field = posting.get(3).ok_or(CatalogError::StoreUnavailable)?;
+                let term = posting.get(4).ok_or(CatalogError::StoreUnavailable)?;
+                let field_code = match field.as_str() {
+                    "repository" => 0_u8,
+                    "package" => 1_u8,
+                    _ => return Err(CatalogError::StoreUnavailable),
+                };
+                shards
+                    .entry(sql_search::bucket_shard(attempt_id))
+                    .or_default()
+                    .push(serde_json::json!([attempt_id, field_code, term]));
+            }
+            for (shard, postings) in shards {
+                connection
+                    .execute(
+                        "INSERT INTO catalog_search_trigram_buckets (
+                             namespace_kind, credential_profile_id, trigram, shard,
+                             postings_json
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        turso::params![
+                            namespace_kind.as_str(),
+                            credential_profile_id.as_str(),
+                            trigram.as_str(),
+                            i64::from(shard),
+                            serde_json::to_string(&postings).map_err(unavailable)?
+                        ],
+                    )
+                    .await
+                    .map_err(unavailable)?;
+            }
+        }
+        connection
+            .execute("DROP TABLE catalog_search_trigram_buckets_v3", ())
             .await
             .map_err(unavailable)?;
         set_metadata_u64(

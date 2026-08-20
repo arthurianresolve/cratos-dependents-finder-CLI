@@ -399,9 +399,9 @@ async fn run_catalog_search_diagnostic(metrics: &mut MetricWriter, count: usize)
     )?;
 
     let phase = Instant::now();
-    verify_catalog_exact_search(&inventory, count).await?;
+    verify_catalog_term_search(&inventory, count).await?;
     metrics.event(
-        "catalog_exact_search",
+        "catalog_term_search",
         "passed",
         phase.elapsed(),
         json!({ "projections": count }),
@@ -784,7 +784,7 @@ async fn verify_catalog_pages(
     })
 }
 
-async fn verify_catalog_exact_search(inventory: &TursoInventoryStore, count: usize) -> Result<()> {
+async fn verify_catalog_term_search(inventory: &TursoInventoryStore, count: usize) -> Result<()> {
     let access = InventoryAccessV1 {
         principal_id: "rollout-gate".to_owned(),
         private_credential_profiles: BTreeSet::new(),
@@ -796,6 +796,24 @@ async fn verify_catalog_exact_search(inventory: &TursoInventoryStore, count: usi
         InventoryMatchModeV1::Exact,
         &repository_name(exact_index),
         1,
+        1,
+    )
+    .await?;
+    verify_search(
+        inventory,
+        &access,
+        InventoryMatchModeV1::Prefix,
+        "arthurian/fs2-tools-000",
+        PAGE_SIZE,
+        count.min(PAGE_SIZE),
+    )
+    .await?;
+    verify_search(
+        inventory,
+        &access,
+        InventoryMatchModeV1::Substring,
+        "tools-123456",
+        10,
         1,
     )
     .await
@@ -816,8 +834,8 @@ async fn verify_search(
     query.match_mode = mode;
     let started = Instant::now();
     eprintln!("catalog {mode:?} search started: {search}");
-    let page = inventory
-        .search(
+    let (page, candidate_elapsed) = inventory
+        .search_with_candidate_timing(
             access,
             &query,
             &InventoryPageRequestV1 {
@@ -827,8 +845,9 @@ async fn verify_search(
         )
         .await?;
     eprintln!(
-        "catalog {mode:?} search completed in {:?}: {} results",
+        "catalog {mode:?} search completed in {:?} (candidates {:?}): {} results",
         started.elapsed(),
+        candidate_elapsed,
         page.items.len()
     );
     ensure!(page.items.len() == expected, "search result count changed");
