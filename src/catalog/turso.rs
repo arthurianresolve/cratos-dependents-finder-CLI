@@ -27,8 +27,9 @@ use super::{
     sql_search,
 };
 
-const PREVIOUS_DURABLE_SCHEMA_VERSION: u16 = 1;
-const DURABLE_SCHEMA_VERSION: u16 = 2;
+const FIRST_DURABLE_SCHEMA_VERSION: u16 = 1;
+const SECOND_DURABLE_SCHEMA_VERSION: u16 = 2;
+const DURABLE_SCHEMA_VERSION: u16 = 3;
 const MAX_BULK_BINDINGS: usize = 900;
 
 struct DatabaseState {
@@ -755,6 +756,13 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
                          (namespace_kind, credential_profile_id, attempt_id)
                      ON DELETE CASCADE
              );
+             CREATE TABLE IF NOT EXISTS catalog_search_trigram_buckets (
+                 namespace_kind TEXT NOT NULL,
+                 credential_profile_id TEXT NOT NULL,
+                 trigram TEXT NOT NULL,
+                 postings_json TEXT NOT NULL,
+                 PRIMARY KEY (namespace_kind, credential_profile_id, trigram)
+             );
              CREATE TABLE IF NOT EXISTS catalog_latest (
                  namespace_kind TEXT NOT NULL,
                  credential_profile_id TEXT NOT NULL,
@@ -780,7 +788,7 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
              CREATE INDEX IF NOT EXISTS catalog_saved_query_identity
                  ON catalog_saved_query_revisions (query_id, revision);
              INSERT OR IGNORE INTO catalog_metadata (key, value)
-                 VALUES ('schema_version', '2');
+                 VALUES ('schema_version', '3');
              INSERT OR IGNORE INTO catalog_metadata (key, value)
                  VALUES ('watermark', '0');
              INSERT OR IGNORE INTO catalog_metadata (key, value)
@@ -790,7 +798,11 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
         .map_err(unavailable)?;
     let schema_version = metadata_u64(connection, "schema_version").await?;
     match u16::try_from(schema_version).unwrap_or(u16::MAX) {
-        PREVIOUS_DURABLE_SCHEMA_VERSION => migrate_search_terms(connection).await?,
+        FIRST_DURABLE_SCHEMA_VERSION => {
+            migrate_search_terms(connection).await?;
+            migrate_search_buckets(connection).await?;
+        }
+        SECOND_DURABLE_SCHEMA_VERSION => migrate_search_buckets(connection).await?,
         DURABLE_SCHEMA_VERSION => {}
         version => return Err(CatalogError::UnsupportedSchemaVersion(version)),
     }
@@ -849,6 +861,42 @@ async fn migrate_search_terms(connection: &turso::Connection) -> Result<(), Cata
             .map_err(unavailable)?;
         connection
             .execute("DROP TABLE catalog_search_term_trigram_json", ())
+            .await
+            .map_err(unavailable)?;
+        set_metadata_u64(
+            connection,
+            "schema_version",
+            u64::from(SECOND_DURABLE_SCHEMA_VERSION),
+        )
+        .await?;
+        Ok::<(), CatalogError>(())
+    }
+    .await;
+    finish_transaction(connection, migrated).await
+}
+
+async fn migrate_search_buckets(connection: &turso::Connection) -> Result<(), CatalogError> {
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .await
+        .map_err(unavailable)?;
+    let migrated = async {
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO catalog_search_trigram_buckets (
+                     namespace_kind, credential_profile_id, trigram, postings_json
+                 )
+                 SELECT terms.namespace_kind, terms.credential_profile_id,
+                        trigrams.value,
+                        json_group_array(json_array(
+                            terms.namespace_kind, terms.credential_profile_id,
+                            terms.attempt_id, terms.field, terms.term
+                        ))
+                 FROM catalog_search_terms AS terms
+                 CROSS JOIN json_each(terms.trigrams_json) AS trigrams
+                 GROUP BY terms.namespace_kind, terms.credential_profile_id, trigrams.value",
+                (),
+            )
             .await
             .map_err(unavailable)?;
         set_metadata_u64(
@@ -1954,7 +2002,8 @@ async fn persist_rebuild_search(
         estimated_working_set = estimated_working_set.saturating_add(document_working_set);
         documents.push(document);
     }
-    sql_search::persist_rebuild_search_documents(connection, documents).await
+    sql_search::persist_rebuild_search_documents(connection, documents).await?;
+    sql_search::finalize_rebuild_search_buckets(connection).await
 }
 
 impl LatestPointers {
@@ -2610,7 +2659,8 @@ async fn select_latest_value(
 async fn clear_projection(connection: &turso::Connection) -> Result<(), CatalogError> {
     connection
         .execute_batch(
-            "DELETE FROM catalog_search_trigrams;
+            "DELETE FROM catalog_search_trigram_buckets;
+             DELETE FROM catalog_search_trigrams;
              DELETE FROM catalog_search_terms;
              DELETE FROM catalog_search_documents;
              DELETE FROM catalog_limitations;
@@ -3462,6 +3512,14 @@ mod tests {
         assert_eq!(
             scalar_i64(connection, "SELECT COUNT(*) FROM catalog_search_trigrams").await,
             0
+        );
+        assert!(
+            scalar_i64(
+                connection,
+                "SELECT COUNT(*) FROM catalog_search_trigram_buckets",
+            )
+            .await
+                > 0
         );
         assert_eq!(
             scalar_i64(

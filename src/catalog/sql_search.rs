@@ -1,6 +1,6 @@
 //! Indexed durable search for the Turso inventory Adapter.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use semver::Version;
@@ -30,6 +30,9 @@ const MAX_ATTEMPT_CANDIDATES_PER_HYDRATION: usize =
     MAX_DYNAMIC_BINDINGS / ATTEMPT_BINDINGS_PER_CANDIDATE;
 pub(crate) const REBUILD_SEARCH_DOCUMENT_BATCH_SIZE: usize = 4_096;
 pub(crate) const REBUILD_SEARCH_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
+const SEARCH_POSTING_FIELDS: usize = 5;
+type SearchBucketKey = (String, String, String);
+type SearchBucketPostings = BTreeMap<SearchBucketKey, BTreeSet<String>>;
 
 pub(crate) fn rebuild_search_batch_should_flush(
     document_count: usize,
@@ -646,10 +649,12 @@ fn push_ranked_ctes(sql: &mut SqlBuilder, query: &InventoryQueryV1) -> Result<()
         InventorySearchFieldV1::Package => "terms.field = 'package'",
     };
     if query.match_mode == InventoryMatchModeV1::Fuzzy && search.chars().count() >= 3 {
-        let terms_field_predicate = match query.search_field {
+        let posting_field_predicate = match query.search_field {
             InventorySearchFieldV1::Any => "1 = 1",
-            InventorySearchFieldV1::Repository => "terms.field = 'repository'",
-            InventorySearchFieldV1::Package => "terms.field = 'package'",
+            InventorySearchFieldV1::Repository => {
+                "json_extract(postings.value, '$[3]') = 'repository'"
+            }
+            InventorySearchFieldV1::Package => "json_extract(postings.value, '$[3]') = 'package'",
         };
         let trigrams = trigrams(&search);
         sql.push(", query_trigrams(trigram) AS (VALUES ");
@@ -663,21 +668,30 @@ fn push_ranked_ctes(sql: &mut SqlBuilder, query: &InventoryQueryV1) -> Result<()
         }
         sql.push(
             "), term_intersections AS (\n\
-             SELECT terms.namespace_kind, terms.credential_profile_id,\n\
-                    terms.attempt_id, terms.field, terms.term,\n\
+             SELECT json_extract(postings.value, '$[0]') AS namespace_kind,\n\
+                    json_extract(postings.value, '$[1]') AS credential_profile_id,\n\
+                    json_extract(postings.value, '$[2]') AS attempt_id,\n\
+                    json_extract(postings.value, '$[3]') AS field,\n\
+                    json_extract(postings.value, '$[4]') AS term,\n\
                     COUNT(query_trigrams.trigram) AS intersection_count\n\
                FROM query_trigrams\n\
                CROSS JOIN authorized\n\
-               CROSS JOIN catalog_search_terms AS terms\n\
-               CROSS JOIN json_each(terms.trigrams_json) AS term_trigrams\n\
-              WHERE terms.namespace_kind = authorized.namespace_kind\n\
-                AND terms.credential_profile_id = authorized.credential_profile_id\n\
-                AND term_trigrams.value = query_trigrams.trigram AND ",
+               JOIN catalog_search_trigram_buckets AS buckets\n\
+                 ON buckets.namespace_kind = authorized.namespace_kind\n\
+                AND buckets.credential_profile_id = authorized.credential_profile_id\n\
+                AND buckets.trigram = query_trigrams.trigram\n\
+               CROSS JOIN json_each(buckets.postings_json) AS postings\n\
+              WHERE json_extract(postings.value, '$[0]') = authorized.namespace_kind\n\
+                AND json_extract(postings.value, '$[1]') = authorized.credential_profile_id\n\
+                AND ",
         );
-        sql.push(terms_field_predicate);
+        sql.push(posting_field_predicate);
         sql.push(
-            " GROUP BY terms.namespace_kind, terms.credential_profile_id,\n\
-                       terms.attempt_id, terms.field, terms.term),\n\
+            " GROUP BY json_extract(postings.value, '$[0]'),\n\
+                       json_extract(postings.value, '$[1]'),\n\
+                       json_extract(postings.value, '$[2]'),\n\
+                       json_extract(postings.value, '$[3]'),\n\
+                       json_extract(postings.value, '$[4]')),\n\
              search_scores AS (\n\
              SELECT intersections.namespace_kind,\n\
                     intersections.credential_profile_id, intersections.attempt_id,\n\
@@ -707,15 +721,30 @@ fn push_ranked_ctes(sql: &mut SqlBuilder, query: &InventoryQueryV1) -> Result<()
     }
 
     if query.match_mode == InventoryMatchModeV1::Substring && search.chars().count() >= 3 {
+        let anchor = trailing_trigram(&search).ok_or(CatalogError::StoreUnavailable)?;
         sql.push(
             ", search_scores AS (\n\
              SELECT terms.namespace_kind, terms.credential_profile_id, terms.attempt_id,\n\
                     MAX(MAX(0, 2000000 - terms.term_byte_len)) AS relevance\n\
                FROM authorized\n\
+               JOIN catalog_search_trigram_buckets AS buckets\n\
+                 ON buckets.namespace_kind = authorized.namespace_kind\n\
+                AND buckets.credential_profile_id = authorized.credential_profile_id\n\
+                AND buckets.trigram = ",
+        );
+        sql.bind(anchor);
+        sql.push(
+            "\n\
+               CROSS JOIN json_each(buckets.postings_json) AS postings\n\
                JOIN catalog_search_terms AS terms\n\
-                 ON terms.namespace_kind = authorized.namespace_kind\n\
-                AND terms.credential_profile_id = authorized.credential_profile_id\n\
-              WHERE ",
+                 ON terms.namespace_kind = json_extract(postings.value, '$[0]')\n\
+                AND terms.credential_profile_id = json_extract(postings.value, '$[1]')\n\
+                AND terms.attempt_id = json_extract(postings.value, '$[2]')\n\
+                AND terms.field = json_extract(postings.value, '$[3]')\n\
+                AND terms.term = json_extract(postings.value, '$[4]')\n\
+              WHERE json_extract(postings.value, '$[0]') = authorized.namespace_kind\n\
+                AND json_extract(postings.value, '$[1]') = authorized.credential_profile_id\n\
+                AND ",
         );
         sql.push(field_predicate);
         sql.push(" AND instr(terms.term, ");
@@ -1204,6 +1233,27 @@ pub(crate) async fn persist_search_document(
     attempt: &RepositoryAttemptV1,
     observation: Option<&TargetObservationV1>,
 ) -> Result<(), CatalogError> {
+    let mut old_trigrams = BTreeSet::new();
+    let mut old_rows = connection
+        .query(
+            "SELECT DISTINCT trigrams.value
+             FROM catalog_search_terms AS terms
+             CROSS JOIN json_each(terms.trigrams_json) AS trigrams
+             WHERE terms.namespace_kind = ?1
+               AND terms.credential_profile_id = ?2
+               AND terms.attempt_id = ?3",
+            turso::params![
+                namespace_kind,
+                credential_profile_id,
+                attempt.attempt_id.as_str()
+            ],
+        )
+        .await
+        .map_err(unavailable)?;
+    while let Some(row) = old_rows.next().await.map_err(unavailable)? {
+        old_trigrams.insert(row.get::<String>(0).map_err(unavailable)?);
+    }
+    let mut bucket_postings = SearchBucketPostings::new();
     connection
         .execute(
             "INSERT INTO catalog_search_documents (
@@ -1249,6 +1299,7 @@ pub(crate) async fn persist_search_document(
         &attempt.attempt_id,
         SEARCH_FIELD_REPOSITORY,
         repository_terms,
+        &mut bucket_postings,
     )
     .await?;
     if let Some(observation) = observation {
@@ -1259,6 +1310,7 @@ pub(crate) async fn persist_search_document(
             &attempt.attempt_id,
             SEARCH_FIELD_PACKAGE,
             std::iter::once(observation.target.name.as_str()),
+            &mut bucket_postings,
         )
         .await?;
         let mut after_ordinal = -1_i64;
@@ -1294,10 +1346,20 @@ pub(crate) async fn persist_search_document(
                 &attempt.attempt_id,
                 SEARCH_FIELD_PACKAGE,
                 batch.iter().map(String::as_str),
+                &mut bucket_postings,
             )
             .await?;
         }
     }
+    persist_search_buckets(
+        connection,
+        namespace_kind,
+        credential_profile_id,
+        attempt.attempt_id.as_str(),
+        &old_trigrams,
+        &bucket_postings,
+    )
+    .await?;
     connection
         .execute(
             "UPDATE catalog_search_documents SET ready = 1
@@ -1494,6 +1556,30 @@ async fn persist_rebuild_search_batch(
     Ok(())
 }
 
+pub(crate) async fn finalize_rebuild_search_buckets(
+    connection: &turso::Connection,
+) -> Result<(), CatalogError> {
+    connection
+        .execute_batch(
+            "DELETE FROM catalog_search_trigram_buckets;
+             INSERT INTO catalog_search_trigram_buckets (
+                 namespace_kind, credential_profile_id, trigram, postings_json
+             )
+             SELECT terms.namespace_kind, terms.credential_profile_id,
+                    trigrams.value,
+                    json_group_array(json_array(
+                        terms.namespace_kind, terms.credential_profile_id,
+                        terms.attempt_id, terms.field, terms.term
+                    ))
+             FROM catalog_search_terms AS terms
+             CROSS JOIN json_each(terms.trigrams_json) AS trigrams
+             GROUP BY terms.namespace_kind, terms.credential_profile_id, trigrams.value;
+            ",
+        )
+        .await
+        .map_err(unavailable)
+}
+
 async fn execute_rebuild_rows(
     connection: &turso::Connection,
     prefix: &str,
@@ -1540,6 +1626,7 @@ async fn persist_terms<'a>(
     attempt_id: &str,
     field: &str,
     terms: impl IntoIterator<Item = &'a str>,
+    bucket_postings: &mut SearchBucketPostings,
 ) -> Result<(), CatalogError> {
     let terms = terms
         .into_iter()
@@ -1549,6 +1636,23 @@ async fn persist_terms<'a>(
     for term in terms {
         let term_trigrams = trigrams(&term);
         let trigrams_json = serde_json::to_string(&term_trigrams).map_err(unavailable)?;
+        let posting = posting_json(
+            namespace_kind,
+            credential_profile_id,
+            attempt_id,
+            field,
+            &term,
+        )?;
+        for trigram in &term_trigrams {
+            bucket_postings
+                .entry((
+                    namespace_kind.to_owned(),
+                    credential_profile_id.to_owned(),
+                    trigram.clone(),
+                ))
+                .or_default()
+                .insert(posting.clone());
+        }
         connection
             .execute(
                 "INSERT OR IGNORE INTO catalog_search_terms (
@@ -1568,6 +1672,133 @@ async fn persist_terms<'a>(
             )
             .await
             .map_err(unavailable)?;
+    }
+    Ok(())
+}
+
+fn posting_json(
+    namespace_kind: &str,
+    credential_profile_id: &str,
+    attempt_id: &str,
+    field: &str,
+    term: &str,
+) -> Result<String, CatalogError> {
+    serde_json::to_string(&[
+        namespace_kind,
+        credential_profile_id,
+        attempt_id,
+        field,
+        term,
+    ])
+    .map_err(unavailable)
+}
+
+async fn persist_search_buckets(
+    connection: &turso::Connection,
+    namespace_kind: &str,
+    credential_profile_id: &str,
+    attempt_id: &str,
+    old_trigrams: &BTreeSet<String>,
+    new_postings: &SearchBucketPostings,
+) -> Result<(), CatalogError> {
+    let mut affected = old_trigrams
+        .iter()
+        .map(|trigram| {
+            (
+                namespace_kind.to_owned(),
+                credential_profile_id.to_owned(),
+                trigram.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    affected.extend(new_postings.keys().cloned());
+
+    let mut merged = SearchBucketPostings::new();
+    let mut empty = Vec::new();
+    for key in affected {
+        let (bucket_namespace, bucket_profile, trigram) = key.clone();
+        let mut postings = BTreeSet::new();
+        let mut rows = connection
+            .query(
+                "SELECT postings_json
+                 FROM catalog_search_trigram_buckets
+                 WHERE namespace_kind = ?1 AND credential_profile_id = ?2 AND trigram = ?3",
+                turso::params![
+                    bucket_namespace.as_str(),
+                    bucket_profile.as_str(),
+                    trigram.as_str()
+                ],
+            )
+            .await
+            .map_err(unavailable)?;
+        if let Some(row) = rows.next().await.map_err(unavailable)? {
+            let encoded: String = row.get(0).map_err(unavailable)?;
+            let existing: Vec<Vec<String>> = serde_json::from_str(&encoded).map_err(unavailable)?;
+            for posting in existing {
+                if posting.len() == SEARCH_POSTING_FIELDS
+                    && posting.get(2).is_none_or(|value| value != attempt_id)
+                {
+                    postings.insert(serde_json::to_string(&posting).map_err(unavailable)?);
+                }
+            }
+        }
+        if let Some(additions) = new_postings.get(&key) {
+            postings.extend(additions.iter().cloned());
+        }
+        if postings.is_empty() {
+            empty.push(key);
+        } else {
+            merged.insert(key, postings);
+        }
+    }
+    for (bucket_namespace, bucket_profile, trigram) in empty {
+        connection
+            .execute(
+                "DELETE FROM catalog_search_trigram_buckets
+                 WHERE namespace_kind = ?1 AND credential_profile_id = ?2 AND trigram = ?3",
+                turso::params![bucket_namespace, bucket_profile, trigram],
+            )
+            .await
+            .map_err(unavailable)?;
+    }
+    persist_bucket_rows(connection, &merged).await
+}
+
+async fn persist_bucket_rows(
+    connection: &turso::Connection,
+    buckets: &SearchBucketPostings,
+) -> Result<(), CatalogError> {
+    let rows = buckets
+        .iter()
+        .map(
+            |((namespace_kind, credential_profile_id, trigram), postings)| {
+                let postings_json = format!(
+                    "[{}]",
+                    postings
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                vec![
+                    turso::Value::Text(namespace_kind.clone()),
+                    turso::Value::Text(credential_profile_id.clone()),
+                    turso::Value::Text(trigram.clone()),
+                    turso::Value::Text(postings_json),
+                ]
+            },
+        )
+        .collect::<Vec<_>>();
+    for rows in rows.chunks(MAX_DYNAMIC_BINDINGS / 4) {
+        execute_rebuild_rows(
+            connection,
+            "INSERT OR REPLACE INTO catalog_search_trigram_buckets (
+                 namespace_kind, credential_profile_id, trigram, postings_json
+             )",
+            4,
+            rows.to_vec(),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1669,7 +1900,6 @@ fn prefix_upper_bound(value: &str) -> Option<String> {
     None
 }
 
-#[cfg(test)]
 fn trailing_trigram(value: &str) -> Option<String> {
     let characters = value.chars().collect::<Vec<_>>();
     (characters.len() >= 3).then(|| characters[characters.len() - 3..].iter().collect())
@@ -1810,18 +2040,25 @@ mod tests {
         let authorized = sql.statement.find("CROSS JOIN authorized").unwrap();
         let terms = sql
             .statement
-            .find("CROSS JOIN catalog_search_terms AS terms")
+            .find("CROSS JOIN json_each(buckets.postings_json) AS postings")
             .unwrap();
         assert!(
             trigrams < authorized && authorized < terms,
             "query trigrams and authorized namespaces must precede term expansion"
         );
-        assert!(sql.statement.contains("json_each(terms.trigrams_json)"));
+        assert!(sql.statement.contains("json_each(buckets.postings_json)"));
         assert!(
             !sql.statement
                 .contains("catalog_search_trigrams AS postings")
         );
-        let grouped = sql.statement.find("GROUP BY terms.namespace_kind").unwrap();
+        assert!(
+            sql.statement
+                .contains("catalog_search_trigram_buckets AS buckets")
+        );
+        let grouped = sql
+            .statement
+            .find("GROUP BY json_extract(postings.value, '$[0]')")
+            .unwrap();
         let intersections = sql
             .statement
             .find("FROM term_intersections AS intersections")
@@ -1842,6 +2079,11 @@ mod tests {
             !sql.statement
                 .contains("catalog_search_trigrams AS postings")
         );
+        assert!(
+            sql.statement
+                .contains("catalog_search_trigram_buckets AS buckets")
+        );
+        assert!(sql.statement.contains("trigram = ?"));
         assert!(sql.statement.contains("instr(terms.term, ?) > 0"));
     }
 
