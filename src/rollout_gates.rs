@@ -120,6 +120,55 @@ async fn restored_capacity_state_gate() -> Result<()> {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "measures the bounded fuzzy query against an existing restored catalog"]
+async fn restored_fuzzy_search_gate() -> Result<()> {
+    let _serial = GATE_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let state = required_state_directory()?;
+    let database = required_file(&state, "coordinator.db")?;
+    let cursor_key = load_cursor_key(&required_file(&state, "inventory-cursor.key")?)?;
+    let inventory = TursoInventoryStore::open(&database, cursor_key).await?;
+    let access = InventoryAccessV1 {
+        principal_id: "rollout-gate".to_owned(),
+        private_credential_profiles: BTreeSet::new(),
+    };
+    let mut query = InventoryQueryV1::new();
+    query.namespace = Some(InventoryNamespaceV1::Public);
+    query.search = Some("arthurain/fs2-tools-123456".to_owned());
+    query.search_field = InventorySearchFieldV1::Repository;
+    query.match_mode = InventoryMatchModeV1::Fuzzy;
+    let started = Instant::now();
+    let (page, candidates) = inventory
+        .search_with_candidate_timing(
+            &access,
+            &query,
+            &InventoryPageRequestV1 {
+                limit: Some(100),
+                cursor: None,
+            },
+        )
+        .await?;
+    let elapsed = started.elapsed();
+    ensure!(
+        page.items
+            .iter()
+            .any(|item| item.repository.full_name == "arthurian/fs2-tools-123456"),
+        "fuzzy search did not recover the typo target"
+    );
+    let mut metrics = MetricWriter::create("restored_fuzzy_search")?;
+    metrics.event(
+        "fuzzy_search",
+        "passed",
+        elapsed,
+        json!({
+            "items": page.items.len(),
+            "candidate_milliseconds": candidates.as_millis(),
+            "index_watermark": page.index_watermark,
+        }),
+    )?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "runs an explicitly sized durable catalog rebuild diagnostic"]
 async fn catalog_rebuild_diagnostic_gate() -> Result<()> {
     let _serial = GATE_LOCK.get_or_init(|| Mutex::new(())).lock().await;

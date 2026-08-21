@@ -20,9 +20,10 @@ use super::{
     cursor::CursorSigner,
     model::{
         CATALOG_SCHEMA_VERSION_V1, CatalogError, InventoryAccessV1, InventoryHistoryModeV1,
-        InventoryNamespaceV1, InventoryPageRequestV1, InventoryPageV1, InventoryProjectionInputV1,
-        InventoryProjectionOutcomeV1, InventoryQueryV1, InventorySearchResultV1, PackagePresenceV1,
-        SavedInventoryQueryDraftV1, SavedInventoryQueryRevisionV1,
+        InventoryMatchModeV1, InventoryNamespaceV1, InventoryPageRequestV1, InventoryPageV1,
+        InventoryProjectionInputV1, InventoryProjectionOutcomeV1, InventoryQueryV1,
+        InventorySearchResultV1, PackagePresenceV1, SavedInventoryQueryDraftV1,
+        SavedInventoryQueryRevisionV1,
     },
     sql_search,
 };
@@ -126,6 +127,11 @@ impl TursoInventoryStore {
                 &preview,
             )
             .await?;
+            // Incremental projections can add new search terms. The bulk
+            // trigram postings are intentionally lazy, so mark them stale in
+            // the same transaction as the projection rather than risking a
+            // ready index that silently misses newly observed values.
+            set_metadata_u64(connection, "trigram_index_ready", 0).await?;
             set_metadata_u64(connection, "watermark", sequence).await?;
             Ok::<u64, CatalogError>(sequence)
         }
@@ -187,6 +193,7 @@ impl TursoInventoryStore {
             let previous_watermark = metadata_u64(connection, "watermark").await?;
             clear_projection(connection).await?;
             let sequence = assign_rebuild_sequences(previous_watermark, &mut unique)?;
+            set_metadata_u64(connection, "trigram_index_ready", 0).await?;
             persist_rebuild(connection, &unique).await?;
             set_metadata_u64(connection, "watermark", sequence).await?;
             set_metadata_u64(connection, "cursor_floor", sequence).await?;
@@ -237,6 +244,44 @@ impl TursoInventoryStore {
             .database
             .connect()
             .map_err(unavailable)
+    }
+
+    async fn ensure_trigram_index(
+        &self,
+        query: &InventoryQueryV1,
+    ) -> Result<Option<u64>, CatalogError> {
+        if query.match_mode != InventoryMatchModeV1::Fuzzy
+            || query
+                .search
+                .as_deref()
+                .is_none_or(|search| search.chars().count() < 3)
+        {
+            return Ok(None);
+        }
+        let database = self.database.lock().await;
+        if metadata_u64(&database.connection, "trigram_index_ready").await? != 0 {
+            return metadata_u64(&database.connection, "watermark")
+                .await
+                .map(Some);
+        }
+        if database
+            .connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .await
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let built = match sql_search::finalize_rebuild_search_buckets(&database.connection).await {
+            Ok(()) => set_metadata_u64(&database.connection, "trigram_index_ready", 1).await,
+            Err(error) => Err(error),
+        };
+        match finish_transaction(&database.connection, built).await {
+            Ok(()) => metadata_u64(&database.connection, "watermark")
+                .await
+                .map(Some),
+            Err(_) => Ok(None),
+        }
     }
 
     async fn search_durable(
@@ -294,6 +339,7 @@ impl TursoInventoryStore {
     where
         Observer: FnOnce(&turso::Connection) -> Result<(), CatalogError> + Send,
     {
+        let trigram_index_ready = self.ensure_trigram_index(query).await?;
         // Authorization and cursor binding are enforced by sql_search before
         // inventory rows are ranked. The read transaction keeps the metadata
         // watermark, candidate page, and bounded hydration on one snapshot.
@@ -305,6 +351,7 @@ impl TursoInventoryStore {
             access,
             query,
             page,
+            trigram_index_ready,
             after_candidates,
         )
         .await;
@@ -793,8 +840,10 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
                  VALUES ('schema_version', '4');
              INSERT OR IGNORE INTO catalog_metadata (key, value)
                  VALUES ('watermark', '0');
-             INSERT OR IGNORE INTO catalog_metadata (key, value)
-                 VALUES ('cursor_floor', '0');",
+            INSERT OR IGNORE INTO catalog_metadata (key, value)
+                VALUES ('cursor_floor', '0');
+            INSERT OR IGNORE INTO catalog_metadata (key, value)
+                VALUES ('trigram_index_ready', '1');",
         )
         .await
         .map_err(unavailable)?;
@@ -2105,8 +2154,7 @@ async fn persist_rebuild_search(
         estimated_working_set = estimated_working_set.saturating_add(document_working_set);
         documents.push(document);
     }
-    sql_search::persist_rebuild_search_documents(connection, documents).await?;
-    sql_search::finalize_rebuild_search_buckets(connection).await
+    sql_search::persist_rebuild_search_documents(connection, documents).await
 }
 
 impl LatestPointers {
@@ -3631,6 +3679,72 @@ mod tests {
             )
             .await,
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_defers_trigram_index_until_fuzzy_search() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("coordinator.db");
+        let store = TursoInventoryStore::open(&path, [31; 32]).await.unwrap();
+
+        store
+            .rebuild(vec![failed(InventoryNamespaceV1::Public)])
+            .await
+            .unwrap();
+        {
+            let database = store.database.lock().await;
+            assert_eq!(
+                metadata_u64(&database.connection, "trigram_index_ready")
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+
+        let mut fuzzy = InventoryQueryV1::new();
+        fuzzy.search = Some("owner/repositorx".to_owned());
+        fuzzy.search_field = InventorySearchFieldV1::Repository;
+        fuzzy.match_mode = InventoryMatchModeV1::Fuzzy;
+        assert_eq!(
+            store
+                .search(
+                    &access_for_namespace(&InventoryNamespaceV1::Public),
+                    &fuzzy,
+                    &InventoryPageRequestV1::default(),
+                )
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        {
+            let database = store.database.lock().await;
+            assert_eq!(
+                metadata_u64(&database.connection, "trigram_index_ready")
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+
+        store
+            .project(failed_at(
+                InventoryNamespaceV1::Public,
+                "43",
+                "owner/another",
+                "task-2",
+                time(11),
+            ))
+            .await
+            .unwrap();
+        let database = store.database.lock().await;
+        assert_eq!(
+            metadata_u64(&database.connection, "trigram_index_ready")
+                .await
+                .unwrap(),
+            0
         );
     }
 
