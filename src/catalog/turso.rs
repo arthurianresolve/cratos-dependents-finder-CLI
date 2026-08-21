@@ -3658,6 +3658,20 @@ mod tests {
             1
         );
 
+        let mut prefix = InventoryQueryV1::new();
+        prefix.search = Some("owner/repo".to_owned());
+        prefix.search_field = InventorySearchFieldV1::Repository;
+        prefix.match_mode = InventoryMatchModeV1::Prefix;
+        assert_eq!(
+            store
+                .search(&access, &prefix, &InventoryPageRequestV1::default())
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
         let database = store.database.lock().await;
         let connection = &database.connection;
         assert_eq!(

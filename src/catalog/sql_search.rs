@@ -25,12 +25,12 @@ const SEARCH_FIELD_REPOSITORY: &str = "repository";
 const SEARCH_FIELD_PACKAGE: &str = "package";
 const INDEX_BATCH_SIZE: usize = 16;
 const MAX_DYNAMIC_BINDINGS: usize = 900;
-const HYDRATION_BINDINGS_PER_CANDIDATE: usize = 3;
+const HYDRATION_BINDINGS_PER_CANDIDATE: usize = 2;
 const MAX_CANDIDATES_PER_HYDRATION: usize =
-    (MAX_DYNAMIC_BINDINGS - 1) / HYDRATION_BINDINGS_PER_CANDIDATE;
-const ATTEMPT_BINDINGS_PER_CANDIDATE: usize = 4;
+    (MAX_DYNAMIC_BINDINGS - 5) / HYDRATION_BINDINGS_PER_CANDIDATE;
+const ATTEMPT_BINDINGS_PER_CANDIDATE: usize = 2;
 const MAX_ATTEMPT_CANDIDATES_PER_HYDRATION: usize =
-    MAX_DYNAMIC_BINDINGS / ATTEMPT_BINDINGS_PER_CANDIDATE;
+    (MAX_DYNAMIC_BINDINGS - 2) / ATTEMPT_BINDINGS_PER_CANDIDATE;
 // One bound per requested ID plus the two namespace bounds stays within the
 // portable dynamic-binding ceiling without using planner-sensitive JSON/IN
 // joins.
@@ -100,7 +100,7 @@ struct Candidate {
     has_observation: bool,
 }
 
-struct FuzzyCandidateRow {
+struct ScoredCandidateRow {
     candidate: Candidate,
     normalized_repository_name: String,
     completed_at: DateTime<Utc>,
@@ -153,25 +153,87 @@ where
     let use_latest = query.as_of.is_none()
         && snapshot_watermark == current_watermark
         && query.history != InventoryHistoryModeV1::Observations;
-    let fuzzy_anchor =
-        if use_latest && trigram_index_ready && latest_fuzzy_term_search(query).is_some() {
-            let namespace = query
-                .namespace
-                .as_ref()
-                .expect("latest fuzzy requires namespace");
-            let search = normalize_text(
-                query
-                    .search
-                    .as_deref()
-                    .expect("latest fuzzy requires search"),
-            );
-            select_fuzzy_anchor(connection, namespace, &search).await?
-        } else {
-            None
-        };
-    let mut candidates = if let (Some(namespace), Some(anchor)) =
-        (query.namespace.as_ref(), fuzzy_anchor.as_deref())
+    let substring_namespace = if use_latest && trigram_index_ready {
+        latest_substring_term_search(query)
+    } else {
+        None
+    };
+    let fuzzy_namespace = if use_latest && trigram_index_ready {
+        latest_fuzzy_term_search(query)
+    } else {
+        None
+    };
+    let trigram_anchor = if substring_namespace.is_some() || fuzzy_namespace.is_some() {
+        let namespace = query
+            .namespace
+            .as_ref()
+            .expect("latest indexed search requires namespace");
+        let search = normalize_text(
+            query
+                .search
+                .as_deref()
+                .expect("latest indexed search requires search"),
+        );
+        select_fuzzy_anchor(connection, namespace, &search).await?
+    } else {
+        None
+    };
+    let mut candidates = if let Some(namespace) = use_latest
+        .then(|| latest_repository_term_search(query))
+        .flatten()
     {
+        match load_latest_term_candidates(
+            connection,
+            namespace,
+            query,
+            cursor.as_ref(),
+            limit.saturating_add(1),
+        )
+        .await
+        {
+            Ok(candidates) => candidates,
+            Err(_) => {
+                load_generic_candidates(
+                    connection,
+                    &namespaces,
+                    query,
+                    cursor.as_ref(),
+                    snapshot_watermark,
+                    use_latest,
+                    limit.saturating_add(1),
+                    trigram_index_ready,
+                )
+                .await?
+            }
+        }
+    } else if let (Some(namespace), Some(anchor)) = (substring_namespace, trigram_anchor.as_deref())
+    {
+        match load_latest_substring_candidates(
+            connection,
+            namespace,
+            query,
+            cursor.as_ref(),
+            limit.saturating_add(1),
+            anchor,
+        )
+        .await
+        {
+            Ok(candidates) if !candidates.is_empty() => candidates,
+            Ok(_) | Err(_) => {
+                load_generic_candidates(
+                    connection,
+                    &namespaces,
+                    query,
+                    cursor.as_ref(),
+                    snapshot_watermark,
+                    use_latest,
+                    limit.saturating_add(1),
+                    trigram_index_ready,
+                )
+                .await?
+            }
+        }
+    } else if let (Some(namespace), Some(anchor)) = (fuzzy_namespace, trigram_anchor.as_deref()) {
         match load_latest_fuzzy_candidates(
             connection,
             namespace,
@@ -184,7 +246,8 @@ where
         {
             Ok(candidates) => candidates,
             Err(_) => {
-                let fallback_sql = CandidateSql::build_with_options(
+                load_generic_candidates(
+                    connection,
                     &namespaces,
                     query,
                     cursor.as_ref(),
@@ -192,14 +255,13 @@ where
                     use_latest,
                     limit.saturating_add(1),
                     trigram_index_ready,
-                    false,
-                    None,
-                )?;
-                load_candidates(connection, fallback_sql).await?
+                )
+                .await?
             }
         }
     } else {
-        let sql = CandidateSql::build_with_options(
+        load_generic_candidates(
+            connection,
             &namespaces,
             query,
             cursor.as_ref(),
@@ -207,10 +269,8 @@ where
             use_latest,
             limit.saturating_add(1),
             trigram_index_ready,
-            true,
-            None,
-        )?;
-        load_candidates(connection, sql).await?
+        )
+        .await?
     };
     // The fast path deliberately chooses an anchor by encoded bucket size
     // without parsing every posting bucket.  A field-specific query can
@@ -218,8 +278,9 @@ where
     // fast result is the one ambiguous case; retry through the field-aware
     // generic planner so this optimization can never turn a match into an
     // absence claim.
-    if candidates.is_empty() && use_latest && trigram_index_ready && fuzzy_anchor.is_some() {
-        let fallback_sql = CandidateSql::build_with_options(
+    if candidates.is_empty() && fuzzy_namespace.is_some() && trigram_anchor.is_some() {
+        candidates = load_generic_candidates(
+            connection,
             &namespaces,
             query,
             cursor.as_ref(),
@@ -227,10 +288,8 @@ where
             use_latest,
             limit.saturating_add(1),
             trigram_index_ready,
-            false,
-            None,
-        )?;
-        candidates = load_candidates(connection, fallback_sql).await?;
+        )
+        .await?;
     }
     after_candidates(connection)?;
     let mut results = hydrate_candidates(connection, &candidates).await?;
@@ -269,6 +328,34 @@ fn authorized_namespaces(
             })
         }))
         .collect()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the candidate fallback forwards the planner snapshot switches without changing query semantics"
+)]
+async fn load_generic_candidates(
+    connection: &turso::Connection,
+    namespaces: &BTreeSet<NamespaceQueryKey>,
+    query: &InventoryQueryV1,
+    cursor: Option<&DecodedCursorV1>,
+    snapshot_watermark: u64,
+    use_latest: bool,
+    capacity: usize,
+    trigram_index_ready: bool,
+) -> Result<Vec<Candidate>, CatalogError> {
+    let sql = CandidateSql::build_with_options(
+        namespaces,
+        query,
+        cursor,
+        snapshot_watermark,
+        use_latest,
+        capacity,
+        trigram_index_ready,
+        false,
+        None,
+    )?;
+    load_candidates(connection, sql).await
 }
 
 struct CandidateSql {
@@ -675,14 +762,14 @@ fn unfiltered_latest_repository_namespace(
 }
 
 fn latest_repository_term_search(query: &InventoryQueryV1) -> Option<&InventoryNamespaceV1> {
-    // Exact terms are selective enough to benefit from the term index and
-    // primary-key joins. Prefix terms can match large ranges and are kept on
-    // the generic planner path to avoid an unstable temp-sort plan.
     let namespace = query.namespace.as_ref()?;
     if query.history != InventoryHistoryModeV1::LatestAttempt
         || query.search.is_none()
         || query.search_field != InventorySearchFieldV1::Repository
-        || query.match_mode != InventoryMatchModeV1::Exact
+        || !matches!(
+            query.match_mode,
+            InventoryMatchModeV1::Exact | InventoryMatchModeV1::Prefix
+        )
         || !query.repository_ids.is_empty()
         || query.repository_owner.is_some()
         || !query.repository_visibilities.is_empty()
@@ -1560,12 +1647,72 @@ async fn load_candidates(
     Ok(candidates)
 }
 
-/// Score the latest fuzzy candidates in Rust after reading only the selected
-/// posting bucket.  Turso's JSON virtual-table implementation is much slower
-/// when it repeatedly expands large historical buckets or term JSON arrays;
-/// keeping this bounded work local avoids that planner/runtime cliff while
-/// leaving the generic historical planner unchanged.
-async fn load_latest_fuzzy_candidates(
+async fn load_latest_term_candidates(
+    connection: &turso::Connection,
+    namespace: &InventoryNamespaceV1,
+    query: &InventoryQueryV1,
+    cursor: Option<&DecodedCursorV1>,
+    capacity: usize,
+) -> Result<Vec<Candidate>, CatalogError> {
+    let namespace = NamespaceQueryKey::from(namespace);
+    let search = normalize_text(query.search.as_deref().ok_or(CatalogError::InvalidInput(
+        "repository term search requires a search value".to_owned(),
+    ))?);
+    let mut sql = SqlBuilder::new();
+    sql.push(
+        "SELECT terms.attempt_id, terms.term_byte_len\n\
+           FROM catalog_search_terms AS terms\n\
+                INDEXED BY catalog_search_terms_exact\n\
+          WHERE terms.namespace_kind = ",
+    );
+    sql.bind(namespace.kind.to_owned());
+    sql.push(" AND terms.credential_profile_id = ");
+    sql.bind(namespace.credential_profile_id.clone());
+    sql.push(" AND terms.field = 'repository' AND terms.term >= ");
+    sql.bind(search.clone());
+    match query.match_mode {
+        InventoryMatchModeV1::Exact => {
+            sql.push(" AND terms.term = ");
+            sql.bind(search);
+        }
+        InventoryMatchModeV1::Prefix => {
+            if let Some(upper_bound) = prefix_upper_bound(&search) {
+                sql.push(" AND terms.term < ");
+                sql.bind(upper_bound);
+            }
+            sql.push(" AND instr(terms.term, ");
+            sql.bind(search);
+            sql.push(") = 1");
+        }
+        InventoryMatchModeV1::Substring | InventoryMatchModeV1::Fuzzy => {
+            return Err(CatalogError::StoreUnavailable);
+        }
+    }
+    let mut rows = connection
+        .query(&sql.statement, sql.params)
+        .await
+        .map_err(unavailable)?;
+    let mut scores = BTreeMap::<String, i64>::new();
+    while let Some(row) = rows.next().await.map_err(unavailable)? {
+        let attempt_id: String = row.get(0).map_err(unavailable)?;
+        let term_bytes: i64 = row.get(1).map_err(unavailable)?;
+        let relevance = match query.match_mode {
+            InventoryMatchModeV1::Exact => 4_000_000,
+            InventoryMatchModeV1::Prefix => 3_000_000_i64.saturating_sub(term_bytes),
+            InventoryMatchModeV1::Substring | InventoryMatchModeV1::Fuzzy => 0,
+        };
+        scores
+            .entry(attempt_id)
+            .and_modify(|current| *current = (*current).max(relevance))
+            .or_insert(relevance);
+    }
+    if scores.is_empty() {
+        return Ok(Vec::new());
+    }
+    load_latest_scored_candidates(connection, namespace, query, cursor, capacity, scores).await
+}
+
+async fn load_latest_substring_candidates(
     connection: &turso::Connection,
     namespace: &InventoryNamespaceV1,
     query: &InventoryQueryV1,
@@ -1573,7 +1720,40 @@ async fn load_latest_fuzzy_candidates(
     capacity: usize,
     anchor: &str,
 ) -> Result<Vec<Candidate>, CatalogError> {
-    let namespace_key = NamespaceQueryKey::from(namespace);
+    let postings = load_anchor_postings(connection, namespace, query, anchor).await?;
+    let search = normalize_text(query.search.as_deref().ok_or(CatalogError::InvalidInput(
+        "substring search requires a search value".to_owned(),
+    ))?);
+    let field = match query.search_field {
+        InventorySearchFieldV1::Repository => posting_field_code(SEARCH_FIELD_REPOSITORY),
+        InventorySearchFieldV1::Package => posting_field_code(SEARCH_FIELD_PACKAGE),
+        InventorySearchFieldV1::Any => return Err(CatalogError::StoreUnavailable),
+    };
+    let mut scores = BTreeMap::<String, i64>::new();
+    for (attempt_id, field_code, term) in postings {
+        if field_code != field || !term.contains(&search) {
+            continue;
+        }
+        let relevance = 2_000_000_i64.saturating_sub(term.len() as i64);
+        scores
+            .entry(attempt_id)
+            .and_modify(|current| *current = (*current).max(relevance))
+            .or_insert(relevance);
+    }
+    if scores.is_empty() {
+        return Ok(Vec::new());
+    }
+    let namespace = NamespaceQueryKey::from(namespace);
+    load_latest_scored_candidates(connection, namespace, query, cursor, capacity, scores).await
+}
+
+async fn load_anchor_postings(
+    connection: &turso::Connection,
+    namespace: &InventoryNamespaceV1,
+    query: &InventoryQueryV1,
+    anchor: &str,
+) -> Result<BTreeSet<(String, u8, String)>, CatalogError> {
+    let namespace = NamespaceQueryKey::from(namespace);
     let mut bucket_rows = connection
         .query(
             "SELECT postings_json
@@ -1583,8 +1763,8 @@ async fn load_latest_fuzzy_candidates(
                 AND trigram = ?3
               ORDER BY shard",
             turso::params![
-                namespace_key.kind,
-                namespace_key.credential_profile_id.as_str(),
+                namespace.kind,
+                namespace.credential_profile_id.as_str(),
                 anchor
             ],
         )
@@ -1619,6 +1799,24 @@ async fn load_latest_fuzzy_candidates(
             }
         }
     }
+    Ok(postings)
+}
+
+/// Score the latest fuzzy candidates in Rust after reading only the selected
+/// posting bucket.  Turso's JSON virtual-table implementation is much slower
+/// when it repeatedly expands large historical buckets or term JSON arrays;
+/// keeping this bounded work local avoids that planner/runtime cliff while
+/// leaving the generic historical planner unchanged.
+async fn load_latest_fuzzy_candidates(
+    connection: &turso::Connection,
+    namespace: &InventoryNamespaceV1,
+    query: &InventoryQueryV1,
+    cursor: Option<&DecodedCursorV1>,
+    capacity: usize,
+    anchor: &str,
+) -> Result<Vec<Candidate>, CatalogError> {
+    let namespace_key = NamespaceQueryKey::from(namespace);
+    let postings = load_anchor_postings(connection, namespace, query, anchor).await?;
     if postings.is_empty() {
         return Ok(Vec::new());
     }
@@ -1657,6 +1855,17 @@ async fn load_latest_fuzzy_candidates(
         return Ok(Vec::new());
     }
 
+    load_latest_scored_candidates(connection, namespace_key, query, cursor, capacity, scores).await
+}
+
+async fn load_latest_scored_candidates(
+    connection: &turso::Connection,
+    namespace: NamespaceQueryKey,
+    query: &InventoryQueryV1,
+    cursor: Option<&DecodedCursorV1>,
+    capacity: usize,
+    scores: BTreeMap<String, i64>,
+) -> Result<Vec<Candidate>, CatalogError> {
     let mut rows = Vec::new();
     let scored = scores.into_iter().collect::<Vec<_>>();
     for chunk in scored.chunks(FUZZY_METADATA_CHUNK_SIZE) {
@@ -1690,9 +1899,9 @@ async fn load_latest_fuzzy_candidates(
                          INDEXED BY sqlite_autoindex_catalog_attempts_1
                    WHERE attempts.namespace_kind = ",
         );
-        attempts_sql.bind(namespace_key.kind.to_owned());
+        attempts_sql.bind(namespace.kind.to_owned());
         attempts_sql.push(" AND attempts.credential_profile_id = ");
-        attempts_sql.bind(namespace_key.credential_profile_id.clone());
+        attempts_sql.bind(namespace.credential_profile_id.clone());
         attempts_sql.push(" AND attempts.attempt_id = requested.attempt_id");
         let mut attempt_rows = connection
             .query(&attempts_sql.statement, attempts_sql.params)
@@ -1735,9 +1944,9 @@ async fn load_latest_fuzzy_candidates(
                       INDEXED BY sqlite_autoindex_catalog_latest_1
                 WHERE latest.namespace_kind = ",
         );
-        latest_sql.bind(namespace_key.kind.to_owned());
+        latest_sql.bind(namespace.kind.to_owned());
         latest_sql.push(" AND latest.credential_profile_id = ");
-        latest_sql.bind(namespace_key.credential_profile_id.clone());
+        latest_sql.bind(namespace.credential_profile_id.clone());
         latest_sql.push(" AND latest.repository_id = requested.repository_id");
         let mut latest_rows = connection
             .query(&latest_sql.statement, latest_sql.params)
@@ -1767,7 +1976,7 @@ async fn load_latest_fuzzy_candidates(
             let relevance = *relevance_by_attempt
                 .get(attempt_id.as_str())
                 .ok_or(CatalogError::StoreUnavailable)?;
-            rows.push(FuzzyCandidateRow {
+            rows.push(ScoredCandidateRow {
                 candidate: Candidate {
                     namespace_kind,
                     credential_profile_id,
@@ -1782,15 +1991,15 @@ async fn load_latest_fuzzy_candidates(
         }
     }
     if let Some(cursor) = cursor {
-        rows.retain(|row| fuzzy_after_cursor(row, &cursor.last, query.sort));
+        rows.retain(|row| scored_after_cursor(row, &cursor.last, query.sort));
     }
-    rows.sort_by(|left, right| compare_fuzzy_candidates(left, right, query.sort));
+    rows.sort_by(|left, right| compare_scored_candidates(left, right, query.sort));
     rows.truncate(capacity);
     Ok(rows.into_iter().map(|row| row.candidate).collect())
 }
 
-fn fuzzy_after_cursor(
-    row: &FuzzyCandidateRow,
+fn scored_after_cursor(
+    row: &ScoredCandidateRow,
     key: &InventorySortKeyV1,
     sort: InventorySortV1,
 ) -> bool {
@@ -1815,9 +2024,9 @@ fn fuzzy_after_cursor(
     }
 }
 
-fn compare_fuzzy_candidates(
-    left: &FuzzyCandidateRow,
-    right: &FuzzyCandidateRow,
+fn compare_scored_candidates(
+    left: &ScoredCandidateRow,
+    right: &ScoredCandidateRow,
     sort: InventorySortV1,
 ) -> Ordering {
     let ordering = match sort {
@@ -1857,9 +2066,7 @@ async fn hydrate_candidates(
     }
     let mut results = Vec::with_capacity(candidates.len());
     results.extend(hydrate_attempt_candidates(connection, &attempt_only).await?);
-    for candidates in observed.chunks(MAX_CANDIDATES_PER_HYDRATION) {
-        results.extend(hydrate_candidate_batch(connection, candidates).await?);
-    }
+    results.extend(hydrate_observed_candidates(connection, &observed).await?);
     Ok(results)
 }
 
@@ -1868,14 +2075,66 @@ async fn hydrate_attempt_candidates(
     candidates: &[Candidate],
 ) -> Result<Vec<InventorySearchResultV1>, CatalogError> {
     let mut results = Vec::with_capacity(candidates.len());
-    for candidates in candidates.chunks(MAX_ATTEMPT_CANDIDATES_PER_HYDRATION) {
-        results.extend(hydrate_attempt_candidate_batch(connection, candidates).await?);
+    for (namespace_kind, credential_profile_id, group) in candidate_namespace_groups(candidates) {
+        for candidates in group.chunks(MAX_ATTEMPT_CANDIDATES_PER_HYDRATION) {
+            results.extend(
+                hydrate_attempt_candidate_batch(
+                    connection,
+                    &namespace_kind,
+                    &credential_profile_id,
+                    candidates,
+                )
+                .await?,
+            );
+        }
     }
     Ok(results)
 }
 
+async fn hydrate_observed_candidates(
+    connection: &turso::Connection,
+    candidates: &[Candidate],
+) -> Result<Vec<InventorySearchResultV1>, CatalogError> {
+    let mut results = Vec::with_capacity(candidates.len());
+    for (namespace_kind, credential_profile_id, group) in candidate_namespace_groups(candidates) {
+        for candidates in group.chunks(MAX_CANDIDATES_PER_HYDRATION) {
+            results.extend(
+                hydrate_candidate_batch(
+                    connection,
+                    &namespace_kind,
+                    &credential_profile_id,
+                    candidates,
+                )
+                .await?,
+            );
+        }
+    }
+    Ok(results)
+}
+
+fn candidate_namespace_groups(candidates: &[Candidate]) -> Vec<(String, String, Vec<Candidate>)> {
+    let mut groups = BTreeMap::<(String, String), Vec<Candidate>>::new();
+    for candidate in candidates {
+        groups
+            .entry((
+                candidate.namespace_kind.clone(),
+                candidate.credential_profile_id.clone(),
+            ))
+            .or_default()
+            .push(candidate.clone());
+    }
+    groups
+        .into_iter()
+        .map(|((namespace_kind, credential_profile_id), candidates)| {
+            (namespace_kind, credential_profile_id, candidates)
+        })
+        .collect()
+}
+
 async fn hydrate_attempt_candidate_batch(
     connection: &turso::Connection,
+    namespace_kind: &str,
+    credential_profile_id: &str,
     candidates: &[Candidate],
 ) -> Result<Vec<InventorySearchResultV1>, CatalogError> {
     let mut sql = requested_candidates_sql(candidates)?;
@@ -1889,8 +2148,13 @@ async fn hydrate_attempt_candidate_batch(
            FROM requested\n\
           CROSS JOIN catalog_attempts AS attempts\n\
                      INDEXED BY sqlite_autoindex_catalog_attempts_1\n\
-             ON attempts.namespace_kind = requested.namespace_kind\n\
-            AND attempts.credential_profile_id = requested.credential_profile_id\n\
+             ON attempts.namespace_kind = ",
+    );
+    sql.bind(namespace_kind.to_owned());
+    sql.push(" AND attempts.credential_profile_id = ");
+    sql.bind(credential_profile_id.to_owned());
+    sql.push(
+        "\n\
             AND attempts.attempt_id = requested.attempt_id)\n\
          SELECT attempts.attempt_id, attempts.attempt_json, repositories.repository_json,\n\
                 snapshots.snapshot_json,\n\
@@ -1925,7 +2189,7 @@ async fn hydrate_attempt_candidate_batch(
 fn requested_candidates_sql(candidates: &[Candidate]) -> Result<SqlBuilder, CatalogError> {
     let mut sql = SqlBuilder::new();
     sql.push(
-        "WITH requested(request_ordinal, namespace_kind, credential_profile_id, attempt_id) AS (\n\
+        "WITH requested(request_ordinal, attempt_id) AS (\n\
          VALUES ",
     );
     for (ordinal, candidate) in candidates.iter().enumerate() {
@@ -1935,10 +2199,6 @@ fn requested_candidates_sql(candidates: &[Candidate]) -> Result<SqlBuilder, Cata
         sql.push("(");
         sql.bind(to_i64(ordinal as u64)?);
         sql.push(",");
-        sql.bind(candidate.namespace_kind.clone());
-        sql.push(",");
-        sql.bind(candidate.credential_profile_id.clone());
-        sql.push(",");
         sql.bind(candidate.attempt_id.clone());
         sql.push(")");
     }
@@ -1947,6 +2207,8 @@ fn requested_candidates_sql(candidates: &[Candidate]) -> Result<SqlBuilder, Cata
 
 async fn hydrate_candidate_batch(
     connection: &turso::Connection,
+    namespace_kind: &str,
+    credential_profile_id: &str,
     candidates: &[Candidate],
 ) -> Result<Vec<InventorySearchResultV1>, CatalogError> {
     let mut sql = requested_candidates_sql(candidates)?;
@@ -1957,8 +2219,13 @@ async fn hydrate_candidate_batch(
            FROM requested\n\
           CROSS JOIN catalog_attempts AS counted\n\
                      INDEXED BY sqlite_autoindex_catalog_attempts_1\n\
-             ON counted.namespace_kind = requested.namespace_kind\n\
-            AND counted.credential_profile_id = requested.credential_profile_id\n\
+             ON counted.namespace_kind = ",
+    );
+    sql.bind(namespace_kind.to_owned());
+    sql.push(" AND counted.credential_profile_id = ");
+    sql.bind(credential_profile_id.to_owned());
+    sql.push(
+        "\n\
             AND counted.attempt_id = requested.attempt_id\n\
            JOIN catalog_packages AS packages\n\
              ON packages.namespace_kind = counted.namespace_kind\n\
@@ -1978,11 +2245,16 @@ async fn hydrate_candidate_batch(
                  COALESCE(package_counts.package_count, 0),\n\
                  attempts.namespace_kind, attempts.credential_profile_id,\n\
                  requested.request_ordinal\n\
-           FROM requested\n\
+         FROM requested\n\
           CROSS JOIN catalog_attempts AS attempts\n\
                      INDEXED BY sqlite_autoindex_catalog_attempts_1\n\
-             ON attempts.namespace_kind = requested.namespace_kind\n\
-            AND attempts.credential_profile_id = requested.credential_profile_id\n\
+             ON attempts.namespace_kind = ",
+    );
+    sql.bind(namespace_kind.to_owned());
+    sql.push(" AND attempts.credential_profile_id = ");
+    sql.bind(credential_profile_id.to_owned());
+    sql.push(
+        "\n\
             AND attempts.attempt_id = requested.attempt_id\n\
            JOIN catalog_repositories AS repositories\n\
                 INDEXED BY sqlite_autoindex_catalog_repositories_1\n\
@@ -3073,11 +3345,11 @@ mod tests {
                     < MAX_DYNAMIC_BINDINGS
             );
             assert!(
-                (MAX_CANDIDATES_PER_HYDRATION + 1) * HYDRATION_BINDINGS_PER_CANDIDATE + 1
+                (MAX_CANDIDATES_PER_HYDRATION + 1) * HYDRATION_BINDINGS_PER_CANDIDATE + 5
                     > MAX_DYNAMIC_BINDINGS
             );
             assert!(
-                MAX_ATTEMPT_CANDIDATES_PER_HYDRATION * ATTEMPT_BINDINGS_PER_CANDIDATE
+                MAX_ATTEMPT_CANDIDATES_PER_HYDRATION * ATTEMPT_BINDINGS_PER_CANDIDATE + 2
                     == MAX_DYNAMIC_BINDINGS
             );
         }
@@ -3097,7 +3369,10 @@ mod tests {
             .map(|chunk| requested_candidates_sql(chunk).expect("valid request sql"))
             .collect::<Vec<_>>();
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].params.len(), MAX_DYNAMIC_BINDINGS);
+        assert_eq!(
+            chunks[0].params.len(),
+            MAX_DYNAMIC_BINDINGS - ATTEMPT_BINDINGS_PER_CANDIDATE
+        );
         assert_eq!(chunks[1].params.len(), ATTEMPT_BINDINGS_PER_CANDIDATE);
         assert!(
             !chunks[0]
