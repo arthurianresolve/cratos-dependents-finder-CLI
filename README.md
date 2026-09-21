@@ -19,7 +19,7 @@ feature set, target, deployed binary, or runtime path.
 
 ## Toolchain
 
-The project uses Rust **1.97.1** and Rust edition **2024**. The exact toolchain is
+The project uses Rust **1.98.1** and Rust edition **2024**. The exact toolchain is
 pinned in `rust-toolchain.toml`.
 
 ```powershell
