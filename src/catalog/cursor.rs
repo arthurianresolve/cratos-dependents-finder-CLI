@@ -176,7 +176,9 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, CatalogError> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = decode_nibble(pair[0]).ok_or(CatalogError::CursorInvalid)?;
             let low = decode_nibble(pair[1]).ok_or(CatalogError::CursorInvalid)?;

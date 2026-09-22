@@ -1,6 +1,7 @@
 //! Durable coordinator domain, state, back-pressure, and cache primitives.
 
 mod cache;
+mod compaction;
 mod control_state;
 mod credential;
 mod dispatch;

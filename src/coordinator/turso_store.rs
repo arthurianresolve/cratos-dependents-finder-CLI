@@ -5,6 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -16,6 +17,7 @@ use uuid::Uuid;
 use crate::control_auth::{ServiceTokenIdV1, ServiceTokenRecordV1};
 use crate::secure_cache::{EnvelopeKey, sha256_hex};
 
+use super::compaction::{AutomaticCompaction, snapshot_json};
 use super::{
     AgentAuthorizationV1, ArtifactRefV1, CacheCatalog, CacheContentKindV1, CacheKeyV1,
     CacheMetadataV1, CacheNamespaceV1, CacheProtectionV1, ControlCommandV1, ControlOutcomeV1,
@@ -1074,6 +1076,7 @@ async fn run_actor(
     mut journal: JournalState,
     _owner_lock: Arc<File>,
 ) {
+    let mut automatic_compaction = AutomaticCompaction::default();
     while let Some(request) = receiver.recv().await {
         match request {
             ActorRequest::Apply { command, response } => {
@@ -1086,6 +1089,7 @@ async fn run_actor(
                     &mut failed_attempt_projections,
                     &mut reuse_index,
                     &mut journal,
+                    &mut automatic_compaction,
                     &command,
                 )
                 .await
@@ -1251,8 +1255,15 @@ async fn run_actor(
                     &failed_attempt_projections,
                     &mut journal,
                 )
-                .await
-                .map_err(|error| format!("compacting coordinator journal: {error:#}"));
+                .await;
+                match &result {
+                    Ok(_) => automatic_compaction.succeeded(),
+                    Err(error) => {
+                        automatic_compaction.failed(error, Instant::now());
+                    }
+                }
+                let result =
+                    result.map_err(|error| format!("compacting coordinator journal: {error:#}"));
                 let _ = response.send(result);
             }
             ActorRequest::RegisterAgent { record, response } => {
@@ -1429,6 +1440,7 @@ async fn apply_and_persist(
     >,
     reuse_index: &mut ReuseIndex,
     journal: &mut JournalState,
+    automatic_compaction: &mut AutomaticCompaction,
     command: &DurableCommandV1,
 ) -> Result<DurableOutcomeV1> {
     validate_artifact_command(memory, artifacts, command)?;
@@ -1477,14 +1489,18 @@ async fn apply_and_persist(
             return Err(error).context("persisting coordinator command");
         }
     };
+    let previous_artifacts = artifacts.len();
     update_artifact_index(artifacts, reuse_index, command, &outcome);
     update_failed_attempt_projection_outbox(failed_attempt_projections, memory, command, &outcome);
+    if artifacts.len() < previous_artifacts || outcome_reduced_state(&outcome) {
+        automatic_compaction.note_reduction();
+    }
     journal.total_commands = journal.total_commands.saturating_add(1);
     journal.tail_commands = journal.tail_commands.saturating_add(1);
     journal.tail_bytes = journal.tail_bytes.saturating_add(appended.stored_bytes);
     journal.watermark_sequence = appended.sequence;
-    if journal.should_compact()
-        && let Err(error) = compact_state(
+    if journal.should_compact() && automatic_compaction.may_attempt(Instant::now()) {
+        let result = compact_state(
             connection,
             key,
             memory,
@@ -1493,13 +1509,31 @@ async fn apply_and_persist(
             failed_attempt_projections,
             journal,
         )
-        .await
-    {
-        // The command is already committed. Reporting failure would invite an
-        // ambiguous retry, so retain the tail and retry compaction later.
-        tracing::warn!(%error, "automatic coordinator journal compaction failed");
+        .await;
+        match result {
+            Ok(_) => automatic_compaction.succeeded(),
+            Err(error) => {
+                // The command is committed; a maintenance failure must not invite
+                // a duplicate command retry or expose its encrypted contents.
+                let reason = automatic_compaction.failed(&error, Instant::now());
+                tracing::warn!(reason, "automatic coordinator journal compaction deferred");
+            }
+        }
     }
     Ok(outcome)
+}
+
+fn outcome_reduced_state(outcome: &DurableOutcomeV1) -> bool {
+    match outcome {
+        DurableOutcomeV1::EventsPruned(count)
+        | DurableOutcomeV1::FailedAttemptProjectionsPruned(count) => *count > 0,
+        DurableOutcomeV1::RunsPruned(summary) => !summary.is_empty(),
+        DurableOutcomeV1::Control(ControlOutcomeV1 {
+            result: super::ControlResultV1::ControlHistoryPruned { summary },
+            ..
+        }) => summary != &super::ControlRetentionSummaryV1::default(),
+        _ => false,
+    }
 }
 
 fn apply_to_state(
@@ -1857,11 +1891,7 @@ async fn compact_state(
         failed_attempt_projections: failed_attempt_projections.values().cloned().collect(),
         control: Some(control.snapshot()),
     };
-    let plaintext = serde_json::to_vec(&snapshot).context("serializing coordinator snapshot")?;
-    ensure!(
-        plaintext.len() <= MAX_SNAPSHOT_BYTES,
-        "coordinator snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte limit"
-    );
+    let plaintext = snapshot_json(&snapshot, MAX_SNAPSHOT_BYTES)?;
     let digest = sha256_hex(&plaintext);
     let payload = key.seal(
         snapshot_aad(
@@ -3894,6 +3924,7 @@ mod tests {
             tail_commands: 0,
             tail_bytes: 0,
         };
+        let mut automatic_compaction = AutomaticCompaction::default();
         apply_and_persist(
             &connection,
             &key,
@@ -3903,6 +3934,7 @@ mod tests {
             &mut failed_attempt_projections,
             &mut reuse_index,
             &mut journal,
+            &mut automatic_compaction,
             &submit("rollback", Utc::now()),
         )
         .await
@@ -3938,6 +3970,66 @@ mod tests {
         );
         let replayed = replay(&connection, &key).await.unwrap();
         assert!(replayed.memory.job(&JobId("rollback".to_owned())).is_some());
+
+        journal.tail_bytes = COMPACTION_BYTE_THRESHOLD;
+        let acknowledged = apply_and_persist(
+            &connection,
+            &key,
+            &mut memory,
+            &mut control,
+            &mut artifacts,
+            &mut failed_attempt_projections,
+            &mut reuse_index,
+            &mut journal,
+            &mut automatic_compaction,
+            &submit("acknowledged", Utc::now()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(acknowledged, DurableOutcomeV1::Submitted(_)));
+        assert!(!automatic_compaction.may_attempt(Instant::now()));
+        assert_eq!(
+            scalar(&connection, "SELECT COUNT(*) FROM coordinator_snapshot").await,
+            0
+        );
+        assert_eq!(
+            scalar(&connection, "SELECT COUNT(*) FROM coordinator_journal").await,
+            2
+        );
+        let replayed = replay(&connection, &key).await.unwrap();
+        assert!(
+            replayed
+                .memory
+                .job(&JobId("acknowledged".to_owned()))
+                .is_some()
+        );
+
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_journal_append BEFORE INSERT ON coordinator_journal \
+             BEGIN SELECT RAISE(ABORT, 'injected append failure'); END;",
+            )
+            .await
+            .unwrap();
+        assert!(
+            apply_and_persist(
+                &connection,
+                &key,
+                &mut memory,
+                &mut control,
+                &mut artifacts,
+                &mut failed_attempt_projections,
+                &mut reuse_index,
+                &mut journal,
+                &mut automatic_compaction,
+                &submit("not-committed", Utc::now()),
+            )
+            .await
+            .is_err()
+        );
+        assert!(!automatic_compaction.may_attempt(Instant::now()));
+        assert!(memory.job(&JobId("not-committed".to_owned())).is_none());
+        assert!(memory.job(&JobId("acknowledged".to_owned())).is_some());
     }
 
     #[test]

@@ -37,7 +37,6 @@ const MAX_ATTEMPT_CANDIDATES_PER_HYDRATION: usize =
 const FUZZY_METADATA_CHUNK_SIZE: usize = MAX_DYNAMIC_BINDINGS - 2;
 pub(crate) const REBUILD_SEARCH_DOCUMENT_BATCH_SIZE: usize = 4_096;
 pub(crate) const REBUILD_SEARCH_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
-const SEARCH_POSTING_FIELDS: usize = 3;
 pub(crate) const TRIGRAM_BUCKET_SHARDS: u8 = 64;
 type SearchBucketKey = (String, String, String, u8);
 type SearchBucketPostings = BTreeMap<SearchBucketKey, BTreeSet<String>>;
@@ -106,35 +105,64 @@ struct ScoredCandidateRow {
     completed_at: DateTime<Utc>,
 }
 
+pub(super) struct SearchRequest<'a> {
+    access: &'a InventoryAccessV1,
+    query: &'a InventoryQueryV1,
+    limit: usize,
+    cursor: Option<DecodedCursorV1>,
+}
+
+impl<'a> SearchRequest<'a> {
+    pub(super) fn cursor_watermark(&self) -> Option<u64> {
+        self.cursor.as_ref().map(|cursor| cursor.index_watermark)
+    }
+
+    pub(super) fn validate(
+        signer: &CursorSigner,
+        access: &'a InventoryAccessV1,
+        query: &'a InventoryQueryV1,
+        page: &InventoryPageRequestV1,
+    ) -> Result<Self, CatalogError> {
+        access.validate()?;
+        query.validate()?;
+        let limit = page.limit()?;
+        if query
+            .namespace
+            .as_ref()
+            .is_some_and(|namespace| !access.allows(namespace))
+        {
+            return Err(CatalogError::Unauthorized);
+        }
+        let cursor = page
+            .cursor
+            .as_deref()
+            .map(|encoded| signer.decode(encoded, access, query))
+            .transpose()?;
+        Ok(Self {
+            access,
+            query,
+            limit,
+            cursor,
+        })
+    }
+}
+
 pub(super) async fn search_with_candidate_observer<Observer>(
     connection: &turso::Connection,
     signer: &CursorSigner,
-    access: &InventoryAccessV1,
-    query: &InventoryQueryV1,
-    page: &InventoryPageRequestV1,
+    request: SearchRequest<'_>,
     trigram_index_ready_at: Option<u64>,
     after_candidates: Observer,
 ) -> Result<InventoryPageV1, CatalogError>
 where
     Observer: FnOnce(&turso::Connection) -> Result<(), CatalogError>,
 {
-    access.validate()?;
-    query.validate()?;
-    let limit = page.limit()?;
-    if query
-        .namespace
-        .as_ref()
-        .is_some_and(|namespace| !access.allows(namespace))
-    {
-        return Err(CatalogError::Unauthorized);
-    }
-
-    // Decode the principal/scope-bound cursor before touching inventory rows.
-    let cursor = page
-        .cursor
-        .as_deref()
-        .map(|encoded| signer.decode(encoded, access, query))
-        .transpose()?;
+    let SearchRequest {
+        access,
+        query,
+        limit,
+        cursor,
+    } = request;
     let current_watermark = metadata_u64(connection, "watermark").await?;
     // The postings build is lazy and incremental projections invalidate it.
     // Bind readiness to the same snapshot watermark as the candidate query so
@@ -163,22 +191,28 @@ where
     } else {
         None
     };
-    let trigram_anchor = if substring_namespace.is_some() || fuzzy_namespace.is_some() {
-        let namespace = query
-            .namespace
-            .as_ref()
-            .expect("latest indexed search requires namespace");
+    let trigram_anchor = if let Some(namespace) = substring_namespace {
         let search = normalize_text(
             query
                 .search
                 .as_deref()
                 .expect("latest indexed search requires search"),
         );
-        select_fuzzy_anchor(connection, namespace, &search).await?
+        match select_substring_anchor(connection, namespace, &search).await {
+            Ok(anchor) => anchor,
+            Err(_) => {
+                tracing::warn!(
+                    path = "substring_postings",
+                    reason = "anchor_query_failed",
+                    "catalog search fallback"
+                );
+                None
+            }
+        }
     } else {
         None
     };
-    let mut candidates = if let Some(namespace) = use_latest
+    let candidates = if let Some(namespace) = use_latest
         .then(|| latest_repository_term_search(query))
         .flatten()
     {
@@ -193,6 +227,11 @@ where
         {
             Ok(candidates) => candidates,
             Err(_) => {
+                tracing::warn!(
+                    path = "repository_terms",
+                    reason = "index_query_failed",
+                    "catalog search fallback"
+                );
                 load_generic_candidates(
                     connection,
                     &namespaces,
@@ -201,7 +240,6 @@ where
                     snapshot_watermark,
                     use_latest,
                     limit.saturating_add(1),
-                    trigram_index_ready,
                 )
                 .await?
             }
@@ -219,7 +257,14 @@ where
         .await
         {
             Ok(candidates) if !candidates.is_empty() => candidates,
-            Ok(_) | Err(_) => {
+            fallback => {
+                if fallback.is_err() {
+                    tracing::warn!(
+                        path = "substring_postings",
+                        reason = "index_query_failed",
+                        "catalog search fallback"
+                    );
+                }
                 load_generic_candidates(
                     connection,
                     &namespaces,
@@ -228,24 +273,27 @@ where
                     snapshot_watermark,
                     use_latest,
                     limit.saturating_add(1),
-                    trigram_index_ready,
                 )
                 .await?
             }
         }
-    } else if let (Some(namespace), Some(anchor)) = (fuzzy_namespace, trigram_anchor.as_deref()) {
+    } else if let Some(namespace) = fuzzy_namespace {
         match load_latest_fuzzy_candidates(
             connection,
             namespace,
             query,
             cursor.as_ref(),
             limit.saturating_add(1),
-            anchor,
         )
         .await
         {
             Ok(candidates) => candidates,
             Err(_) => {
+                tracing::warn!(
+                    path = "fuzzy_postings",
+                    reason = "index_query_failed",
+                    "catalog search fallback"
+                );
                 load_generic_candidates(
                     connection,
                     &namespaces,
@@ -254,7 +302,6 @@ where
                     snapshot_watermark,
                     use_latest,
                     limit.saturating_add(1),
-                    trigram_index_ready,
                 )
                 .await?
             }
@@ -268,29 +315,9 @@ where
             snapshot_watermark,
             use_latest,
             limit.saturating_add(1),
-            trigram_index_ready,
         )
         .await?
     };
-    // The fast path deliberately chooses an anchor by encoded bucket size
-    // without parsing every posting bucket.  A field-specific query can
-    // therefore select a bucket containing only the other field.  An empty
-    // fast result is the one ambiguous case; retry through the field-aware
-    // generic planner so this optimization can never turn a match into an
-    // absence claim.
-    if candidates.is_empty() && fuzzy_namespace.is_some() && trigram_anchor.is_some() {
-        candidates = load_generic_candidates(
-            connection,
-            &namespaces,
-            query,
-            cursor.as_ref(),
-            snapshot_watermark,
-            use_latest,
-            limit.saturating_add(1),
-            trigram_index_ready,
-        )
-        .await?;
-    }
     after_candidates(connection)?;
     let mut results = hydrate_candidates(connection, &candidates).await?;
     results.sort_by(|left, right| compare_results(left, right, query.sort));
@@ -330,10 +357,6 @@ fn authorized_namespaces(
         .collect()
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the candidate fallback forwards the planner snapshot switches without changing query semantics"
-)]
 async fn load_generic_candidates(
     connection: &turso::Connection,
     namespaces: &BTreeSet<NamespaceQueryKey>,
@@ -342,18 +365,14 @@ async fn load_generic_candidates(
     snapshot_watermark: u64,
     use_latest: bool,
     capacity: usize,
-    trigram_index_ready: bool,
 ) -> Result<Vec<Candidate>, CatalogError> {
-    let sql = CandidateSql::build_with_options(
+    let sql = CandidateSql::build(
         namespaces,
         query,
         cursor,
         snapshot_watermark,
         use_latest,
         capacity,
-        trigram_index_ready,
-        false,
-        None,
     )?;
     load_candidates(connection, sql).await
 }
@@ -402,7 +421,6 @@ impl SqlBuilder {
 }
 
 impl CandidateSql {
-    #[cfg(test)]
     fn build(
         namespaces: &BTreeSet<NamespaceQueryKey>,
         query: &InventoryQueryV1,
@@ -411,64 +429,11 @@ impl CandidateSql {
         use_latest: bool,
         capacity: usize,
     ) -> Result<Self, CatalogError> {
-        Self::build_with_trigram_index(
-            namespaces, query, cursor, watermark, use_latest, capacity, true,
-        )
-    }
-
-    #[cfg(test)]
-    fn build_with_trigram_index(
-        namespaces: &BTreeSet<NamespaceQueryKey>,
-        query: &InventoryQueryV1,
-        cursor: Option<&DecodedCursorV1>,
-        watermark: u64,
-        use_latest: bool,
-        capacity: usize,
-        trigram_index_ready: bool,
-    ) -> Result<Self, CatalogError> {
-        Self::build_with_options(
-            namespaces,
-            query,
-            cursor,
-            watermark,
-            use_latest,
-            capacity,
-            trigram_index_ready,
-            true,
-            None,
-        )
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the compatibility builder keeps all candidate-planner switches explicit"
-    )]
-    fn build_with_options(
-        namespaces: &BTreeSet<NamespaceQueryKey>,
-        query: &InventoryQueryV1,
-        cursor: Option<&DecodedCursorV1>,
-        watermark: u64,
-        use_latest: bool,
-        capacity: usize,
-        trigram_index_ready: bool,
-        allow_latest_fuzzy_fast_path: bool,
-        fuzzy_anchor: Option<&str>,
-    ) -> Result<Self, CatalogError> {
         if use_latest && let Some(namespace) = latest_repository_term_search(query) {
             return Self::build_latest_repository_term_search(namespace, query, cursor, capacity);
         }
         if use_latest && let Some(namespace) = latest_substring_term_search(query) {
             return Self::build_latest_substring_term_search(namespace, query, cursor, capacity);
-        }
-        if use_latest
-            && allow_latest_fuzzy_fast_path
-            && trigram_index_ready
-            && let Some(namespace) = latest_fuzzy_term_search(query)
-            && let Some(anchor) = fuzzy_anchor
-        {
-            return Self::build_latest_fuzzy_term_search(
-                namespace, query, cursor, capacity, anchor,
-            );
         }
         if use_latest && let Some(namespace) = unfiltered_latest_repository_namespace(query) {
             return Self::build_latest_repository_page(namespace, cursor, capacity);
@@ -482,7 +447,7 @@ impl CandidateSql {
             push_historical_selection(&mut sql, query, watermark)?;
         }
         push_filtered_ctes(&mut sql, query)?;
-        push_ranked_ctes(&mut sql, query, trigram_index_ready)?;
+        push_ranked_ctes(&mut sql, query)?;
         sql.push(
             " SELECT namespace_kind, credential_profile_id, attempt_id, relevance, freshness,\n\
                      observation_id IS NOT NULL AS has_observation\n\
@@ -551,7 +516,7 @@ impl CandidateSql {
         ))?);
         let relevance = match query.match_mode {
             InventoryMatchModeV1::Exact => "4000000",
-            InventoryMatchModeV1::Prefix => "MAX(0, 3000000 - terms.term_byte_len)",
+            InventoryMatchModeV1::Prefix => "MAX(MAX(0, 3000000 - terms.term_byte_len))",
             InventoryMatchModeV1::Substring | InventoryMatchModeV1::Fuzzy => {
                 return Err(CatalogError::StoreUnavailable);
             }
@@ -606,8 +571,7 @@ impl CandidateSql {
         sql.push(
             " GROUP BY attempts.namespace_kind, attempts.credential_profile_id,\n\
                       attempts.attempt_id, attempts.status, attempts.observation_id,\n\
-                      attempts.normalized_repository_name, attempts.completed_at,\n\
-                      relevance\n\
+                      attempts.normalized_repository_name, attempts.completed_at\n\
              ) SELECT namespace_kind, credential_profile_id, attempt_id, relevance,\n\
                       freshness, has_observation\n\
                  FROM ranked WHERE 1 = 1",
@@ -691,64 +655,6 @@ impl CandidateSql {
         sql.bind(to_i64(capacity as u64)?);
         Ok(sql.finish())
     }
-
-    fn build_latest_fuzzy_term_search(
-        namespace: &InventoryNamespaceV1,
-        query: &InventoryQueryV1,
-        cursor: Option<&DecodedCursorV1>,
-        capacity: usize,
-        anchor: &str,
-    ) -> Result<Self, CatalogError> {
-        let namespace = NamespaceQueryKey::from(namespace);
-        let search = normalize_text(query.search.as_deref().ok_or(CatalogError::InvalidInput(
-            "fuzzy search requires a search value".to_owned(),
-        ))?);
-        if search.chars().count() < 3 {
-            return Err(CatalogError::InvalidInput(
-                "fuzzy search requires at least three characters".to_owned(),
-            ));
-        }
-        let mut sql = SqlBuilder::new();
-        sql.push("WITH authorized(namespace_kind, credential_profile_id) AS (VALUES (");
-        sql.bind(namespace.kind.to_owned());
-        sql.push(",");
-        sql.bind(namespace.credential_profile_id.clone());
-        sql.push("))");
-        push_fuzzy_score_ctes(&mut sql, query, &search, false, Some(anchor))?;
-        sql.push(
-            ", ranked AS (\n\
-             SELECT attempts.namespace_kind, attempts.credential_profile_id,
-                    attempts.attempt_id, search_scores.relevance,
-                    CASE\n\
-                      WHEN attempts.status = 'complete' THEN 'current'\n\
-                      WHEN attempts.status = 'partial' THEN 'refresh_partial'\n\
-                      ELSE 'refresh_failed'\n\
-                    END AS freshness,
-                    attempts.observation_id IS NOT NULL AS has_observation,
-                    attempts.normalized_repository_name, attempts.completed_at
-               FROM search_scores
-               CROSS JOIN catalog_attempts AS attempts
-                    INDEXED BY sqlite_autoindex_catalog_attempts_1
-               CROSS JOIN catalog_latest AS latest
-              WHERE attempts.namespace_kind = search_scores.namespace_kind
-                AND attempts.credential_profile_id = search_scores.credential_profile_id
-                AND attempts.attempt_id = search_scores.attempt_id
-                AND latest.namespace_kind = attempts.namespace_kind
-                AND latest.credential_profile_id = attempts.credential_profile_id
-                AND latest.repository_id = attempts.repository_id
-                AND latest.latest_attempt_id = attempts.attempt_id)
-             SELECT namespace_kind, credential_profile_id, attempt_id, relevance,
-                    freshness, has_observation
-               FROM ranked WHERE 1 = 1",
-        );
-        if let Some(cursor) = cursor {
-            push_keyset(&mut sql, &cursor.last, query.sort);
-        }
-        push_order(&mut sql, query.sort);
-        sql.push(" LIMIT ");
-        sql.bind(to_i64(capacity as u64)?);
-        Ok(sql.finish())
-    }
 }
 
 fn unfiltered_latest_repository_namespace(
@@ -764,7 +670,10 @@ fn unfiltered_latest_repository_namespace(
 fn latest_repository_term_search(query: &InventoryQueryV1) -> Option<&InventoryNamespaceV1> {
     let namespace = query.namespace.as_ref()?;
     if query.history != InventoryHistoryModeV1::LatestAttempt
-        || query.search.is_none()
+        || query
+            .search
+            .as_deref()
+            .is_none_or(|search| normalize_text(search).is_empty())
         || query.search_field != InventorySearchFieldV1::Repository
         || !matches!(
             query.match_mode,
@@ -791,7 +700,10 @@ fn latest_repository_term_search(query: &InventoryQueryV1) -> Option<&InventoryN
 fn latest_substring_term_search(query: &InventoryQueryV1) -> Option<&InventoryNamespaceV1> {
     let namespace = query.namespace.as_ref()?;
     if query.history != InventoryHistoryModeV1::LatestAttempt
-        || query.search.is_none()
+        || query
+            .search
+            .as_deref()
+            .is_none_or(|search| normalize_text(search).chars().count() < 3)
         || !matches!(
             query.search_field,
             InventorySearchFieldV1::Repository | InventorySearchFieldV1::Package
@@ -821,7 +733,7 @@ fn latest_fuzzy_term_search(query: &InventoryQueryV1) -> Option<&InventoryNamesp
         || query
             .search
             .as_deref()
-            .is_none_or(|search| search.chars().count() < 3)
+            .is_none_or(|search| normalize_text(search).chars().count() < 3)
         || query.match_mode != InventoryMatchModeV1::Fuzzy
         || !matches!(
             query.sort,
@@ -841,7 +753,7 @@ fn latest_fuzzy_term_search(query: &InventoryQueryV1) -> Option<&InventoryNamesp
     Some(namespace)
 }
 
-async fn select_fuzzy_anchor(
+async fn select_substring_anchor(
     connection: &turso::Connection,
     namespace: &InventoryNamespaceV1,
     search: &str,
@@ -867,7 +779,7 @@ async fn select_fuzzy_anchor(
         sql.bind(trigram.clone());
     }
     sql.push(
-        ") ORDER BY length(postings_json), trigram\n\
+        ") GROUP BY trigram ORDER BY SUM(length(postings_json)), trigram\n\
            LIMIT 1",
     );
     let sql = sql.finish();
@@ -1220,35 +1132,25 @@ fn push_package_filter(sql: &mut SqlBuilder, query: &InventoryQueryV1) -> Result
     Ok(())
 }
 
-fn push_ranked_ctes(
-    sql: &mut SqlBuilder,
-    query: &InventoryQueryV1,
-    trigram_index_ready: bool,
-) -> Result<(), CatalogError> {
+fn push_ranked_ctes(sql: &mut SqlBuilder, query: &InventoryQueryV1) -> Result<(), CatalogError> {
     let Some(search) = query.search.as_deref() else {
         sql.push(", ranked AS (SELECT filtered.*, 0 AS relevance FROM filtered)");
         return Ok(());
     };
     let search = normalize_text(search);
+    if search.is_empty() {
+        sql.push(", ranked AS (SELECT filtered.*, 0 AS relevance FROM filtered WHERE 0 = 1)");
+        return Ok(());
+    }
     let field_predicate = match query.search_field {
         InventorySearchFieldV1::Any => "1 = 1",
         InventorySearchFieldV1::Repository => "terms.field = 'repository'",
         InventorySearchFieldV1::Package => "terms.field = 'package'",
     };
     if query.match_mode == InventoryMatchModeV1::Fuzzy && search.chars().count() >= 3 {
-        if !trigram_index_ready {
-            return push_fuzzy_term_fallback(sql, query, &search);
-        }
-        push_fuzzy_score_ctes(sql, query, &search, true, None)?;
-        sql.push(
-            ", ranked AS (SELECT filtered.*, search_scores.relevance\n\
-                FROM search_scores JOIN filtered USING\n\
-                     (namespace_kind, credential_profile_id, attempt_id)\n\
-                WHERE search_scores.relevance >= ",
-        );
-        sql.bind(MIN_FUZZY_SCORE);
-        sql.push(")");
-        return Ok(());
+        // The general planner also handles historical and cross-namespace queries.
+        // Score canonical terms instead of trusting bucket contents or one anchor.
+        return push_fuzzy_term_fallback(sql, query, &search);
     }
 
     if query.match_mode == InventoryMatchModeV1::Substring && search.chars().count() >= 3 {
@@ -1322,146 +1224,6 @@ fn push_ranked_ctes(
         " GROUP BY terms.namespace_kind, terms.credential_profile_id, terms.attempt_id),\n\
          ranked AS (SELECT filtered.*, search_scores.relevance FROM search_scores\n\
           JOIN filtered USING (namespace_kind, credential_profile_id, attempt_id))",
-    );
-    Ok(())
-}
-
-/// Add the indexed fuzzy-score CTEs shared by the generic and latest-row
-/// candidate builders.  The first trigram is chosen from the smallest
-/// field-compatible posting bucket, so the expensive term join starts from a
-/// bounded candidate set instead of expanding every query trigram.
-fn push_fuzzy_score_ctes(
-    sql: &mut SqlBuilder,
-    query: &InventoryQueryV1,
-    search: &str,
-    field_aware_anchor: bool,
-    anchor: Option<&str>,
-) -> Result<(), CatalogError> {
-    let trigrams = trigrams(search);
-    if trigrams.is_empty() {
-        return Err(CatalogError::StoreUnavailable);
-    }
-    let posting_field_predicate = match query.search_field {
-        InventorySearchFieldV1::Any => "1 = 1",
-        InventorySearchFieldV1::Repository => "json_extract(postings.value, '$[1]') = 0",
-        InventorySearchFieldV1::Package => "json_extract(postings.value, '$[1]') = 1",
-    };
-    let term_field_predicate = match query.search_field {
-        InventorySearchFieldV1::Any => {
-            "((postings.field_code = 0 AND terms.field = 'repository')\n\
-               OR (postings.field_code = 1 AND terms.field = 'package'))"
-        }
-        InventorySearchFieldV1::Repository => {
-            "postings.field_code = 0 AND terms.field = 'repository'"
-        }
-        InventorySearchFieldV1::Package => "postings.field_code = 1 AND terms.field = 'package'",
-    };
-
-    sql.push(", query_trigrams(trigram) AS (VALUES ");
-    for (index, trigram) in trigrams.iter().enumerate() {
-        if index > 0 {
-            sql.push(",");
-        }
-        sql.push("(");
-        sql.bind(trigram.clone());
-        sql.push(")");
-    }
-    if let Some(anchor) = anchor {
-        sql.push("), anchor_trigram(trigram) AS (VALUES (");
-        sql.bind(anchor.to_owned());
-        sql.push("))");
-    } else {
-        sql.push(
-            r#"), anchor_trigram AS (
-         SELECT query_trigrams.trigram
-           FROM query_trigrams
-           CROSS JOIN authorized
-           LEFT JOIN catalog_search_trigram_buckets AS matching_buckets
-            ON matching_buckets.namespace_kind = authorized.namespace_kind
-            AND matching_buckets.credential_profile_id = authorized.credential_profile_id
-            AND matching_buckets.trigram = query_trigrams.trigram
-"#,
-        );
-        if field_aware_anchor {
-            let anchor_field_predicate = match query.search_field {
-                InventorySearchFieldV1::Any => "1 = 1",
-                InventorySearchFieldV1::Repository => {
-                    "json_extract(matching_postings.value, '$[1]') = 0"
-                }
-                InventorySearchFieldV1::Package => {
-                    "json_extract(matching_postings.value, '$[1]') = 1"
-                }
-            };
-            sql.push(
-                r#" WHERE EXISTS (SELECT 1
-                          FROM json_each(matching_buckets.postings_json) AS matching_postings
-                         WHERE "#,
-            );
-            sql.push(anchor_field_predicate);
-            sql.push(")");
-        }
-        sql.push(
-            r#"
-          GROUP BY query_trigrams.trigram
-          ORDER BY COALESCE(SUM(length(matching_buckets.postings_json)), 0),
-                   query_trigrams.trigram
-          LIMIT 1"#,
-        );
-    }
-    if anchor.is_some() {
-        sql.push(", anchor_postings AS (");
-    } else {
-        sql.push("), anchor_postings AS (");
-    }
-    sql.push(
-        r#"
-         SELECT buckets.namespace_kind, buckets.credential_profile_id,
-                json_extract(postings.value, '$[0]') AS attempt_id,
-                json_extract(postings.value, '$[1]') AS field_code,
-                json_extract(postings.value, '$[2]') AS term
-           FROM anchor_trigram
-           CROSS JOIN authorized
-           JOIN catalog_search_trigram_buckets AS buckets
-             ON buckets.namespace_kind = authorized.namespace_kind
-            AND buckets.credential_profile_id = authorized.credential_profile_id
-            AND buckets.trigram = anchor_trigram.trigram
-           CROSS JOIN json_each(buckets.postings_json) AS postings
-          WHERE "#,
-    );
-    sql.push(posting_field_predicate);
-    sql.push(
-        r#"), term_intersections AS (
-         SELECT postings.namespace_kind, postings.credential_profile_id,
-                postings.attempt_id, postings.field_code, postings.term,
-                terms.trigram_count, COUNT(wanted.trigram) AS intersection_count
-           FROM query_trigrams AS wanted
-           CROSS JOIN anchor_postings AS postings
-            CROSS JOIN catalog_search_terms AS terms
-                 INDEXED BY sqlite_autoindex_catalog_search_terms_1
-           WHERE terms.namespace_kind = postings.namespace_kind
-             AND terms.credential_profile_id = postings.credential_profile_id
-             AND terms.attempt_id = postings.attempt_id
-             AND terms.term = postings.term
-             AND "#,
-    );
-    sql.push(term_field_predicate);
-    sql.push(
-        r#" AND instr(terms.trigrams_json, json_quote(wanted.trigram)) > 0
-          GROUP BY postings.namespace_kind, postings.credential_profile_id,
-                   postings.attempt_id, postings.field_code, postings.term,
-                   terms.trigram_count
-        ), search_scores AS (
-         SELECT intersections.namespace_kind, intersections.credential_profile_id,
-                intersections.attempt_id,
-                MAX(intersections.intersection_count * 1000000 /
-                    (intersections.trigram_count + "#,
-    );
-    sql.bind(to_i64(trigrams.len() as u64)?);
-    sql.push(
-        r#" - intersections.intersection_count)) AS relevance
-           FROM term_intersections AS intersections
-          GROUP BY intersections.namespace_kind, intersections.credential_profile_id,
-                   intersections.attempt_id)"#,
     );
     Ok(())
 }
@@ -1720,7 +1482,13 @@ async fn load_latest_substring_candidates(
     capacity: usize,
     anchor: &str,
 ) -> Result<Vec<Candidate>, CatalogError> {
-    let postings = load_anchor_postings(connection, namespace, query, anchor).await?;
+    let postings = load_postings(
+        connection,
+        namespace,
+        query,
+        &BTreeSet::from([anchor.to_owned()]),
+    )
+    .await?;
     let search = normalize_text(query.search.as_deref().ok_or(CatalogError::InvalidInput(
         "substring search requires a search value".to_owned(),
     ))?);
@@ -1747,80 +1515,69 @@ async fn load_latest_substring_candidates(
     load_latest_scored_candidates(connection, namespace, query, cursor, capacity, scores).await
 }
 
-async fn load_anchor_postings(
+type SearchPosting = (String, u8, String);
+
+fn decode_postings(encoded: &str) -> Result<Vec<SearchPosting>, CatalogError> {
+    let postings: Vec<SearchPosting> = serde_json::from_str(encoded).map_err(unavailable)?;
+    if postings.iter().any(|(attempt_id, field, term)| {
+        attempt_id.is_empty() || !matches!(field, 0 | 1) || term.is_empty()
+    }) {
+        return Err(CatalogError::StoreUnavailable);
+    }
+    Ok(postings)
+}
+
+async fn load_postings(
     connection: &turso::Connection,
     namespace: &InventoryNamespaceV1,
     query: &InventoryQueryV1,
-    anchor: &str,
-) -> Result<BTreeSet<(String, u8, String)>, CatalogError> {
+    wanted: &BTreeSet<String>,
+) -> Result<BTreeSet<SearchPosting>, CatalogError> {
+    if wanted.is_empty() {
+        return Ok(BTreeSet::new());
+    }
     let namespace = NamespaceQueryKey::from(namespace);
+    let mut sql = SqlBuilder::new();
+    sql.push("SELECT postings_json FROM catalog_search_trigram_buckets WHERE namespace_kind = ");
+    sql.bind(namespace.kind.to_owned());
+    sql.push(" AND credential_profile_id = ");
+    sql.bind(namespace.credential_profile_id);
+    sql.push(" AND trigram IN (");
+    for (index, trigram) in wanted.iter().enumerate() {
+        if index != 0 {
+            sql.push(",");
+        }
+        sql.bind(trigram.clone());
+    }
+    sql.push(") ORDER BY trigram, shard");
     let mut bucket_rows = connection
-        .query(
-            "SELECT postings_json
-               FROM catalog_search_trigram_buckets
-              WHERE namespace_kind = ?1
-                AND credential_profile_id = ?2
-                AND trigram = ?3
-              ORDER BY shard",
-            turso::params![
-                namespace.kind,
-                namespace.credential_profile_id.as_str(),
-                anchor
-            ],
-        )
+        .query(&sql.statement, sql.params)
         .await
         .map_err(unavailable)?;
-    let mut postings = BTreeSet::<(String, u8, String)>::new();
+    let mut postings = BTreeSet::new();
     while let Some(row) = bucket_rows.next().await.map_err(unavailable)? {
         let encoded: String = row.get(0).map_err(unavailable)?;
-        let values: Vec<Vec<serde_json::Value>> =
-            serde_json::from_str(&encoded).map_err(unavailable)?;
-        for posting in values {
-            let Some(attempt_id) = posting.first().and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let Some(field_code) = posting
-                .get(1)
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| u8::try_from(value).ok())
-            else {
-                continue;
-            };
-            let Some(term) = posting.get(2).and_then(serde_json::Value::as_str) else {
-                continue;
-            };
+        for (attempt_id, field_code, term) in decode_postings(&encoded)? {
             if matches!(
                 (query.search_field, field_code),
                 (InventorySearchFieldV1::Any, 0 | 1)
                     | (InventorySearchFieldV1::Repository, 0)
                     | (InventorySearchFieldV1::Package, 1)
             ) {
-                postings.insert((attempt_id.to_owned(), field_code, term.to_owned()));
+                postings.insert((attempt_id, field_code, term));
             }
         }
     }
     Ok(postings)
 }
 
-/// Score the latest fuzzy candidates in Rust after reading only the selected
-/// posting bucket.  Turso's JSON virtual-table implementation is much slower
-/// when it repeatedly expands large historical buckets or term JSON arrays;
-/// keeping this bounded work local avoids that planner/runtime cliff while
-/// leaving the generic historical planner unchanged.
 async fn load_latest_fuzzy_candidates(
     connection: &turso::Connection,
     namespace: &InventoryNamespaceV1,
     query: &InventoryQueryV1,
     cursor: Option<&DecodedCursorV1>,
     capacity: usize,
-    anchor: &str,
 ) -> Result<Vec<Candidate>, CatalogError> {
-    let namespace_key = NamespaceQueryKey::from(namespace);
-    let postings = load_anchor_postings(connection, namespace, query, anchor).await?;
-    if postings.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let search = normalize_text(
         query
             .search
@@ -1828,34 +1585,34 @@ async fn load_latest_fuzzy_candidates(
             .ok_or(CatalogError::StoreUnavailable)?,
     );
     let query_trigrams = trigrams(&search);
+    // A fuzzy match may omit any one query trigram. Union all postings before
+    // scoring, including terms outside the smallest bucket.
+    let postings = load_postings(connection, namespace, query, &query_trigrams).await?;
     let mut scores = BTreeMap::<String, i64>::new();
-    // The posting bucket already stores the normalized term.  Recomputing its
-    // small trigram set locally is both cheaper and more predictable than
-    // probing `catalog_search_terms` for every posting: on Turso, a VALUES
-    // join can still be reordered into a scan of the entire term table.  The
-    // same `trigrams` helper is used when the index is built, so the score is
-    // byte-for-byte equivalent to the indexed `trigram_count` calculation.
     for (attempt_id, _field_code, term) in postings {
         let stored_trigrams = trigrams(&term);
-        let intersection_count = stored_trigrams.intersection(&query_trigrams).count() as i64;
-        let denominator = (stored_trigrams.len() as i64)
-            .saturating_add(query_trigrams.len() as i64)
-            .saturating_sub(intersection_count);
-        if denominator <= 0 {
+        let intersection = stored_trigrams.intersection(&query_trigrams).count() as i64;
+        let union = (stored_trigrams.len() + query_trigrams.len()) as i64 - intersection;
+        let Some(score) = intersection.saturating_mul(1_000_000).checked_div(union) else {
+            continue;
+        };
+        if score < MIN_FUZZY_SCORE {
             continue;
         }
-        let score = intersection_count.saturating_mul(1_000_000) / denominator;
         scores
             .entry(attempt_id)
             .and_modify(|current| *current = (*current).max(score))
             .or_insert(score);
     }
-    scores.retain(|_, score| *score >= MIN_FUZZY_SCORE);
-    if scores.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    load_latest_scored_candidates(connection, namespace_key, query, cursor, capacity, scores).await
+    load_latest_scored_candidates(
+        connection,
+        NamespaceQueryKey::from(namespace),
+        query,
+        cursor,
+        capacity,
+        scores,
+    )
+    .await
 }
 
 async fn load_latest_scored_candidates(
@@ -2921,13 +2678,24 @@ async fn persist_search_buckets(
             .map_err(unavailable)?;
         if let Some(row) = rows.next().await.map_err(unavailable)? {
             let encoded: String = row.get(0).map_err(unavailable)?;
-            let existing: Vec<Vec<serde_json::Value>> =
-                serde_json::from_str(&encoded).map_err(unavailable)?;
+            let existing = match decode_postings(&encoded) {
+                Ok(postings) => postings,
+                Err(_) => {
+                    tracing::warn!(
+                        reason = "malformed_postings",
+                        "catalog index invalidated during projection"
+                    );
+                    connection.execute(
+                        "UPDATE catalog_metadata SET value = '0' WHERE key = 'trigram_index_ready'",
+                        (),
+                    ).await.map_err(unavailable)?;
+                    // Canonical terms survive; the stale marker makes rebuilding
+                    // repair every bucket before indexed reads resume.
+                    return Ok(());
+                }
+            };
             for posting in existing {
-                let posting_attempt = posting.first().and_then(serde_json::Value::as_str);
-                if posting.len() == SEARCH_POSTING_FIELDS
-                    && posting_attempt.is_none_or(|value| value != attempt_id)
-                {
+                if posting.0 != attempt_id {
                     postings.insert(serde_json::to_string(&posting).map_err(unavailable)?);
                 }
             }
@@ -3166,6 +2934,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_postings_fail_instead_of_losing_matches() {
+        assert_eq!(
+            decode_postings(r#"[["attempt",0,"owner/repo"]]"#).unwrap(),
+            vec![("attempt".to_owned(), 0, "owner/repo".to_owned())]
+        );
+        for encoded in [
+            r#"[["attempt",0]]"#,
+            r#"[[null,0,"repo"]]"#,
+            r#"[["attempt",2,"repo"]]"#,
+            r#"[["attempt",0,"repo","extra"]]"#,
+            r#"[["attempt","0","repo"]]"#,
+            r#"[["",0,"repo"]]"#,
+            r#"[["attempt",0,""]]"#,
+            "not json",
+        ] {
+            assert!(decode_postings(encoded).is_err(), "accepted {encoded}");
+        }
+    }
+
+    #[test]
     fn current_repository_pages_use_the_ordered_latest_index() {
         let mut query = InventoryQueryV1::new();
         query.namespace = Some(InventoryNamespaceV1::Public);
@@ -3226,48 +3014,11 @@ mod tests {
         query.match_mode = InventoryMatchModeV1::Fuzzy;
         query.search = Some("owner/repositorx".to_owned());
         let sql = CandidateSql::build(&namespaces, &query, None, 42, true, 100).unwrap();
-        let trigrams = sql.statement.find("FROM query_trigrams").unwrap();
-        let authorized = sql.statement.find("CROSS JOIN authorized").unwrap();
-        let terms = sql
-            .statement
-            .find("CROSS JOIN json_each(buckets.postings_json) AS postings")
-            .unwrap();
-        assert!(
-            trigrams < authorized && authorized < terms,
-            "query trigrams and authorized namespaces must precede term expansion"
-        );
-        assert!(sql.statement.contains("json_each(buckets.postings_json)"));
-        assert!(
-            !sql.statement
-                .contains("catalog_search_trigrams AS postings")
-        );
-        assert!(
-            sql.statement
-                .contains("catalog_search_trigram_buckets AS buckets")
-        );
-        assert!(sql.statement.contains("anchor_trigram AS"));
-        assert!(
-            sql.statement
-                .contains("length(matching_buckets.postings_json)")
-        );
-        assert!(
-            sql.statement
-                .contains("COUNT(wanted.trigram) AS intersection_count")
-        );
-        assert!(sql.statement.contains("matching_buckets"));
-        let anchor_postings = sql.statement.find("anchor_postings AS postings").unwrap();
-        let intersections = sql
-            .statement
-            .find("FROM term_intersections AS intersections")
-            .unwrap();
-        let term_lookup = sql
-            .statement
-            .find("JOIN catalog_search_terms AS terms")
-            .unwrap();
-        assert!(
-            anchor_postings < term_lookup && term_lookup < intersections,
-            "fuzzy search must look up each anchored term before scoring intersections"
-        );
+        assert!(sql.statement.contains("FROM authorized"));
+        assert!(sql.statement.contains("CROSS JOIN query_trigrams"));
+        assert!(sql.statement.contains("json_each(terms.trigrams_json)"));
+        assert!(!sql.statement.contains("anchor_trigram"));
+        assert!(!sql.statement.contains("catalog_search_trigram_buckets"));
 
         query.match_mode = InventoryMatchModeV1::Substring;
         query.search = Some("owner/repository".to_owned());
@@ -3290,7 +3041,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_search_falls_back_when_postings_are_not_ready() {
+    fn generic_fuzzy_search_scores_canonical_terms_without_postings() {
         let mut query = InventoryQueryV1::new();
         query.namespace = Some(InventoryNamespaceV1::Public);
         query.search = Some("owner/repositorx".to_owned());
@@ -3304,9 +3055,7 @@ mod tests {
             &query,
         );
 
-        let sql =
-            CandidateSql::build_with_trigram_index(&namespaces, &query, None, 42, true, 100, false)
-                .unwrap();
+        let sql = CandidateSql::build(&namespaces, &query, None, 42, true, 100).unwrap();
 
         assert!(sql.statement.contains("JOIN catalog_search_terms AS terms"));
         assert!(sql.statement.contains("json_each(terms.trigrams_json)"));

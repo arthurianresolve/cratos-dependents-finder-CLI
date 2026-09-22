@@ -249,16 +249,26 @@ impl TursoInventoryStore {
     async fn ensure_trigram_index(
         &self,
         query: &InventoryQueryV1,
+        cursor_watermark: Option<u64>,
     ) -> Result<Option<u64>, CatalogError> {
-        if query.match_mode != InventoryMatchModeV1::Fuzzy
-            || query
-                .search
-                .as_deref()
-                .is_none_or(|search| search.chars().count() < 3)
+        if !matches!(
+            query.match_mode,
+            InventoryMatchModeV1::Fuzzy | InventoryMatchModeV1::Substring
+        ) || query
+            .search
+            .as_deref()
+            .is_none_or(|search| super::search::normalize_text(search).chars().count() < 3)
         {
             return Ok(None);
         }
         let database = self.database.lock().await;
+        if let Some(watermark) = cursor_watermark {
+            let current = metadata_u64(&database.connection, "watermark").await?;
+            let floor = metadata_u64(&database.connection, "cursor_floor").await?;
+            if watermark > current || watermark < floor {
+                return Err(CatalogError::CursorStale);
+            }
+        }
         if metadata_u64(&database.connection, "trigram_index_ready").await? != 0 {
             return metadata_u64(&database.connection, "watermark")
                 .await
@@ -270,6 +280,10 @@ impl TursoInventoryStore {
             .await
             .is_err()
         {
+            tracing::warn!(
+                reason = "index_writer_unavailable",
+                "catalog search fallback"
+            );
             return Ok(None);
         }
         let built = match sql_search::finalize_rebuild_search_buckets(&database.connection).await {
@@ -280,7 +294,10 @@ impl TursoInventoryStore {
             Ok(()) => metadata_u64(&database.connection, "watermark")
                 .await
                 .map(Some),
-            Err(_) => Ok(None),
+            Err(_) => {
+                tracing::warn!(reason = "index_build_failed", "catalog search fallback");
+                Ok(None)
+            }
         }
     }
 
@@ -339,7 +356,11 @@ impl TursoInventoryStore {
     where
         Observer: FnOnce(&turso::Connection) -> Result<(), CatalogError> + Send,
     {
-        let trigram_index_ready = self.ensure_trigram_index(query).await?;
+        let request =
+            sql_search::SearchRequest::validate(&self.cursor_signer, access, query, page)?;
+        let trigram_index_ready = self
+            .ensure_trigram_index(query, request.cursor_watermark())
+            .await?;
         // Authorization and cursor binding are enforced by sql_search before
         // inventory rows are ranked. The read transaction keeps the metadata
         // watermark, candidate page, and bounded hydration on one snapshot.
@@ -348,9 +369,7 @@ impl TursoInventoryStore {
         let searched = sql_search::search_with_candidate_observer(
             &transaction,
             &self.cursor_signer,
-            access,
-            query,
-            page,
+            request,
             trigram_index_ready,
             after_candidates,
         )
@@ -3617,6 +3636,305 @@ mod tests {
                 .items
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn fuzzy_search_keeps_matches_without_the_smallest_trigram() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TursoInventoryStore::open(directory.path().join("coordinator.db"), [45; 32])
+            .await
+            .unwrap();
+        let reference = InMemoryInventoryStore::new([45; 32]);
+        for (id, name) in [("1", "owner/abcdef"), ("2", "owner/xbcdef")] {
+            let input = failed_at(InventoryNamespaceV1::Public, id, name, id, time(10));
+            reference.project(input.clone()).await.unwrap();
+            store.project(input).await.unwrap();
+        }
+        let access = access_for_namespace(&InventoryNamespaceV1::Public);
+        for namespace in [Some(InventoryNamespaceV1::Public), None] {
+            let mut query = InventoryQueryV1::new();
+            query.namespace = namespace;
+            query.search = Some("abcdef".to_owned());
+            query.search_field = InventorySearchFieldV1::Repository;
+            let expected = reference
+                .search(&access, &query, &InventoryPageRequestV1::default())
+                .await
+                .unwrap();
+            assert_eq!(expected.items.len(), 2);
+            let actual = store
+                .search(&access, &query, &InventoryPageRequestV1::default())
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+
+            let mut cursor = None;
+            let mut items = Vec::new();
+            loop {
+                let page = store
+                    .search(
+                        &access,
+                        &query,
+                        &InventoryPageRequestV1 {
+                            limit: Some(1),
+                            cursor,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                items.extend(page.items);
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+                assert!(items.len() < expected.items.len());
+            }
+            assert_eq!(items, expected.items);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_search_does_not_prepare_the_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TursoInventoryStore::open(directory.path().join("coordinator.db"), [46; 32])
+            .await
+            .unwrap();
+        store
+            .rebuild(vec![failed(InventoryNamespaceV1::Public)])
+            .await
+            .unwrap();
+        let access = access_for_namespace(&InventoryNamespaceV1::Public);
+        let mut query = InventoryQueryV1::new();
+        query.namespace = Some(InventoryNamespaceV1::Private {
+            credential_profile_id: "not-authorized".to_owned(),
+        });
+        query.search = Some("repository".to_owned());
+        assert!(matches!(
+            store
+                .search(&access, &query, &InventoryPageRequestV1::default())
+                .await,
+            Err(CatalogError::Unauthorized)
+        ));
+        query.namespace = Some(InventoryNamespaceV1::Public);
+        for page in [
+            InventoryPageRequestV1 {
+                limit: Some(0),
+                cursor: None,
+            },
+            InventoryPageRequestV1 {
+                limit: None,
+                cursor: Some("invalid".to_owned()),
+            },
+        ] {
+            assert!(store.search(&access, &query, &page).await.is_err());
+        }
+        query.schema_version += 1;
+        assert!(
+            store
+                .search(&access, &query, &InventoryPageRequestV1::default())
+                .await
+                .is_err()
+        );
+        let database = store.database.lock().await;
+        assert_eq!(
+            metadata_u64(&database.connection, "trigram_index_ready")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            scalar_i64(
+                &database.connection,
+                "SELECT COUNT(*) FROM catalog_search_trigram_buckets"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn normalized_short_queries_match_the_reference_without_index_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TursoInventoryStore::open(directory.path().join("coordinator.db"), [48; 32])
+            .await
+            .unwrap();
+        let reference = InMemoryInventoryStore::new([48; 32]);
+        let input = failed_at(
+            InventoryNamespaceV1::Public,
+            "1",
+            "owner/abcdef",
+            "1",
+            time(10),
+        );
+        reference.project(input.clone()).await.unwrap();
+        store.rebuild(vec![input]).await.unwrap();
+        let access = access_for_namespace(&InventoryNamespaceV1::Public);
+        for namespace in [Some(InventoryNamespaceV1::Public), None] {
+            for mode in [
+                InventoryMatchModeV1::Exact,
+                InventoryMatchModeV1::Prefix,
+                InventoryMatchModeV1::Substring,
+                InventoryMatchModeV1::Fuzzy,
+            ] {
+                for search in ["ab", " ab ", "AB", "!!!"] {
+                    let mut query = InventoryQueryV1::new();
+                    query.namespace = namespace.clone();
+                    query.match_mode = mode;
+                    query.search = Some(search.to_owned());
+                    query.search_field = InventorySearchFieldV1::Repository;
+                    let expected = reference
+                        .search(&access, &query, &InventoryPageRequestV1::default())
+                        .await
+                        .unwrap();
+                    let actual = store
+                        .search(&access, &query, &InventoryPageRequestV1::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(actual.items, expected.items, "{mode:?}: {search:?}");
+                }
+            }
+        }
+        let database = store.database.lock().await;
+        assert_eq!(
+            metadata_u64(&database.connection, "trigram_index_ready")
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_signed_cursor_does_not_prepare_the_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TursoInventoryStore::open(directory.path().join("coordinator.db"), [49; 32])
+            .await
+            .unwrap();
+        let inputs = vec![
+            failed(InventoryNamespaceV1::Public),
+            failed_at(
+                InventoryNamespaceV1::Public,
+                "43",
+                "other/repository",
+                "2",
+                time(11),
+            ),
+        ];
+        store.rebuild(inputs.clone()).await.unwrap();
+        let access = access_for_namespace(&InventoryNamespaceV1::Public);
+        let mut query = InventoryQueryV1::new();
+        query.namespace = Some(InventoryNamespaceV1::Public);
+        query.search = Some("repository".to_owned());
+        let first = store
+            .search(
+                &access,
+                &query,
+                &InventoryPageRequestV1 {
+                    limit: Some(1),
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+        let cursor = first.next_cursor.expect("both repositories must match");
+        store.rebuild(inputs).await.unwrap();
+        assert!(matches!(
+            store
+                .search(
+                    &access,
+                    &query,
+                    &InventoryPageRequestV1 {
+                        limit: Some(1),
+                        cursor: Some(cursor)
+                    }
+                )
+                .await,
+            Err(CatalogError::CursorStale)
+        ));
+        let database = store.database.lock().await;
+        assert_eq!(
+            metadata_u64(&database.connection, "trigram_index_ready")
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn substring_prepares_index_and_corrupt_postings_fall_back_completely() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TursoInventoryStore::open(directory.path().join("coordinator.db"), [47; 32])
+            .await
+            .unwrap();
+        store
+            .rebuild(vec![failed(InventoryNamespaceV1::Public)])
+            .await
+            .unwrap();
+        let access = access_for_namespace(&InventoryNamespaceV1::Public);
+        let mut query = InventoryQueryV1::new();
+        query.namespace = Some(InventoryNamespaceV1::Public);
+        query.search = Some("repository".to_owned());
+        query.search_field = InventorySearchFieldV1::Repository;
+        query.match_mode = InventoryMatchModeV1::Substring;
+        let page = store
+            .search(&access, &query, &InventoryPageRequestV1::default())
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        {
+            let database = store.database.lock().await;
+            assert_eq!(
+                metadata_u64(&database.connection, "trigram_index_ready")
+                    .await
+                    .unwrap(),
+                1
+            );
+            database
+                .connection
+                .execute(
+                    "UPDATE catalog_search_trigram_buckets SET postings_json = ?1",
+                    turso::params![r#"[["broken",2,"repository"]]"#],
+                )
+                .await
+                .unwrap();
+        }
+        for mode in [InventoryMatchModeV1::Substring, InventoryMatchModeV1::Fuzzy] {
+            query.match_mode = mode;
+            let page = store
+                .search(&access, &query, &InventoryPageRequestV1::default())
+                .await
+                .unwrap();
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items[0].repository.full_name, "owner/repository");
+        }
+        {
+            let database = store.database.lock().await;
+            for shard in 0..sql_search::TRIGRAM_BUCKET_SHARDS {
+                database
+                    .connection
+                    .execute(
+                        "INSERT OR REPLACE INTO catalog_search_trigram_buckets
+                     (namespace_kind, credential_profile_id, trigram, shard, postings_json)
+                     VALUES ('public', '', 'own', ?1, ?2)",
+                        turso::params![i64::from(shard), r#"[["broken",2,"owner"]]"#],
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        store
+            .project(failed_at(
+                InventoryNamespaceV1::Public,
+                "43",
+                "owner/repository-two",
+                "task-2",
+                time(11),
+            ))
+            .await
+            .unwrap();
+        let page = store
+            .search(&access, &query, &InventoryPageRequestV1::default())
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2);
     }
 
     #[tokio::test]

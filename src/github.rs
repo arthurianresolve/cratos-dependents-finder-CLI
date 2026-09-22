@@ -1343,9 +1343,9 @@ fn decode_base64(value: &str) -> Result<Vec<u8>> {
         "base64 length is not a multiple of four"
     );
     let mut decoded = Vec::with_capacity(compact.len() / 4 * 3);
-    let chunks = compact.chunks_exact(4);
+    let chunks = compact.as_chunks::<4>().0;
     let chunk_count = chunks.len();
-    for (index, chunk) in chunks.enumerate() {
+    for (index, chunk) in chunks.iter().enumerate() {
         let last = index + 1 == chunk_count;
         let a = base64_value(chunk[0])?;
         let b = base64_value(chunk[1])?;
