@@ -43,6 +43,7 @@ pub struct SchedulerRunReportV1 {
     pub jobs_submitted: usize,
     pub occurrences_finished: usize,
     pub occurrences_deferred: usize,
+    pub repositories_suppressed: usize,
 }
 
 impl<StateT: ControlApiState> DurableSchedulerRunner<StateT> {
@@ -213,6 +214,17 @@ impl<StateT: ControlApiState> DurableSchedulerRunner<StateT> {
             return;
         }
 
+        let privacy_guard = if let Some(privacy) = self.state.privacy() {
+            let guard = privacy.gate.read().await;
+            if !guard.ready {
+                report.occurrences_deferred += 1;
+                return;
+            }
+            Some(guard)
+        } else {
+            None
+        };
+
         let occurrence_ref = ScheduledOccurrenceRefV1 {
             schedule_id: occurrence.schedule_id.clone(),
             occurrence_id: occurrence.id.clone(),
@@ -252,7 +264,7 @@ impl<StateT: ControlApiState> DurableSchedulerRunner<StateT> {
                 return;
             }
         };
-        let content = match fresh_content {
+        let mut content = match fresh_content {
             Some(content) => content,
             None => match self
                 .state
@@ -269,6 +281,44 @@ impl<StateT: ControlApiState> DurableSchedulerRunner<StateT> {
         if content.repository_set != selection.repository_set || content.repository_ids.is_empty() {
             report.occurrences_deferred += 1;
             return;
+        }
+        if let Some(policy) = &privacy_guard {
+            let namespace = match revision.scan_spec.repository_scope {
+                crate::coordinator::RepositoryScopeV1::PublicOnly => InventoryNamespaceV1::Public,
+                crate::coordinator::RepositoryScopeV1::AllVisible => {
+                    let Some(profile) = &revision.scan_spec.credential_profile_id else {
+                        report.occurrences_deferred += 1;
+                        return;
+                    };
+                    InventoryNamespaceV1::Private {
+                        credential_profile_id: profile.clone(),
+                    }
+                }
+            };
+            let before = content.repository_ids.len();
+            content
+                .repository_ids
+                .retain(|repository| !policy.ledger.suppresses(&namespace, "", repository));
+            report.repositories_suppressed += before - content.repository_ids.len();
+            if content.repository_ids.is_empty() {
+                if self
+                    .apply(
+                        runner_command_id("suppressed", [&occurrence.id.0]),
+                        ControlActionV1::FinishOccurrence {
+                            occurrence: occurrence_ref,
+                            terminal_state: OccurrenceStateV1::Failed,
+                        },
+                        now,
+                    )
+                    .await
+                    .is_ok()
+                {
+                    report.occurrences_finished += 1;
+                } else {
+                    report.occurrences_deferred += 1;
+                }
+                return;
+            }
         }
         let job_id = scheduled_job_id(&occurrence.id.0);
         let outcome = self
@@ -641,9 +691,172 @@ fn run_age_exceeded(
 
 #[cfg(test)]
 mod tests {
-    use crate::catalog::InventoryHistoryModeV1;
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use crate::{
+        catalog::{
+            InMemoryInventoryStore, InventoryHistoryModeV1, InventoryProjectionInputV1,
+            InventoryProjectionStore, RepositoryAttemptInputV1,
+        },
+        control_api::CoordinatorControlApiState,
+        coordinator::{
+            CreateScheduleV1, JobPriorityV1, RepositoryScopeV1, ScanBoundsV1, ScanSpecV1,
+            ScanTargetV1, ScheduleDefinitionV1, ScheduleId, TaskId, TursoCoordinatorStore,
+            UtcCronV1,
+        },
+        evidence::RepositoryVisibilityV1,
+        privacy::{PrivacyService, RemovalScopeV1, SuppressionTargetV1},
+        secure_cache::EnvelopeKey,
+    };
 
     use super::*;
+
+    #[tokio::test]
+    async fn scheduler_excludes_suppressed_repositories_from_retained_explicit_sets() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TursoCoordinatorStore::open(
+            directory.path().join("coordinator.db"),
+            EnvelopeKey::generate("test-key"),
+        )
+        .await
+        .unwrap();
+        let inventory = Arc::new(InMemoryInventoryStore::new([61; 32]));
+        let now = Utc::now();
+        inventory
+            .project(InventoryProjectionInputV1::FailedAttempt(
+                RepositoryAttemptInputV1 {
+                    schema_version: 1,
+                    namespace: InventoryNamespaceV1::Public,
+                    job_id: JobId("prior-job".into()),
+                    task_id: TaskId("prior-task".into()),
+                    task_attempt: 1,
+                    repository_id: "42".into(),
+                    repository_full_name: "owner/suppressed".into(),
+                    visibility: RepositoryVisibilityV1::Public,
+                    revision: None,
+                    completed_at: now,
+                    failure_code: "provider_unavailable".into(),
+                    failure_message: "provider unavailable".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let privacy = PrivacyService::open(store.clone(), inventory.clone())
+            .await
+            .unwrap();
+        let state = CoordinatorControlApiState::new(store.clone(), inventory, None, false)
+            .unwrap()
+            .with_privacy(privacy.clone());
+        for (name, repositories) in [
+            (
+                "mixed",
+                vec!["owner/suppressed".into(), "owner/retained".into()],
+            ),
+            ("suppressed-only", vec!["owner/suppressed".into()]),
+        ] {
+            let content = RepositorySetContentV1::from_repositories(repositories).unwrap();
+            state
+                .apply_control(ControlCommandV1 {
+                    schema_version: 1,
+                    command_id: format!("create-{name}"),
+                    expected_generation: None,
+                    issued_at: now,
+                    action: ControlActionV1::CreateSchedule {
+                        request: CreateScheduleV1 {
+                            schema_version: 1,
+                            schedule_id: ScheduleId(name.into()),
+                            enabled: true,
+                            definition: ScheduleDefinitionV1 {
+                                schema_version: 1,
+                                cron: UtcCronV1::parse("0 * * * *").unwrap(),
+                                scan_spec: ScanSpecV1 {
+                                    schema_version: 1,
+                                    target: ScanTargetV1 {
+                                        crate_name: "fs2".into(),
+                                        version_spec: "=0.4.3".into(),
+                                    },
+                                    repository_scope: RepositoryScopeV1::PublicOnly,
+                                    credential_profile_id: None,
+                                    bounds: ScanBoundsV1::default(),
+                                    analyzer_versions: BTreeMap::new(),
+                                },
+                                repository_source: RepositorySourceRefV1::Explicit {
+                                    repository_set: content.repository_set.clone(),
+                                },
+                                priority: JobPriorityV1::Normal,
+                                max_run_age_seconds: 3_600,
+                            },
+                            created_at: now,
+                        },
+                        repository_set_content: Some(content),
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        let plan = privacy
+            .plan(SuppressionTargetV1 {
+                repository_id: "42".into(),
+                scope: RemovalScopeV1::Public,
+                aliases: BTreeSet::new(),
+            })
+            .await
+            .unwrap();
+        assert!(plan.target.aliases.contains("owner/suppressed"));
+        privacy
+            .submit(uuid::Uuid::new_v4().to_string(), plan)
+            .await
+            .unwrap();
+        let report = DurableSchedulerRunner::new(state.clone())
+            .run_once(now + TimeDelta::hours(1))
+            .await
+            .unwrap();
+        assert_eq!(report.repositories_suppressed, 2);
+        assert_eq!(report.jobs_submitted, 1);
+        assert_eq!(report.occurrences_finished, 1);
+        assert_eq!(report.occurrences_deferred, 0);
+        let jobs = store.jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        let tasks = store
+            .tasks_for_job(jobs[0].id.clone(), None, 256)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].repository_id, "owner/retained");
+        let materializations = state.occurrence_materializations().await.unwrap();
+        let snapshot = state.scheduler_snapshot().await.unwrap();
+        assert_eq!(materializations.len(), 2);
+        assert!(
+            snapshot
+                .schedules
+                .iter()
+                .find(|schedule| schedule.schedule.id.0 == "suppressed-only")
+                .unwrap()
+                .occurrences
+                .iter()
+                .any(|occurrence| occurrence.state == OccurrenceStateV1::Failed)
+        );
+        let mixed = snapshot
+            .schedules
+            .iter()
+            .find(|schedule| schedule.schedule.id.0 == "mixed")
+            .unwrap();
+        let RepositorySourceRefV1::Explicit { repository_set } =
+            &mixed.revisions[0].repository_source
+        else {
+            panic!("explicit source expected");
+        };
+        assert_eq!(
+            state
+                .repository_set(&repository_set.digest)
+                .await
+                .unwrap()
+                .unwrap()
+                .repository_ids
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn saved_query_materialization_preserves_history_semantics() {

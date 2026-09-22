@@ -12,6 +12,8 @@ const PUBLIC_GITHUB_PRINCIPAL: &str = "public";
 const COMPLETED_PERMIT_RETRY_HORIZON_SECONDS: u64 = 15 * 60;
 const MAX_COMPLETED_PERMITS: usize = 262_144;
 const COMPLETED_PERMIT_COMPACTION_TARGET: usize = 196_608;
+const GITHUB_MAX_SECONDARY_PROBES: u8 = 3;
+const GITHUB_SECONDARY_BACKOFF_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ProviderKeyV1 {
@@ -97,10 +99,9 @@ impl ProviderKeyV1 {
     /// Stable key shared by job submission and workers for GitHub repository
     /// analysis.
     ///
-    /// Public unauthenticated work shares a conservative principal.
-    /// Credentialed work is isolated by the operator-supplied profile
-    /// identifier, while the resource dimension prevents public and
-    /// all-visible work from sharing rate or circuit state.
+    /// Profile and scope remain distinct permit/authorization identities.
+    /// GitHub rate-limit cooldowns are shared separately across those keys;
+    /// naming another profile never establishes an independent API budget.
     pub fn github_repository_analysis(
         scope: RepositoryScopeV1,
         credential_profile_id: Option<&str>,
@@ -219,6 +220,11 @@ pub struct RateLimitObservationV1 {
     pub remaining: Option<u64>,
     pub reset_at: Option<DateTime<Utc>>,
     pub retry_after_seconds: Option<u64>,
+    #[serde(default)]
+    pub secondary_limit: bool,
+    /// Zero preserves pre-shared-control command replay; live ingress stamps 1.
+    #[serde(default)]
+    pub shared_control_version: u8,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -227,6 +233,126 @@ pub enum PermitDecision {
     WaitUntil(DateTime<Utc>),
     CapacityExhausted,
     HalfOpenProbeInFlight,
+    Suspended,
+}
+
+/// Deployment-wide rate control. It deliberately shares budgets between
+/// profiles: profile names do not establish independent GitHub principals.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GithubProviderStatusV1 {
+    pub primary_blocked_until: BTreeMap<String, DateTime<Utc>>,
+    pub secondary_blocked_until: Option<DateTime<Utc>>,
+    pub recovery_required: bool,
+    pub probes_used: u8,
+    pub probe_in_flight: bool,
+    pub suspended: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct GithubRateControl {
+    status: GithubProviderStatusV1,
+    probe_permit_id: Option<PermitId>,
+}
+
+impl GithubRateControl {
+    fn decision(&self, resource: &str, now: DateTime<Utc>) -> Option<PermitDecision> {
+        if self.status.suspended {
+            return Some(PermitDecision::Suspended);
+        }
+        let until = [
+            self.status.secondary_blocked_until,
+            self.status.primary_blocked_until.get(resource).copied(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|until| *until > now)
+        .max();
+        if let Some(until) = until {
+            return Some(PermitDecision::WaitUntil(until));
+        }
+        self.probe_permit_id
+            .as_ref()
+            .map(|_| PermitDecision::HalfOpenProbeInFlight)
+    }
+
+    fn acquire_probe(&mut self, permit_id: &PermitId) {
+        if self.status.recovery_required {
+            self.status.probes_used += 1;
+            self.status.probe_in_flight = true;
+            self.probe_permit_id = Some(permit_id.clone());
+        }
+    }
+
+    fn finish(
+        &mut self,
+        permit: &ProviderPermitV1,
+        outcome: ProviderOutcomeClassV1,
+        observation: &RateLimitObservationV1,
+        now: DateTime<Utc>,
+    ) {
+        if observation.remaining == Some(0) {
+            let reset_at = observation
+                .reset_at
+                .filter(|until| *until > now)
+                .unwrap_or_else(|| checked_add_seconds(now, GITHUB_SECONDARY_BACKOFF_SECONDS));
+            let reset_at = observation.retry_after_seconds.map_or(reset_at, |seconds| {
+                reset_at.max(checked_add_seconds(now, seconds))
+            });
+            let resource = github_resource(&permit.key).to_owned();
+            self.status
+                .primary_blocked_until
+                .entry(resource)
+                .and_modify(|until| *until = (*until).max(reset_at))
+                .or_insert(reset_at);
+        }
+        let is_probe = self.probe_permit_id.as_ref() == Some(&permit.id);
+        // Missing primary-exhaustion evidence is treated conservatively as a
+        // secondary limit, including feedback from older workers.
+        let secondary_limit = outcome == ProviderOutcomeClassV1::RateLimited
+            && (observation.secondary_limit || observation.remaining != Some(0));
+        if secondary_limit || (is_probe && outcome.qualifies_for_circuit()) {
+            self.status.recovery_required = true;
+            let backoff =
+                GITHUB_SECONDARY_BACKOFF_SECONDS.saturating_mul(1_u64 << self.status.probes_used);
+            let delay = observation.retry_after_seconds.unwrap_or(0).max(backoff);
+            let deadline = checked_add_seconds(now, delay);
+            self.status.secondary_blocked_until =
+                Some(max_instant(self.status.secondary_blocked_until, deadline));
+            if is_probe && self.status.probes_used >= GITHUB_MAX_SECONDARY_PROBES {
+                self.status.suspended = true;
+                tracing::warn!(
+                    probes_used = self.status.probes_used,
+                    "GitHub admission suspended after bounded recovery probes"
+                );
+            }
+        } else if is_probe {
+            // Only the single admitted recovery probe may reopen traffic.
+            // Concurrent responses admitted before the limit cannot do so.
+            self.status.recovery_required = false;
+            self.status.probes_used = 0;
+        }
+        if is_probe {
+            self.probe_permit_id = None;
+            self.status.probe_in_flight = false;
+        }
+    }
+
+    fn resume(&mut self) {
+        if self.status.suspended {
+            self.status.suspended = false;
+            self.status.recovery_required = true;
+            self.status.probes_used = 0;
+            tracing::info!("GitHub admission explicitly resumed for one recovery probe");
+        }
+    }
+}
+
+fn github_resource(key: &ProviderKeyV1) -> &str {
+    if key.resource.starts_with("request:") {
+        key.resource.rsplit(':').next().unwrap_or("other")
+    } else {
+        "core"
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -240,6 +366,7 @@ pub struct ProviderGate {
     providers: BTreeMap<ProviderKeyV1, ProviderEntry>,
     active_permits: BTreeMap<PermitId, ProviderPermitV1>,
     completed_permits: BTreeMap<PermitId, Option<DateTime<Utc>>>,
+    github: GithubRateControl,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -257,11 +384,14 @@ pub(crate) struct ProviderGateSnapshotV1 {
     providers: Vec<(ProviderKeyV1, ProviderEntry)>,
     active_permits: Vec<ProviderPermitV1>,
     completed_permits: Vec<CompletedPermitSnapshotV1>,
+    #[serde(default)]
+    github: GithubRateControl,
 }
 
 impl ProviderGate {
     pub(crate) fn snapshot(&self) -> ProviderGateSnapshotV1 {
         ProviderGateSnapshotV1 {
+            github: self.github.clone(),
             providers: self
                 .providers
                 .iter()
@@ -283,7 +413,10 @@ impl ProviderGate {
     }
 
     pub(crate) fn from_snapshot(snapshot: ProviderGateSnapshotV1) -> Result<Self, ProviderError> {
-        let mut gate = Self::default();
+        let mut gate = Self {
+            github: snapshot.github,
+            ..Self::default()
+        };
         for (key, entry) in snapshot.providers {
             validate_policy(entry.policy)?;
             if gate.providers.insert(key, entry).is_some() {
@@ -317,6 +450,17 @@ impl ProviderGate {
             }
         }
         gate.prune_completed_permits_from_latest_observation();
+        if gate.github.status.probe_in_flight != gate.github.probe_permit_id.is_some()
+            || gate.github.status.probes_used > GITHUB_MAX_SECONDARY_PROBES
+            || gate.github.probe_permit_id.as_ref().is_some_and(|id| {
+                !gate
+                    .active_permits
+                    .get(id)
+                    .is_some_and(|permit| permit.key.provider == "github")
+            })
+        {
+            return Err(ProviderError::InvalidSnapshot);
+        }
         Ok(gate)
     }
 
@@ -350,6 +494,29 @@ impl ProviderGate {
         self.providers.get(key).map(|entry| &entry.rate)
     }
 
+    pub fn github_status(&self) -> GithubProviderStatusV1 {
+        self.github.status.clone()
+    }
+
+    pub fn resume_github(&mut self) {
+        self.github.resume();
+    }
+
+    pub fn github_repository_work_available(&self, now: DateTime<Utc>) -> bool {
+        match self.github.decision("core", now) {
+            None => true,
+            // Permit acquisition journals expiration feedback. Lease selection
+            // stays read-only so an empty lease result cannot lose a transition.
+            Some(PermitDecision::HalfOpenProbeInFlight) => self
+                .github
+                .probe_permit_id
+                .as_ref()
+                .and_then(|id| self.active_permits.get(id))
+                .is_some_and(|permit| permit.expires_at <= now),
+            Some(_) => false,
+        }
+    }
+
     pub fn acquire(
         &mut self,
         key: &ProviderKeyV1,
@@ -366,6 +533,11 @@ impl ProviderGate {
         }
         if self.completed_permits.contains_key(&permit_id) {
             return Err(ProviderError::PermitAlreadyFinished);
+        }
+        if key.provider == "github"
+            && let Some(decision) = self.github.decision(github_resource(key), now)
+        {
+            return Ok(decision);
         }
 
         let active_for_key = self
@@ -428,6 +600,9 @@ impl ProviderGate {
                 entry.policy.minimum_interval_millis,
             ));
         }
+        if key.provider == "github" && key.resource.starts_with("request:") {
+            self.github.acquire_probe(&permit_id);
+        }
         self.active_permits.insert(permit_id, permit.clone());
         Ok(PermitDecision::Granted(permit))
     }
@@ -455,6 +630,9 @@ impl ProviderGate {
             .active_permits
             .remove(permit_id)
             .expect("permit ownership was just validated");
+        if permit.key.provider == "github" && observation.shared_control_version == 1 {
+            self.github.finish(&permit, outcome, observation, now);
+        }
         let entry = self
             .providers
             .get_mut(&permit.key)
@@ -475,16 +653,25 @@ impl ProviderGate {
             .map(|permit| permit.id.clone())
             .collect::<Vec<_>>();
         for permit_id in &expired {
-            if let Some(permit) = self.active_permits.remove(permit_id)
-                && permit.half_open_probe
-                && let Some(entry) = self.providers.get_mut(&permit.key)
-            {
-                update_circuit(
-                    &mut entry.rate,
-                    entry.policy.circuit,
-                    ProviderOutcomeClassV1::Timeout,
-                    now,
-                );
+            if let Some(permit) = self.active_permits.remove(permit_id) {
+                if permit.key.provider == "github" {
+                    self.github.finish(
+                        &permit,
+                        ProviderOutcomeClassV1::Timeout,
+                        &RateLimitObservationV1::default(),
+                        now,
+                    );
+                }
+                if permit.half_open_probe
+                    && let Some(entry) = self.providers.get_mut(&permit.key)
+                {
+                    update_circuit(
+                        &mut entry.rate,
+                        entry.policy.circuit,
+                        ProviderOutcomeClassV1::Timeout,
+                        now,
+                    );
+                }
             }
             self.completed_permits.insert(permit_id.clone(), Some(now));
         }
@@ -662,7 +849,8 @@ fn close_circuit(rate: &mut ProviderRateStateV1) {
 
 fn checked_add_seconds(now: DateTime<Utc>, seconds: u64) -> DateTime<Utc> {
     let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
-    now.checked_add_signed(TimeDelta::seconds(seconds))
+    TimeDelta::try_seconds(seconds)
+        .and_then(|delta| now.checked_add_signed(delta))
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
@@ -962,5 +1150,233 @@ mod tests {
         assert_eq!(private.principal_id, "installation-42");
         assert_eq!(private.resource, "repository_analysis:all_visible");
         assert_ne!(public, private);
+    }
+
+    fn github_gate() -> (ProviderGate, ProviderKeyV1, ProviderKeyV1) {
+        let public = ProviderKeyV1::github_request(RepositoryScopeV1::PublicOnly, None, "core");
+        let private = ProviderKeyV1::github_request(
+            RepositoryScopeV1::AllVisible,
+            Some("installation"),
+            "core",
+        );
+        let mut gate = ProviderGate::default();
+        for key in [&public, &private] {
+            gate.configure(key.clone(), ProviderPolicyV1::github_requests())
+                .unwrap();
+        }
+        (gate, public, private)
+    }
+
+    fn secondary_observation() -> RateLimitObservationV1 {
+        RateLimitObservationV1 {
+            secondary_limit: true,
+            shared_control_version: 1,
+            ..RateLimitObservationV1::default()
+        }
+    }
+
+    #[test]
+    fn github_primary_budget_is_shared_across_profiles_but_not_resources() {
+        let (mut gate, public, private) = github_gate();
+        gate.acquire(&public, permit(0), "agent", time(0)).unwrap();
+        gate.finish(
+            &permit(0),
+            "agent",
+            ProviderOutcomeClassV1::Success,
+            &RateLimitObservationV1 {
+                remaining: Some(0),
+                reset_at: Some(time(180)),
+                retry_after_seconds: Some(240),
+                shared_control_version: 1,
+                ..RateLimitObservationV1::default()
+            },
+            time(0),
+        )
+        .unwrap();
+        assert_eq!(
+            gate.acquire(&private, permit(1), "agent", time(1)).unwrap(),
+            PermitDecision::WaitUntil(time(240))
+        );
+        let search = ProviderKeyV1::github_request(
+            RepositoryScopeV1::AllVisible,
+            Some("installation"),
+            "search",
+        );
+        gate.configure(search.clone(), ProviderPolicyV1::github_requests())
+            .unwrap();
+        assert!(matches!(
+            gate.acquire(&search, permit(2), "agent", time(1)).unwrap(),
+            PermitDecision::Granted(_)
+        ));
+        assert!(!gate.github_repository_work_available(time(1)));
+    }
+
+    #[test]
+    fn github_secondary_probes_are_global_bounded_and_resumable_without_losing_deadline() {
+        let (mut gate, public, private) = github_gate();
+        gate.acquire(&public, permit(0), "agent", time(0)).unwrap();
+        gate.acquire(&private, permit(9), "agent", time(0)).unwrap();
+        gate.finish(
+            &permit(0),
+            "agent",
+            ProviderOutcomeClassV1::RateLimited,
+            &secondary_observation(),
+            time(0),
+        )
+        .unwrap();
+        gate.finish(
+            &permit(9),
+            "agent",
+            ProviderOutcomeClassV1::Success,
+            &RateLimitObservationV1 {
+                shared_control_version: 1,
+                ..RateLimitObservationV1::default()
+            },
+            time(1),
+        )
+        .unwrap();
+        assert_eq!(
+            gate.acquire(&private, permit(1), "agent", time(1)).unwrap(),
+            PermitDecision::WaitUntil(time(60))
+        );
+        assert!(gate.github_status().recovery_required);
+
+        for (index, at) in [(1, 60), (2, 181), (3, 422)] {
+            assert!(matches!(
+                gate.acquire(&private, permit(index), "agent", time(at))
+                    .unwrap(),
+                PermitDecision::Granted(_)
+            ));
+            assert_eq!(
+                gate.acquire(&public, permit(10 + index), "other", time(at))
+                    .unwrap(),
+                PermitDecision::HalfOpenProbeInFlight
+            );
+            gate.finish(
+                &permit(index),
+                "agent",
+                ProviderOutcomeClassV1::RateLimited,
+                &secondary_observation(),
+                time(at + 1),
+            )
+            .unwrap();
+            let status = gate.github_status();
+            gate.finish(
+                &permit(index),
+                "agent",
+                ProviderOutcomeClassV1::RateLimited,
+                &secondary_observation(),
+                time(at + 2),
+            )
+            .unwrap();
+            assert_eq!(
+                gate.github_status(),
+                status,
+                "duplicate feedback cannot extend cooldowns"
+            );
+            gate = ProviderGate::from_snapshot(gate.snapshot()).unwrap();
+        }
+        assert!(gate.github_status().suspended);
+        assert_eq!(
+            gate.acquire(&public, permit(20), "agent", time(904))
+                .unwrap(),
+            PermitDecision::Suspended
+        );
+        assert!(!gate.github_repository_work_available(time(904)));
+        gate.resume_github();
+        assert_eq!(
+            gate.acquire(&public, permit(21), "agent", time(500))
+                .unwrap(),
+            PermitDecision::WaitUntil(time(903))
+        );
+        assert!(matches!(
+            gate.acquire(&public, permit(21), "agent", time(903))
+                .unwrap(),
+            PermitDecision::Granted(_)
+        ));
+        gate.finish(
+            &permit(21),
+            "agent",
+            ProviderOutcomeClassV1::Success,
+            &RateLimitObservationV1 {
+                shared_control_version: 1,
+                ..RateLimitObservationV1::default()
+            },
+            time(904),
+        )
+        .unwrap();
+        assert!(!gate.github_status().recovery_required);
+        assert!(!gate.github_status().suspended);
+    }
+
+    #[test]
+    fn github_expired_probe_is_recovered_by_journaled_acquisition() {
+        let (mut gate, public, _) = github_gate();
+        gate.acquire(&public, permit(0), "agent", time(0)).unwrap();
+        gate.finish(
+            &permit(0),
+            "agent",
+            ProviderOutcomeClassV1::RateLimited,
+            &secondary_observation(),
+            time(0),
+        )
+        .unwrap();
+        gate.acquire(&public, permit(1), "agent", time(60)).unwrap();
+        assert!(!gate.github_repository_work_available(time(61)));
+        assert!(gate.github_repository_work_available(time(120)));
+        assert_eq!(
+            gate.acquire(&public, permit(2), "agent", time(120))
+                .unwrap(),
+            PermitDecision::WaitUntil(time(240))
+        );
+        assert_eq!(gate.github_status().probes_used, 1);
+        assert!(!gate.github_status().probe_in_flight);
+    }
+
+    #[test]
+    fn legacy_github_feedback_does_not_change_historical_admission() {
+        let (mut gate, public, private) = github_gate();
+        gate.acquire(&public, permit(0), "agent", time(0)).unwrap();
+        let legacy: RateLimitObservationV1 = serde_json::from_str(
+            r#"{"remaining":0,"reset_at":"2026-08-01T00:01:00Z","retry_after_seconds":null}"#,
+        )
+        .unwrap();
+        gate.finish(
+            &permit(0),
+            "agent",
+            ProviderOutcomeClassV1::RateLimited,
+            &legacy,
+            time(0),
+        )
+        .unwrap();
+        assert!(matches!(
+            gate.acquire(&private, permit(1), "agent", time(1)).unwrap(),
+            PermitDecision::Granted(_)
+        ));
+        assert_eq!(gate.github_status(), GithubProviderStatusV1::default());
+        let mut snapshot = serde_json::to_value(gate.snapshot()).unwrap();
+        snapshot.as_object_mut().unwrap().remove("github");
+        assert!(ProviderGate::from_snapshot(serde_json::from_value(snapshot).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn extreme_retry_deadlines_saturate_without_panicking() {
+        let (mut gate, public, private) = github_gate();
+        gate.acquire(&public, permit(0), "agent", time(0)).unwrap();
+        gate.finish(
+            &permit(0),
+            "agent",
+            ProviderOutcomeClassV1::RateLimited,
+            &RateLimitObservationV1 {
+                retry_after_seconds: Some(u64::MAX),
+                ..secondary_observation()
+            },
+            time(0),
+        )
+        .unwrap();
+        assert_eq!(
+            gate.acquire(&private, permit(1), "agent", time(1)).unwrap(),
+            PermitDecision::WaitUntil(DateTime::<Utc>::MAX_UTC)
+        );
     }
 }

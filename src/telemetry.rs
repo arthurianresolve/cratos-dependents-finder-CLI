@@ -33,6 +33,8 @@ pub struct CoordinatorMetrics {
     pub inventory_watermark: Gauge,
     pub provider_deferrals: Counter,
     pub credential_broker_failures: Counter,
+    pub privacy_removal_failures: Counter,
+    pub privacy_removals_incomplete: Gauge,
     pub retention_runs: Counter,
     pub retention_failures: Counter,
     pub retention_metadata_removed: Counter,
@@ -62,6 +64,8 @@ impl CoordinatorMetrics {
         let inventory_watermark = Gauge::default();
         let provider_deferrals = Counter::default();
         let credential_broker_failures = Counter::default();
+        let privacy_removal_failures = Counter::default();
+        let privacy_removals_incomplete = Gauge::default();
         let retention_runs = Counter::default();
         let retention_failures = Counter::default();
         let retention_metadata_removed = Counter::default();
@@ -161,6 +165,16 @@ impl CoordinatorMetrics {
             credential_broker_failures.clone(),
         );
         registry.register(
+            "coordinator_privacy_removal_failures",
+            "Removal batches that failed and require retry",
+            privacy_removal_failures.clone(),
+        );
+        registry.register(
+            "coordinator_privacy_removals_incomplete",
+            "Accepted removal requests awaiting completed cleanup, including failures",
+            privacy_removals_incomplete.clone(),
+        );
+        registry.register(
             "coordinator_retention_runs",
             "Bounded artifact retention sweeps",
             retention_runs.clone(),
@@ -215,6 +229,8 @@ impl CoordinatorMetrics {
             inventory_watermark,
             provider_deferrals,
             credential_broker_failures,
+            privacy_removal_failures,
+            privacy_removals_incomplete,
             retention_runs,
             retention_failures,
             retention_metadata_removed,
@@ -331,6 +347,8 @@ mod tests {
         metrics.queue_depth.set(3);
         metrics.schedule_occurrences_created.inc();
         metrics.inventory_projection_pending.set(2);
+        metrics.privacy_removal_failures.inc();
+        metrics.privacy_removals_incomplete.set(4);
         metrics.retention_runs.inc();
         metrics.retention_last_run_succeeded.set(1);
         metrics.retention_pending_candidates.set(7);
@@ -339,6 +357,8 @@ mod tests {
         assert!(rendered.contains("coordinator_queue_depth 3"));
         assert!(rendered.contains("coordinator_schedule_occurrences_created_total 1"));
         assert!(rendered.contains("coordinator_inventory_projection_pending 2"));
+        assert!(rendered.contains("coordinator_privacy_removal_failures_total 1"));
+        assert!(rendered.contains("coordinator_privacy_removals_incomplete 4"));
         assert!(rendered.contains("coordinator_retention_runs_total 1"));
         assert!(rendered.contains("coordinator_retention_last_run_succeeded 1"));
         assert!(rendered.contains("coordinator_retention_pending_candidates 7"));

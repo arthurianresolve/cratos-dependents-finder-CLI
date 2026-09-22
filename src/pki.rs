@@ -221,6 +221,16 @@ pub fn authenticated_client(
     client_certificate: &Path,
     client_private_key: &Path,
 ) -> Result<reqwest::Client> {
+    authenticated_client_builder(ca_certificate, client_certificate, client_private_key)?
+        .build()
+        .context("building mutual-TLS HTTP client")
+}
+
+pub(crate) fn authenticated_client_builder(
+    ca_certificate: &Path,
+    client_certificate: &Path,
+    client_private_key: &Path,
+) -> Result<reqwest::ClientBuilder> {
     crate::install_rustls_crypto_provider();
     let ca = reqwest::Certificate::from_pem(&fs::read(ca_certificate)?)
         .context("decoding coordinator CA certificate")?;
@@ -228,14 +238,12 @@ pub fn authenticated_client(
     identity_pem.extend_from_slice(&fs::read(client_private_key)?);
     let identity = reqwest::Identity::from_pem(&identity_pem)
         .context("decoding mutual-TLS client identity")?;
-    reqwest::Client::builder()
+    Ok(reqwest::Client::builder()
         .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .add_root_certificate(ca)
-        .identity(identity)
-        .build()
-        .context("building mutual-TLS HTTP client")
+        .identity(identity))
 }
 
 fn read_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {

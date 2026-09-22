@@ -24,6 +24,7 @@ use super::{ControlApiState, ControlApiStateError};
 /// coordinator and the disposable inventory projection.
 #[derive(Clone)]
 pub struct CoordinatorControlApiState {
+    privacy: Option<Arc<crate::privacy::PrivacyService>>,
     store: TursoCoordinatorStore,
     inventory: Arc<dyn InventoryProjectionStore>,
     oidc_policy: Option<OidcTrustPolicyV1>,
@@ -44,6 +45,7 @@ impl CoordinatorControlApiState {
             return Err(ControlApiStateError::AuthenticationRejected);
         }
         Ok(Self {
+            privacy: None,
             store,
             inventory,
             oidc_policy,
@@ -54,15 +56,57 @@ impl CoordinatorControlApiState {
     pub fn store(&self) -> &TursoCoordinatorStore {
         &self.store
     }
+
+    pub fn with_privacy(mut self, privacy: Arc<crate::privacy::PrivacyService>) -> Self {
+        self.privacy = Some(privacy);
+        self
+    }
 }
 
 impl ControlApiState for CoordinatorControlApiState {
+    fn privacy(&self) -> Option<&Arc<crate::privacy::PrivacyService>> {
+        self.privacy.as_ref()
+    }
+    fn github_provider_status(
+        &self,
+    ) -> BoxFuture<'_, Result<crate::coordinator::GithubProviderStatusV1, ControlApiStateError>>
+    {
+        Box::pin(async move {
+            self.store
+                .github_provider_status()
+                .await
+                .map_err(|_| ControlApiStateError::Unavailable)
+        })
+    }
+
+    fn resume_github_provider(
+        &self,
+        now: DateTime<Utc>,
+    ) -> BoxFuture<'_, Result<crate::coordinator::GithubProviderStatusV1, ControlApiStateError>>
+    {
+        Box::pin(async move {
+            self.store
+                .apply(DurableCommandV1::ResumeGithubProvider { now })
+                .await
+                .map_err(|_| ControlApiStateError::Unavailable)?;
+            self.store
+                .github_provider_status()
+                .await
+                .map_err(|_| ControlApiStateError::Unavailable)
+        })
+    }
+
     fn inventory(&self) -> &(dyn InventoryProjectionStore + Send + Sync) {
         self.inventory.as_ref()
     }
 
     fn readiness(&self) -> BoxFuture<'_, Result<(), ControlApiStateError>> {
         Box::pin(async move {
+            if let Some(privacy) = &self.privacy
+                && !privacy.gate.read().await.ready
+            {
+                return Err(ControlApiStateError::Unavailable);
+            }
             self.store
                 .agent("operator")
                 .await
@@ -111,21 +155,24 @@ impl ControlApiState for CoordinatorControlApiState {
                 }
                 BTreeSet::new()
             } else if let Some(selected) = scope.selected_credential_profiles() {
-                selected
-                    .map(|profile| profile.as_str().to_owned())
-                    .collect()
+                let mut eligible = BTreeSet::new();
+                let now = Utc::now();
+                for profile in selected {
+                    if self
+                        .store
+                        .credential_profile(profile.as_str())
+                        .await
+                        .map_err(|_| ControlApiStateError::Unavailable)?
+                        .is_some_and(|record| record.is_github_eligible(now))
+                    {
+                        eligible.insert(profile.as_str().to_owned());
+                    }
+                }
+                eligible
             } else if scope.includes_all_credential_profiles() {
                 // All-profile access is intentionally resolved from the durable
                 // registry, never from names supplied by a search request.
-                self.store
-                    .control_snapshot()
-                    .await
-                    .map_err(|_| ControlApiStateError::Unavailable)?
-                    .credential_profiles
-                    .into_iter()
-                    .filter(|profile| profile.enabled)
-                    .map(|profile| profile.id)
-                    .collect()
+                enabled_credential_profiles(&self.store).await?
             } else {
                 BTreeSet::new()
             };
@@ -491,13 +538,14 @@ impl ControlApiState for CoordinatorControlApiState {
 async fn enabled_credential_profiles(
     store: &TursoCoordinatorStore,
 ) -> Result<BTreeSet<String>, ControlApiStateError> {
+    let now = Utc::now();
     Ok(store
         .control_snapshot()
         .await
         .map_err(|_| ControlApiStateError::Unavailable)?
         .credential_profiles
         .into_iter()
-        .filter(|profile| profile.enabled)
+        .filter(|profile| profile.is_github_eligible(now))
         .map(|profile| profile.id)
         .collect())
 }
@@ -543,9 +591,8 @@ async fn ensure_private_profile_enabled(
         .await
         .map_err(|_| ControlApiStateError::Unavailable)?
     {
-        Some(record) if record.enabled => Ok(()),
-        Some(_) => Err(ControlApiStateError::Conflict),
-        None => Err(ControlApiStateError::NotFound),
+        Some(record) if record.is_github_eligible(Utc::now()) => Ok(()),
+        Some(_) | None => Err(ControlApiStateError::NotFound),
     }
 }
 
@@ -574,5 +621,209 @@ fn classify_state_error(error: anyhow::Error) -> ControlApiStateError {
         ControlApiStateError::ValidationFailed
     } else {
         ControlApiStateError::Unavailable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        catalog::{
+            CatalogError, InMemoryInventoryStore, InventoryNamespaceV1, InventoryPageRequestV1,
+            InventoryQueryV1,
+        },
+        control_auth::{
+            ControlRoleV1, CredentialProfileAccessV1, InventoryScopeRequestV1,
+            PrincipalAuthenticationV1, PrincipalGrantV1, PrincipalIdV1, RepositoryAccessV1,
+            authorize_inventory_scope,
+        },
+        coordinator::{ControlActionV1, ScanBoundsV1, ScanTargetV1},
+        secure_cache::EnvelopeKey,
+    };
+    use chrono::TimeDelta;
+
+    fn reader(profiles: CredentialProfileAccessV1) -> ControlPrincipalV1 {
+        ControlPrincipalV1 {
+            schema_version: 1,
+            id: PrincipalIdV1::parse("service_token:test-reader").unwrap(),
+            authentication: PrincipalAuthenticationV1::ServiceToken {
+                token_id: "test-reader".to_owned(),
+            },
+            grant: PrincipalGrantV1::for_roles(
+                BTreeSet::from([ControlRoleV1::InventoryReader]),
+                RepositoryAccessV1 {
+                    public: true,
+                    credential_profiles: profiles,
+                },
+            )
+            .unwrap(),
+        }
+    }
+
+    fn profile(id: &str, now: DateTime<Utc>) -> CredentialProfileV1 {
+        CredentialProfileV1 {
+            schema_version: 1,
+            id: id.to_owned(),
+            provider: "github".to_owned(),
+            provider_host: "api.github.com".to_owned(),
+            secret_reference: "vault://github/test".to_owned(),
+            principal_fingerprint: "installation:42".to_owned(),
+            secret_version: "1".to_owned(),
+            enabled: true,
+            expires_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn current_profiles_constrain_selected_all_and_scheduler_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TursoCoordinatorStore::open(
+            directory.path().join("coordinator.db"),
+            EnvelopeKey::generate("test-key"),
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let recorded_at = now - TimeDelta::hours(2);
+        let mut expired = profile("expired", recorded_at);
+        expired.expires_at = Some(now - TimeDelta::hours(1));
+        let mut disabled = profile("disabled", recorded_at);
+        disabled.enabled = false;
+        let mut foreign = profile("foreign", recorded_at);
+        foreign.provider_host = "github.example".to_owned();
+        for record in [profile("active", recorded_at), expired, disabled, foreign] {
+            store
+                .apply_control(ControlCommandV1 {
+                    schema_version: 1,
+                    command_id: format!("register-{}", record.id),
+                    expected_generation: None,
+                    issued_at: recorded_at,
+                    action: ControlActionV1::UpsertCredentialProfile { profile: record },
+                })
+                .await
+                .unwrap();
+        }
+        let state = CoordinatorControlApiState::new(
+            store.clone(),
+            Arc::new(InMemoryInventoryStore::new([7; 32])),
+            None,
+            true,
+        )
+        .unwrap();
+        let ids = ["active", "expired", "disabled", "foreign", "missing"]
+            .map(|id| CredentialProfileIdV1::parse(id).unwrap());
+        for profiles in [
+            CredentialProfileAccessV1::All,
+            CredentialProfileAccessV1::Selected {
+                credential_profile_ids: ids.iter().cloned().collect(),
+            },
+        ] {
+            let principal = reader(profiles);
+            let scope =
+                authorize_inventory_scope(&principal, &InventoryScopeRequestV1::AllAuthorized)
+                    .unwrap();
+            assert_eq!(
+                state
+                    .inventory_access(&principal, &scope)
+                    .await
+                    .unwrap()
+                    .private_credential_profiles,
+                BTreeSet::from(["active".to_owned()])
+            );
+            for id in &ids[1..] {
+                let scope = authorize_inventory_scope(
+                    &principal,
+                    &InventoryScopeRequestV1::CredentialProfile {
+                        credential_profile_id: id.clone(),
+                    },
+                )
+                .unwrap();
+                let access = state.inventory_access(&principal, &scope).await.unwrap();
+                assert!(access.private_credential_profiles.is_empty());
+                let query = InventoryQueryV1 {
+                    schema_version: 1,
+                    namespace: Some(InventoryNamespaceV1::Private {
+                        credential_profile_id: id.as_str().to_owned(),
+                    }),
+                    ..InventoryQueryV1::default()
+                };
+                assert!(matches!(
+                    state
+                        .inventory()
+                        .search(&access, &query, &InventoryPageRequestV1::default())
+                        .await,
+                    Err(CatalogError::Unauthorized)
+                ));
+            }
+        }
+        let private_spec = ScanSpecV1 {
+            schema_version: 1,
+            target: ScanTargetV1 {
+                crate_name: "fs2".to_owned(),
+                version_spec: "=0.4.3".to_owned(),
+            },
+            repository_scope: RepositoryScopeV1::AllVisible,
+            credential_profile_id: Some("active".to_owned()),
+            bounds: ScanBoundsV1::default(),
+            analyzer_versions: Default::default(),
+        };
+        assert!(
+            state
+                .scheduler_inventory_access(&private_spec)
+                .await
+                .is_ok()
+        );
+        store
+            .apply_control(ControlCommandV1 {
+                schema_version: 1,
+                command_id: "revoke-active".to_owned(),
+                expected_generation: None,
+                issued_at: now,
+                action: ControlActionV1::RevokeCredentialProfile {
+                    profile_id: "active".to_owned(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            state.scheduler_inventory_access(&private_spec).await,
+            Err(ControlApiStateError::NotFound)
+        ));
+        assert!(matches!(
+            state
+                .validate_scan_spec_access(&reader(CredentialProfileAccessV1::All), &private_spec)
+                .await,
+            Err(ControlApiStateError::NotFound)
+        ));
+        let principal = reader(CredentialProfileAccessV1::All);
+        let scope =
+            authorize_inventory_scope(&principal, &InventoryScopeRequestV1::AllAuthorized).unwrap();
+        assert!(
+            state
+                .inventory_access(&principal, &scope)
+                .await
+                .unwrap()
+                .private_credential_profiles
+                .is_empty()
+        );
+        let public_scope =
+            authorize_inventory_scope(&principal, &InventoryScopeRequestV1::PublicOnly).unwrap();
+        let disabled_state = CoordinatorControlApiState::new(
+            store,
+            Arc::new(InMemoryInventoryStore::new([8; 32])),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            disabled_state
+                .inventory_access(&principal, &public_scope)
+                .await
+                .unwrap()
+                .private_credential_profiles
+                .is_empty()
+        );
     }
 }

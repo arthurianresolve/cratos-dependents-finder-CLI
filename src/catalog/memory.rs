@@ -32,6 +32,7 @@ use super::{
 
 #[derive(Debug, Default)]
 struct MemoryState {
+    suppressions: Vec<crate::privacy::SuppressionTargetV1>,
     repositories: BTreeMap<RepositoryKeyV1, InventoryRepositoryV1>,
     snapshots: BTreeMap<RepositorySnapshotKeyV1, RepositorySnapshotV1>,
     attempts: BTreeMap<String, RepositoryAttemptV1>,
@@ -160,6 +161,74 @@ impl InMemoryInventoryStore {
 }
 
 impl InventoryProjectionStore for InMemoryInventoryStore {
+    fn install_suppressions<'a>(
+        &'a self,
+        targets: &'a [crate::privacy::SuppressionTargetV1],
+    ) -> BoxFuture<'a, Result<(), CatalogError>> {
+        async move {
+            for target in targets {
+                target.validate().map_err(|_| {
+                    CatalogError::InvalidInput("invalid suppression target".to_owned())
+                })?;
+            }
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| CatalogError::StoreUnavailable)?;
+            let mut changed = false;
+            for target in targets {
+                if !state.suppressions.contains(target) {
+                    state.suppressions.push(target.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                state.watermark = state.watermark.saturating_add(1);
+                state.cursor_floor = state.watermark;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn purge_repository<'a>(
+        &'a self,
+        target: &'a crate::privacy::SuppressionTargetV1,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<usize, CatalogError>> {
+        async move {
+            target
+                .validate()
+                .map_err(|_| CatalogError::InvalidInput("invalid suppression target".to_owned()))?;
+            if limit == 0 || limit > crate::privacy::REMOVAL_BATCH_SIZE {
+                return Err(CatalogError::InvalidInput(
+                    "invalid removal batch size".to_owned(),
+                ));
+            }
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| CatalogError::StoreUnavailable)?;
+            let removed = state
+                .attempts
+                .iter()
+                .filter(|(_, attempt)| {
+                    state
+                        .repositories
+                        .get(&attempt.repository)
+                        .is_some_and(|repository| {
+                            repository_is_suppressed(std::slice::from_ref(target), repository)
+                        })
+                })
+                .take(limit)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            remove_attempt_ids(&mut state, &removed);
+            Ok(removed.len())
+        }
+        .boxed()
+    }
+
     fn project<'a>(
         &'a self,
         input: InventoryProjectionInputV1,
@@ -183,9 +252,13 @@ impl InventoryProjectionStore for InMemoryInventoryStore {
                 .map_err(|_| CatalogError::StoreUnavailable)?;
             let mut rebuilt = MemoryState {
                 watermark: state.watermark,
+                suppressions: state.suppressions.clone(),
                 ..MemoryState::default()
             };
             for input in inputs {
+                if super::input_is_suppressed(&rebuilt.suppressions, &input) {
+                    continue;
+                }
                 let sequence = rebuilt.watermark.saturating_add(1);
                 project_input_at(&mut rebuilt, input, sequence)?;
             }
@@ -338,6 +411,7 @@ impl InventoryProjectionStore for InMemoryInventoryStore {
                 .map_err(|_| CatalogError::StoreUnavailable)?;
             let mut matches = state.repositories.values().filter(|repository| {
                 &repository.key.namespace == namespace
+                    && !repository_is_suppressed(&state.suppressions, repository)
                     && (repository.normalized_full_name == normalized_alias
                         || repository.aliases.contains(normalized_alias))
             });
@@ -388,6 +462,9 @@ fn project_input_at(
     input: InventoryProjectionInputV1,
     sequence: u64,
 ) -> Result<InventoryProjectionOutcomeV1, CatalogError> {
+    if super::input_is_suppressed(&state.suppressions, &input) {
+        return Err(CatalogError::Unauthorized);
+    }
     if sequence <= state.watermark {
         return Err(CatalogError::InvalidInput(
             "projection sequences must be strictly increasing".to_owned(),
@@ -888,6 +965,25 @@ fn index_attempt(state: &mut MemoryState, attempt_id: &str) {
         .upsert(attempt_id, repository_terms, package_terms);
 }
 
+fn repository_is_suppressed(
+    targets: &[crate::privacy::SuppressionTargetV1],
+    repository: &InventoryRepositoryV1,
+) -> bool {
+    targets.iter().any(|target| {
+        target.matches(
+            &repository.key.namespace,
+            &repository.key.repository_id,
+            &repository.full_name,
+        ) || repository.aliases.iter().any(|alias| {
+            target.matches(
+                &repository.key.namespace,
+                &repository.key.repository_id,
+                alias,
+            )
+        })
+    })
+}
+
 fn select_attempts(
     state: &MemoryState,
     query: &InventoryQueryV1,
@@ -896,7 +992,12 @@ fn select_attempts(
 ) -> BTreeSet<String> {
     let mut selected = BTreeSet::new();
     for (repository, attempt_ids) in &state.attempts_by_repository {
-        if !namespaces.contains(&repository.namespace) {
+        if !namespaces.contains(&repository.namespace)
+            || state
+                .repositories
+                .get(repository)
+                .is_some_and(|record| repository_is_suppressed(&state.suppressions, record))
+        {
             continue;
         }
         let mut attempts = attempt_ids

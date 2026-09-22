@@ -31,8 +31,44 @@ pub(crate) fn normalize_repository_alias(value: &str) -> String {
     search::normalize_text(value)
 }
 
+fn input_is_suppressed(
+    targets: &[crate::privacy::SuppressionTargetV1],
+    input: &InventoryProjectionInputV1,
+) -> bool {
+    match input {
+        InventoryProjectionInputV1::Observation(envelope) => targets.iter().any(|target| {
+            target.matches(&envelope.namespace, &envelope.repository_id, "")
+                || envelope.evidence.repositories.iter().any(|repository| {
+                    target.matches(
+                        &envelope.namespace,
+                        &envelope.repository_id,
+                        &repository.repository,
+                    )
+                })
+        }),
+        InventoryProjectionInputV1::FailedAttempt(attempt) => targets.iter().any(|target| {
+            target.matches(
+                &attempt.namespace,
+                &attempt.repository_id,
+                &attempt.repository_full_name,
+            )
+        }),
+    }
+}
+
 /// Projection and query Interface implemented by durable and in-memory Adapters.
 pub trait InventoryProjectionStore: Send + Sync {
+    fn install_suppressions<'a>(
+        &'a self,
+        targets: &'a [crate::privacy::SuppressionTargetV1],
+    ) -> BoxFuture<'a, Result<(), CatalogError>>;
+
+    fn purge_repository<'a>(
+        &'a self,
+        target: &'a crate::privacy::SuppressionTargetV1,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<usize, CatalogError>>;
+
     fn project<'a>(
         &'a self,
         input: InventoryProjectionInputV1,

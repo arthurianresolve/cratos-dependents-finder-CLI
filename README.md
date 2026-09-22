@@ -5,6 +5,12 @@ repositories that declare a crate or record an exact crate version in a
 default-branch `Cargo.lock`. Public scope is the default; private and internal
 repositories require explicit authenticated opt-in.
 
+Cratos is intended to identify dependent repositories so maintainers can
+optimize a library for its actual userbase and assess migration from an
+unmaintained dependency to a maintained replacement. Its current sources are
+crates.io and GitHub. GitHub operations are read-only; the tool does not submit
+issues, pull requests, email, or automated migration outreach.
+
 It deliberately keeps these observations separate:
 
 - a current published crate version directly declares the target, according to
@@ -147,6 +153,17 @@ public-only qualifier from bounded name/code searches and adds a paginated,
 visible to that credential. Repository IDs are deduplicated. Permission
 failures or reaching the inventory bound produce partial evidence. The default
 path retains its public qualifiers and does not perform this inventory request.
+
+Credential precedence is `GITHUB_APP_TOKEN`, `GITHUB_TOKEN`, then `GH_TOKEN`.
+The first selects installation-token enumeration; the others select user-token
+enumeration. Token type is not guessed from the secret. Shared cooldowns and
+bounded retries apply to GitHub requests; long limits defer work rather than
+continuing requests through the cooldown.
+
+Standalone scans can apply a deployment's authenticated suppression policy with
+paired `--suppression-ledger` and `--suppression-key-file` flags. See the
+[GitHub access and removal guide](docs/github-api-and-removal.md) for token
+semantics, provider suspension/resume, online removal, and recovery guarantees.
 
 ### Report an existing CSV
 
@@ -357,7 +374,9 @@ cargo run --locked -- coordinator backup `
 
 cargo run --locked -- coordinator restore `
   --backup-set backups/cdr-2026-08-14 `
-  --sidecars recovered-secrets --directory .cdr-state-restored
+  --sidecars recovered-secrets --directory .cdr-state-restored `
+  --suppression-ledger recovery-policy/suppression.ledger `
+  --suppression-key-file recovery-policy/suppression.key
 ```
 
 The versioned set contains the checkpointed database, the deployment manifest,
@@ -371,6 +390,16 @@ overwrites an existing destination. Worker enrollment packages live outside
 the coordinator state directory and therefore require separate protected
 escrow or worker re-enrollment after recovery.
 
+New backup sets also bind the suppression policy's deployment, revision, and
+digest. Keep the **current** authenticated `suppression.ledger` and its
+dedicated `suppression.key` independently of old backups. Restore requires them
+for every format-3 backup (including revision zero) and purges matching restored evidence in staging
+before publishing the destination. The ordinary backup set does not provide
+this independent current policy or its key. For legacy sets without a policy
+identity, applying a nonempty ledger requires an independently verified
+association and explicit `--accept-legacy-ledger-binding` attestation. See the
+[recovery limits](docs/github-api-and-removal.md#independent-ledger-and-recovery).
+
 The database itself is integrity-checked but is not wrapped in a second backup
 encryption layer. A backup set can contain normalized public or explicitly
 enabled private inventory metadata and must therefore be stored on access-
@@ -380,7 +409,8 @@ recovery channel.
 The older database-only interface remains available with `backup --output DB
 --manifest JSON` and `restore --backup DB --manifest JSON --database NEW_DB`.
 It does not capture encrypted artifacts or external recovery dependencies and
-is retained only for compatibility. Neither mode is an online snapshot or
+is retained only for compatibility with storage that does not require
+suppression-aware recovery. Neither mode is an online snapshot or
 secret escrow. It is also not evidence that any RPO/RTO target has been met;
 that claim requires repeated timed restore rehearsals.
 
@@ -398,6 +428,15 @@ to one inventory watermark so newly completed scans cannot reorder later
 pages. Repository/package filters, completeness, evidence strength, relation,
 MSRV, revision, time, and freshness operate on normalized `EvidenceBundleV1`
 projections rather than CSV output.
+
+Admin control operations include `coordinator github status/resume` and
+`coordinator privacy plan/remove/status/retry`. Online removal first publishes
+repository suppression, then removes evidence and inventory in bounded
+batches. It does not erase encrypted operational history before its existing
+expiry, recall old exports/backups, or claim secure erasure. Disabling a
+credential profile, revoking its GitHub token, and removing evidence are
+separate operations. Follow the [operator guide](docs/github-api-and-removal.md)
+and its [release checklist](docs/github-api-and-removal.md#release-checklist).
 
 Schedules use five-field UTC cron, enforce a one-hour minimum cadence, allow
 one active occurrence, and coalesce missed instants to the newest occurrence.

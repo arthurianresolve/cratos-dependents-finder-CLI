@@ -120,6 +120,7 @@ pub struct ScanSummary {
     pub repositories_filtered_as_forks: usize,
     pub repositories_filtered_as_archived: usize,
     pub repositories_filtered_as_private: usize,
+    pub repositories_suppressed: usize,
     pub repositories_resolved_public: usize,
     pub repositories_resolved_private: usize,
     pub repositories_resolved_internal: usize,
@@ -697,6 +698,26 @@ pub async fn scan(
         bail!("--output and --summary-json must refer to different files");
     }
     validate_distinct_outputs(&options)?;
+    if let Some(policy_paths) = github.suppression_paths() {
+        for output in std::iter::once(options.output.as_path()).chain(
+            [
+                options.summary_json.as_deref(),
+                options.evidence_json.as_deref(),
+                options.policy_report.as_deref(),
+            ]
+            .into_iter()
+            .flatten(),
+        ) {
+            for policy_path in policy_paths {
+                let same_existing_file = output != Path::new("-")
+                    && output.exists()
+                    && std::fs::canonicalize(output)? == std::fs::canonicalize(policy_path)?;
+                if output_paths_conflict(output, policy_path)? || same_existing_file {
+                    bail!("scan outputs must not overwrite suppression policy or its key");
+                }
+            }
+        }
+    }
     if options.version_selector.kind() == VersionSelectorKind::Range
         && (options.evidence_json.is_some()
             || options.policy_file.is_some()
@@ -850,6 +871,19 @@ pub async fn scan(
 
     let mut github_groups = Vec::new();
     for group in groups.into_values() {
+        let suppressed = match &group.known_repository {
+            Some(repository) => {
+                github.repository_suppressed(&repository.id.to_string(), &repository.full_name)
+            }
+            None => group
+                .repository_hint
+                .as_ref()
+                .is_some_and(|repo| github.repository_suppressed("", &repo.full_name())),
+        };
+        if suppressed {
+            accounting.summary.repositories_suppressed += 1;
+            continue;
+        }
         if group.repository_hint.is_some() {
             github_groups.push(group);
         } else {
@@ -896,6 +930,13 @@ pub async fn scan(
         ));
     }
     for (group, error) in resolution.failures {
+        if error
+            .downcast_ref::<crate::github::RepositorySuppressed>()
+            .is_some()
+        {
+            accounting.summary.repositories_suppressed += 1;
+            continue;
+        }
         accounting.record_resolution_failure(&context, &group, &error);
     }
 
@@ -935,6 +976,12 @@ pub async fn scan(
     accounting.absorb_inspection(aggregate);
     let (summary, rows) = accounting.finish();
 
+    github.validate_suppression_results(rows.iter().map(|row| {
+        (
+            row.github_repository_id.as_str(),
+            row.github_full_name.as_str(),
+        )
+    }))?;
     write_csv(&options.output, CsvRow::HEADERS, &rows)?;
     if let Some(path) = &options.summary_json {
         write_json(path, &summary)?;

@@ -1,4 +1,5 @@
 //! Mutual-TLS coordinator protocol for LAN operators and workers.
+mod privacy;
 
 use std::{collections::BTreeSet, io, net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -92,6 +93,7 @@ pub struct CoordinatorServerConfig {
 
 #[derive(Clone)]
 struct ApiState {
+    privacy: Option<Arc<crate::privacy::PrivacyService>>,
     store: TursoCoordinatorStore,
     inventory: Arc<dyn InventoryProjectionStore>,
     metrics: CoordinatorMetrics,
@@ -308,7 +310,23 @@ pub struct AcquireProviderPermitRequestV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AcquireProviderPermitResponseV1 {
+    #[serde(serialize_with = "serialize_worker_permit_decision")]
     pub decision: PermitDecision,
+}
+
+fn serialize_worker_permit_decision<S>(
+    decision: &PermitDecision,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    // V1 workers already release their lease on capacity backpressure. Keep
+    // suspension details on the admin API without extending the worker enum.
+    match decision {
+        PermitDecision::Suspended => PermitDecision::CapacityExhausted.serialize(serializer),
+        _ => decision.serialize(serializer),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -398,6 +416,22 @@ pub async fn serve(
     inventory: Arc<dyn InventoryProjectionStore>,
     metrics: CoordinatorMetrics,
 ) -> Result<()> {
+    serve_with_privacy(config, store, inventory, metrics, None).await
+}
+
+pub async fn serve_with_privacy(
+    config: CoordinatorServerConfig,
+    store: TursoCoordinatorStore,
+    inventory: Arc<dyn InventoryProjectionStore>,
+    metrics: CoordinatorMetrics,
+    privacy: Option<Arc<crate::privacy::PrivacyService>>,
+) -> Result<()> {
+    if privacy.is_none() {
+        ensure!(
+            store.privacy_ledger().await?.revision == 0,
+            "suppression-aware state requires a shared privacy service before serving"
+        );
+    }
     ensure!(
         !config.envelope_key_id.trim().is_empty(),
         "envelope key ID is empty"
@@ -428,6 +462,7 @@ pub async fn serve(
         })
         .transpose()?;
     let state = ApiState {
+        privacy,
         store,
         inventory,
         metrics,
@@ -443,6 +478,7 @@ pub async fn serve(
     spawn_lease_reclaimer(state.store.clone());
     spawn_retention_collector(state.clone());
     spawn_inventory_reconciler(state.clone());
+    privacy::spawn(state.clone());
     let application = Router::new()
         .route("/healthz", get(health))
         .route("/metrics", get(render_metrics))
@@ -480,6 +516,30 @@ pub async fn serve(
         .serve(application.into_make_service())
         .await
         .context("serving coordinator API")
+}
+
+pub(crate) async fn purge_suppressed_before_restore(
+    store: TursoCoordinatorStore,
+    inventory: Arc<dyn InventoryProjectionStore>,
+    artifacts: SecureBlobCache,
+    envelope_key: Arc<EnvelopeKey>,
+    privacy_service: Arc<crate::privacy::PrivacyService>,
+) -> Result<()> {
+    let state = ApiState {
+        privacy: Some(privacy_service),
+        store,
+        inventory,
+        artifacts,
+        envelope_key,
+        metrics: CoordinatorMetrics::new(),
+        retention_policy: RetentionPolicyV1::default(),
+        private_inventory_enabled: true,
+        credential_broker: None,
+        artifact_retention: Arc::new(RwLock::new(())),
+        inventory_reconciliation_cursor: Arc::new(Mutex::new(None)),
+        failed_attempt_reconciliation_cursor: Arc::new(Mutex::new(None)),
+    };
+    privacy::run_to_completion(&state).await
 }
 
 async fn authenticate(
@@ -954,8 +1014,9 @@ async fn issue_task_credential(
     headers: HeaderMap,
     Extension(peer): Extension<TlsPeerIdentity>,
     Json(request): Json<TaskCredentialRequestV1>,
-) -> Result<Json<TaskCredentialResponseV1>, ApiError> {
+) -> Result<Response, ApiError> {
     let agent = authenticate(&state, &headers, &peer).await?;
+    let privacy_guard = privacy::read_guard(&state).await?;
     let task_id = TaskId(task_id);
     let task = state
         .store
@@ -981,6 +1042,12 @@ async fn issue_task_credential(
             "public-only tasks do not receive brokered credentials",
         ));
     }
+    privacy::ensure_allowed(
+        &privacy_guard,
+        &cache_namespace(&job)?,
+        "",
+        &task.repository_id,
+    )?;
     let profile_id = job
         .spec
         .credential_profile_id
@@ -999,21 +1066,13 @@ async fn issue_task_credential(
                 "the task credential profile is not configured",
             )
         })?;
-    if !profile.enabled || profile.provider != "github" || profile.provider_host != "api.github.com"
-    {
+    if !profile.is_github_eligible(now) {
         state.metrics.credential_broker_failures.inc();
         return Err(ApiError::unavailable(
             "credential_profile_unavailable",
-            "the task credential profile is disabled or incompatible",
+            "the task credential profile is unavailable",
         ));
     }
-    profile.validate(now).map_err(|_| {
-        state.metrics.credential_broker_failures.inc();
-        ApiError::unavailable(
-            "credential_profile_unavailable",
-            "the task credential profile is invalid or expired",
-        )
-    })?;
     let broker = state.credential_broker.as_ref().ok_or_else(|| {
         state.metrics.credential_broker_failures.inc();
         ApiError::unavailable(
@@ -1046,6 +1105,23 @@ async fn issue_task_credential(
         .map_err(|error| ApiError::internal(error.to_string()))?
         .ok_or_else(|| ApiError::internal("credential task disappeared"))?;
     validate_task_lease(&current_task, &agent.agent_id, &request.lease_id)?;
+    let current_profile = state
+        .store
+        .credential_profile(profile_id)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if !current_profile.is_some_and(|current| {
+        current.is_github_eligible(Utc::now())
+            && current.principal_fingerprint == profile.principal_fingerprint
+            && current.secret_reference == profile.secret_reference
+            && current.secret_version == profile.secret_version
+    }) {
+        state.metrics.credential_broker_failures.inc();
+        return Err(ApiError::unavailable(
+            "credential_profile_unavailable",
+            "the task credential profile changed during credential issuance",
+        ));
+    }
     if credential.expires_at <= Utc::now() {
         state.metrics.credential_broker_failures.inc();
         return Err(ApiError::unavailable(
@@ -1057,7 +1133,8 @@ async fn issue_task_credential(
         schema_version: 1,
         access_token: credential.expose_token().to_owned(),
         expires_at: credential.expires_at,
-    }))
+    })
+    .into_response())
 }
 
 fn spawn_lease_reclaimer(store: TursoCoordinatorStore) {
@@ -1343,6 +1420,16 @@ async fn reconcile_failed_attempt(
     state: &ApiState,
     record: FailedAttemptProjectionRecordV1,
 ) -> Result<InventoryReconciliationOutcome> {
+    let guard = privacy::read_guard(state)
+        .await
+        .map_err(|_| anyhow::anyhow!("privacy policy unavailable"))?;
+    privacy::ensure_allowed(
+        &guard,
+        &record.namespace,
+        "",
+        &record.normalized_repository_alias,
+    )
+    .map_err(|_| anyhow::anyhow!("repository evidence unavailable"))?;
     if !inventory_projection_enabled(state.private_inventory_enabled, &record.namespace) {
         return Ok(InventoryReconciliationOutcome::PrivateDisabled);
     }
@@ -1415,6 +1502,23 @@ async fn project_and_mark_inventory(
     artifact: &ArtifactRecordV1,
     projection: InventoryProjectionInputV1,
 ) -> Result<()> {
+    let guard = privacy::read_guard(state)
+        .await
+        .map_err(|_| anyhow::anyhow!("privacy policy unavailable"))?;
+    match &projection {
+        InventoryProjectionInputV1::Observation(envelope) => privacy::ensure_evidence_allowed(
+            &guard,
+            &artifact.metadata.key.namespace,
+            &envelope.evidence,
+        ),
+        InventoryProjectionInputV1::FailedAttempt(attempt) => privacy::ensure_allowed(
+            &guard,
+            &artifact.metadata.key.namespace,
+            &attempt.repository_id,
+            &attempt.repository_full_name,
+        ),
+    }
+    .map_err(|_| anyhow::anyhow!("repository evidence unavailable"))?;
     state
         .inventory
         .project(projection)
@@ -1467,8 +1571,9 @@ async fn cache_lookup(
     headers: HeaderMap,
     Extension(peer): Extension<TlsPeerIdentity>,
     Json(request): Json<CacheLookupRequestV1>,
-) -> Result<Json<CacheLookupResponseV1>, ApiError> {
+) -> Result<Response, ApiError> {
     let agent = authenticate(&state, &headers, &peer).await?;
+    let privacy_guard = privacy::read_guard(&state).await?;
     let task_id = TaskId(task_id);
     let task = state
         .store
@@ -1489,6 +1594,14 @@ async fn cache_lookup(
     authorize_job(&agent, &job)?;
     validate_task_lease(&task, &agent.agent_id, &request.lease_id)?;
     validate_reuse_fingerprint_for_job(&request.fingerprint, &job)?;
+    ensure_current_private_profile(&state, &job).await?;
+
+    privacy::ensure_allowed(
+        &privacy_guard,
+        &cache_namespace(&job)?,
+        &request.fingerprint.repository_id,
+        &task.repository_id,
+    )?;
 
     // Keep metadata and object retention under one read-side lifecycle guard.
     // The collector takes the write side before removing either.
@@ -1500,7 +1613,7 @@ async fn cache_lookup(
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?
     else {
-        return Ok(Json(CacheLookupResponseV1 { evidence: None }));
+        return Ok(Json(CacheLookupResponseV1 { evidence: None }).into_response());
     };
     let secure_namespace =
         SecureNamespaceOwned::from_cache_namespace(&artifact.metadata.key.namespace);
@@ -1518,12 +1631,14 @@ async fn cache_lookup(
     let key = state.envelope_key.clone();
     let read_namespace = secure_namespace.clone();
     let read_digest = digest.clone();
+    ensure_current_private_profile(&state, &job).await?;
     let plaintext = tokio::task::spawn_blocking(move || {
-        cache.get(
+        cache.get_bounded(
             &read_namespace.as_borrowed(),
             CACHE_CONTENT_KIND_EVIDENCE,
             &read_digest,
             &key,
+            MAX_EVIDENCE_ARTIFACT_BYTES as u64,
         )
     })
     .await
@@ -1534,7 +1649,7 @@ async fn cache_lookup(
             tracing::warn!(%error, "invalid encrypted cache object; invalidating metadata");
             invalidate_cached_object(&state, &artifact.metadata.key, &secure_namespace, &digest)
                 .await?;
-            return Ok(Json(CacheLookupResponseV1 { evidence: None }));
+            return Ok(Json(CacheLookupResponseV1 { evidence: None }).into_response());
         }
     };
     let evidence = match serde_json::from_slice::<EvidenceBundleV1>(&plaintext) {
@@ -1543,18 +1658,18 @@ async fn cache_lookup(
             tracing::warn!("unsupported cached evidence payload; invalidating metadata");
             invalidate_cached_object(&state, &artifact.metadata.key, &secure_namespace, &digest)
                 .await?;
-            return Ok(Json(CacheLookupResponseV1 { evidence: None }));
+            return Ok(Json(CacheLookupResponseV1 { evidence: None }).into_response());
         }
     };
     if validate_reuse_fingerprint(&request.fingerprint, &evidence, &job).is_err() {
         tracing::warn!("cached evidence does not match its reuse metadata; invalidating entry");
         invalidate_cached_object(&state, &artifact.metadata.key, &secure_namespace, &digest)
             .await?;
-        return Ok(Json(CacheLookupResponseV1 { evidence: None }));
+        return Ok(Json(CacheLookupResponseV1 { evidence: None }).into_response());
     }
     let evidence = match validate_evidence(&task, &job, evidence) {
         Ok(evidence) => evidence,
-        Err(_) => return Ok(Json(CacheLookupResponseV1 { evidence: None })),
+        Err(_) => return Ok(Json(CacheLookupResponseV1 { evidence: None }).into_response()),
     };
     match state
         .store
@@ -1568,9 +1683,12 @@ async fn cache_lookup(
         DurableOutcomeV1::Applied => {}
         _ => return Err(ApiError::internal("unexpected cache touch outcome")),
     }
+    ensure_current_private_profile(&state, &job).await?;
+    privacy::ensure_evidence_allowed(&privacy_guard, &cache_namespace(&job)?, &evidence)?;
     Ok(Json(CacheLookupResponseV1 {
         evidence: Some(evidence),
-    }))
+    })
+    .into_response())
 }
 
 async fn complete_task(
@@ -1581,6 +1699,7 @@ async fn complete_task(
     Json(request): Json<CompleteTaskRequestV1>,
 ) -> Result<StatusCode, ApiError> {
     let agent = authenticate(&state, &headers, &peer).await?;
+    let privacy_guard = privacy::read_guard(&state).await?;
     let task_id = TaskId(task_id);
     let task = state
         .store
@@ -1609,6 +1728,19 @@ async fn complete_task(
     let canonical = serde_json::to_vec(&evidence)
         .map_err(|error| ApiError::internal(format!("serializing evidence: {error}")))?;
     validate_artifact_reference(&request.artifact, &canonical, &job)?;
+    if task.state == RepositoryTaskStateV1::Succeeded {
+        if task.result.as_ref() != Some(&request.artifact) {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                code: "completion_conflict",
+                message: "task already completed with a different artifact".to_owned(),
+            });
+        }
+        // Completed tasks retain their receipt, not an active lease. Do not
+        // recreate retained or privacy-removed content when retrying its ACK.
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    privacy::ensure_evidence_allowed(&privacy_guard, &cache_namespace(&job)?, &evidence)?;
 
     let cache_namespace = cache_namespace(&job)?;
     let secure_namespace = secure_namespace(&job)?;
@@ -1711,6 +1843,7 @@ async fn complete_task(
     }
     drop(_object_guard);
     drop(_retention_guard);
+    drop(privacy_guard);
     if !inventory_projection_enabled(
         state.private_inventory_enabled,
         &artifact_record.metadata.key.namespace,
@@ -1818,6 +1951,7 @@ async fn task_artifact(
     Extension(peer): Extension<TlsPeerIdentity>,
 ) -> Result<Response, ApiError> {
     require_operator(&state, &headers, &peer).await?;
+    let privacy_guard = privacy::read_guard(&state).await?;
     let _retention_guard = state.artifact_retention.read().await;
     let artifact = state
         .store
@@ -1834,16 +1968,20 @@ async fn task_artifact(
     let cache = state.artifacts.clone();
     let key = state.envelope_key.clone();
     let body = tokio::task::spawn_blocking(move || {
-        cache.get(
+        cache.get_bounded(
             &namespace.as_borrowed(),
             CACHE_CONTENT_KIND_EVIDENCE,
             &digest,
             &key,
+            MAX_EVIDENCE_ARTIFACT_BYTES as u64,
         )
     })
     .await
     .map_err(|error| ApiError::internal(format!("artifact read task failed: {error}")))?
     .map_err(|error| ApiError::internal(format!("reading encrypted evidence: {error:#}")))?;
+    let evidence: EvidenceBundleV1 = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::internal("invalid evidence artifact"))?;
+    privacy::ensure_evidence_allowed(&privacy_guard, &artifact.metadata.key.namespace, &evidence)?;
     let mut response = body.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -2505,6 +2643,7 @@ async fn acquire_provider_permit(
     Json(request): Json<AcquireProviderPermitRequestV1>,
 ) -> Result<Json<AcquireProviderPermitResponseV1>, ApiError> {
     let agent = authenticate(&state, &headers, &peer).await?;
+    let privacy_guard = privacy::read_guard(&state).await?;
     authorize_provider_key(&agent, &request.key)?;
     match (&request.task_id, &request.lease_id) {
         (Some(task_id), Some(lease_id)) => {
@@ -2526,6 +2665,13 @@ async fn acquire_provider_permit(
                 .ok_or_else(|| ApiError::internal("task references a missing job"))?;
             authorize_job(&agent, &job)?;
             validate_task_lease(&task, &agent.agent_id, lease_id)?;
+            ensure_current_private_profile(&state, &job).await?;
+            privacy::ensure_allowed(
+                &privacy_guard,
+                &cache_namespace(&job)?,
+                "",
+                &task.repository_id,
+            )?;
             let expected = ProviderKeyV1::github_request(
                 job.spec.repository_scope,
                 job.spec.credential_profile_id.as_deref(),
@@ -2577,13 +2723,15 @@ async fn finish_provider_permit(
     Json(request): Json<FinishProviderPermitRequestV1>,
 ) -> Result<StatusCode, ApiError> {
     let agent = authenticate(&state, &headers, &peer).await?;
+    let mut observation = request.observation;
+    observation.shared_control_version = 1;
     apply_unit(
         &state,
         DurableCommandV1::FinishProviderRequest {
             permit_id: request.permit_id,
             agent_id: agent.agent_id,
             outcome: request.outcome,
-            observation: request.observation,
+            observation,
             now: Utc::now(),
         },
     )
@@ -2603,6 +2751,31 @@ async fn require_operator(
         });
     }
     Ok(())
+}
+
+async fn ensure_current_private_profile(state: &ApiState, job: &ScanJobV1) -> Result<(), ApiError> {
+    if job.spec.repository_scope == RepositoryScopeV1::PublicOnly {
+        return Ok(());
+    }
+    let profile_id = job
+        .spec
+        .credential_profile_id
+        .as_deref()
+        .ok_or_else(|| ApiError::internal("private job lacks a credential profile"))?;
+    if state
+        .store
+        .credential_profile(profile_id)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .is_some_and(|profile| profile.is_github_eligible(Utc::now()))
+    {
+        Ok(())
+    } else {
+        Err(ApiError::unavailable(
+            "credential_profile_unavailable",
+            "the task credential profile is unavailable",
+        ))
+    }
 }
 
 fn authorize_job(agent: &AgentRecordV1, job: &ScanJobV1) -> Result<(), ApiError> {
@@ -2753,6 +2926,56 @@ mod tests {
     }
 
     #[test]
+    fn suspended_permits_keep_the_existing_worker_response_wire_format() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        enum LegacyPermitDecision {
+            Granted(crate::coordinator::ProviderPermitV1),
+            WaitUntil(DateTime<Utc>),
+            CapacityExhausted,
+            HalfOpenProbeInFlight,
+        }
+        #[derive(Deserialize)]
+        struct LegacyPermitResponse {
+            decision: LegacyPermitDecision,
+        }
+        let now = Utc::now();
+        for (decision, expected) in [
+            (
+                PermitDecision::Suspended,
+                LegacyPermitDecision::CapacityExhausted,
+            ),
+            (
+                PermitDecision::CapacityExhausted,
+                LegacyPermitDecision::CapacityExhausted,
+            ),
+            (
+                PermitDecision::WaitUntil(now),
+                LegacyPermitDecision::WaitUntil(now),
+            ),
+            (
+                PermitDecision::HalfOpenProbeInFlight,
+                LegacyPermitDecision::HalfOpenProbeInFlight,
+            ),
+        ] {
+            let response = AcquireProviderPermitResponseV1 { decision };
+            let encoded = serde_json::to_vec(&response).unwrap();
+            let legacy: LegacyPermitResponse = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(legacy.decision, expected);
+        }
+        assert_eq!(
+            serde_json::to_value(AcquireProviderPermitResponseV1 {
+                decision: PermitDecision::Suspended,
+            })
+            .unwrap(),
+            serde_json::json!({ "decision": "CapacityExhausted" })
+        );
+        assert_eq!(
+            serde_json::to_value(PermitDecision::Suspended).unwrap(),
+            "Suspended"
+        );
+    }
+
+    #[test]
     fn coordinator_owns_bounded_typed_retry_policy() {
         let now = Utc::now();
         assert_eq!(
@@ -2781,7 +3004,7 @@ mod tests {
         assert!(validate_lease_request_id(&"x".repeat(257)).is_err());
     }
 
-    fn test_job(scope: RepositoryScopeV1, profile: Option<&str>) -> ScanJobV1 {
+    pub(super) fn test_job(scope: RepositoryScopeV1, profile: Option<&str>) -> ScanJobV1 {
         ScanJobV1 {
             schema_version: SCHEMA_VERSION_V1,
             id: JobId("job-1".to_owned()),
@@ -2876,7 +3099,7 @@ mod tests {
         assert!(inventory_projection_enabled(true, &private));
     }
 
-    fn inventory_evidence(now: DateTime<Utc>) -> EvidenceBundleV1 {
+    pub(super) fn inventory_evidence(now: DateTime<Utc>) -> EvidenceBundleV1 {
         let repository = "example/app";
         EvidenceBundleV1 {
             schema_version: EvidenceBundleV1::SCHEMA_VERSION,
@@ -2928,7 +3151,7 @@ mod tests {
         .normalized()
     }
 
-    async fn submit_and_fail_repository_task(
+    pub(super) async fn submit_and_fail_repository_task(
         store: &TursoCoordinatorStore,
         job_id: &str,
         task_id: &str,
@@ -2981,7 +3204,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn seed_prior_inventory_observation(
+    pub(super) async fn seed_prior_inventory_observation(
         inventory: &InMemoryInventoryStore,
         observed_at: DateTime<Utc>,
     ) {
@@ -3013,7 +3236,7 @@ mod tests {
             .unwrap();
     }
 
-    fn reconciliation_state(
+    pub(super) fn reconciliation_state(
         directory: &tempfile::TempDir,
         store: TursoCoordinatorStore,
         inventory: Arc<InMemoryInventoryStore>,
@@ -3021,6 +3244,7 @@ mod tests {
         private_inventory_enabled: bool,
     ) -> ApiState {
         ApiState {
+            privacy: None,
             store,
             inventory,
             metrics: CoordinatorMetrics::new(),
@@ -3122,13 +3346,38 @@ mod tests {
         )
         .await
         .unwrap();
+        let now = Utc::now();
+        store
+            .apply_control(crate::coordinator::ControlCommandV1 {
+                schema_version: 1,
+                command_id: "register-private-failure-profile".to_owned(),
+                expected_generation: None,
+                issued_at: now,
+                action: crate::coordinator::ControlActionV1::UpsertCredentialProfile {
+                    profile: crate::coordinator::CredentialProfileV1 {
+                        schema_version: 1,
+                        id: "production".to_owned(),
+                        provider: "github".to_owned(),
+                        provider_host: "api.github.com".to_owned(),
+                        secret_reference: "vault://github/test".to_owned(),
+                        principal_fingerprint: "installation:42".to_owned(),
+                        secret_version: "1".to_owned(),
+                        enabled: true,
+                        expires_at: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                },
+            })
+            .await
+            .unwrap();
         submit_and_fail_repository_task(
             &store,
             "private-failed-job",
             "private-failed-task",
             RepositoryScopeV1::AllVisible,
             Some("production"),
-            Utc::now(),
+            now,
         )
         .await;
         let inventory = Arc::new(InMemoryInventoryStore::new([9; 32]));
@@ -3269,6 +3518,7 @@ mod tests {
 
         let inventory = Arc::new(InMemoryInventoryStore::new([7; 32]));
         let state = ApiState {
+            privacy: None,
             store: store.clone(),
             inventory: inventory.clone(),
             metrics: CoordinatorMetrics::new(),

@@ -249,6 +249,7 @@ pub trait StateStore {
 /// Deterministic adapter used for state-machine tests and single-process execution.
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
+    privacy_targets: std::sync::Arc<[crate::privacy::SuppressionTargetV1]>,
     jobs: BTreeMap<JobId, ScanJobV1>,
     idempotency_keys: BTreeMap<String, JobId>,
     queued_jobs: BTreeSet<(DateTime<Utc>, JobId)>,
@@ -583,39 +584,28 @@ impl StateStore for InMemoryStateStore {
                     .as_ref()
                     .is_some_and(|lease| lease.agent_id == agent_id)
             {
-                return Ok(Some(existing.clone()));
+                return Ok((!self.task_is_suppressed(existing)).then(|| existing.clone()));
             }
             return Err(StoreError::LeaseIdConflict);
+        }
+        if !self.provider_gate.github_repository_work_available(now) {
+            return Ok(None);
         }
         let task_id = self.ready_task_for_job(job_id, now);
         let Some(task_id) = task_id else {
             return Ok(None);
         };
 
-        self.transition_task(&task_id, RepositoryTaskStateV1::Leased, now)?;
-        let task = self.tasks.get_mut(&task_id).expect("task was selected");
-        task.attempt = task
-            .attempt
-            .checked_add(1)
-            .ok_or(StoreError::AttemptOverflow)?;
-        task.lease = Some(LeaseV1 {
-            lease_id: lease_id.to_owned(),
-            agent_id: agent_id.to_owned(),
-            acquired_at: now,
-            expires_at: checked_add_seconds(now, lease_seconds),
-        });
-        task.failure = None;
-        self.active_leases
-            .insert(lease_id.to_owned(), task_id.clone());
-        let leased = task.clone();
-        self.record_event(
-            job_id,
-            Some(task_id),
-            now,
-            JobEventKindV1::TaskLeased,
-            BTreeMap::from([("agent_id".to_owned(), agent_id.to_owned())]),
-        )?;
-        Ok(Some(leased))
+        self.lease_ready_task(
+            task_id,
+            LeaseV1 {
+                lease_id: lease_id.to_owned(),
+                agent_id: agent_id.to_owned(),
+                acquired_at: now,
+                expires_at: checked_add_seconds(now, lease_seconds),
+            },
+        )
+        .map(Some)
     }
 
     fn lease_next_authorized_task(
@@ -642,11 +632,17 @@ impl StateStore for InMemoryStateStore {
                 .as_ref()
                 .is_some_and(|lease| lease.agent_id == agent_id)
             {
-                return Ok(authorization.allows(&job.spec).then(|| existing.clone()));
+                return Ok(
+                    (authorization.allows(&job.spec) && !self.task_is_suppressed(existing))
+                        .then(|| existing.clone()),
+                );
             }
             return Err(StoreError::LeaseIdConflict);
         }
 
+        if !self.provider_gate.github_repository_work_available(now) {
+            return Ok(None);
+        }
         let eligible_jobs = self
             .running_jobs
             .iter()
@@ -1043,6 +1039,130 @@ impl StateStore for InMemoryStateStore {
 }
 
 impl InMemoryStateStore {
+    pub(super) fn global_lease_cursor(&self) -> Option<JobId> {
+        self.global_lease_cursor.clone()
+    }
+
+    /// Replays the selected identity, not today's eligibility policy. The
+    /// caller admits this command only from the authenticated journal.
+    pub(super) fn replay_selected_lease(
+        &mut self,
+        task_id: TaskId,
+        lease: LeaseV1,
+        global_cursor: Option<JobId>,
+    ) -> Result<RepositoryTaskV1, StoreError> {
+        let task = if let Some(existing_id) = self.active_leases.get(&lease.lease_id) {
+            let existing = &self.tasks[existing_id];
+            if *existing_id != task_id || existing.lease.as_ref() != Some(&lease) {
+                return Err(StoreError::LeaseIdConflict);
+            }
+            existing.clone()
+        } else {
+            self.lease_ready_task(task_id, lease)?
+        };
+        self.global_lease_cursor = global_cursor;
+        Ok(task)
+    }
+
+    fn lease_ready_task(
+        &mut self,
+        task_id: TaskId,
+        lease: LeaseV1,
+    ) -> Result<RepositoryTaskV1, StoreError> {
+        if lease.agent_id.is_empty()
+            || lease.lease_id.is_empty()
+            || lease.expires_at <= lease.acquired_at
+        {
+            return Err(StoreError::InvalidLease);
+        }
+        let task = self.tasks.get(&task_id).ok_or(StoreError::TaskNotFound)?;
+        if task.state != RepositoryTaskStateV1::Pending || task.not_before > lease.acquired_at {
+            return Err(StoreError::InvalidLease);
+        }
+        let job_id = task.job_id.clone();
+        if self.jobs.get(&job_id).ok_or(StoreError::JobNotFound)?.state != ScanJobStateV1::Running {
+            return Err(StoreError::InvalidJobTransition);
+        }
+        let attempt = task
+            .attempt
+            .checked_add(1)
+            .ok_or(StoreError::AttemptOverflow)?;
+        self.ensure_event_capacity(1)?;
+        self.transition_task(&task_id, RepositoryTaskStateV1::Leased, lease.acquired_at)?;
+        let task = self.tasks.get_mut(&task_id).expect("task was selected");
+        task.attempt = attempt;
+        task.lease = Some(lease.clone());
+        task.failure = None;
+        self.active_leases
+            .insert(lease.lease_id.clone(), task_id.clone());
+        let leased = task.clone();
+        self.record_event(
+            &job_id,
+            Some(task_id),
+            lease.acquired_at,
+            JobEventKindV1::TaskLeased,
+            BTreeMap::from([("agent_id".to_owned(), lease.agent_id)]),
+        )?;
+        Ok(leased)
+    }
+
+    pub(super) fn set_privacy_targets(
+        &mut self,
+        targets: std::sync::Arc<[crate::privacy::SuppressionTargetV1]>,
+    ) {
+        self.privacy_targets = targets;
+    }
+
+    pub(super) fn privacy_task_page(
+        &self,
+        after: Option<&TaskId>,
+        limit: usize,
+    ) -> Vec<RepositoryTaskV1> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.tasks
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .take(limit.min(crate::privacy::REMOVAL_BATCH_SIZE))
+            .map(|(_, task)| task.clone())
+            .collect()
+    }
+
+    pub(super) fn task_is_suppressed(&self, task: &RepositoryTaskV1) -> bool {
+        self.jobs.get(&task.job_id).is_some_and(|job| {
+            let namespace = crate::privacy::namespace_for_spec(&job.spec);
+            self.privacy_targets
+                .iter()
+                .any(|target| target.matches(&namespace, "", &task.repository_id))
+        })
+    }
+
+    pub(super) fn cancel_selected_tasks(
+        &mut self,
+        tasks: &[TaskId],
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        if tasks.len() > crate::privacy::REMOVAL_BATCH_SIZE
+            || tasks.iter().any(|id| !self.tasks.contains_key(id))
+        {
+            return Err(StoreError::InvalidBatch);
+        }
+        for id in tasks {
+            if !self.tasks[id].state.is_terminal() {
+                self.clear_task_lease(id);
+                self.transition_task(id, RepositoryTaskStateV1::Cancelled, now)?;
+                self.tasks.get_mut(id).expect("task was validated").failure =
+                    Some("repository_suppressed".to_owned());
+            }
+        }
+        Ok(())
+    }
+    pub fn github_provider_status(&self) -> super::GithubProviderStatusV1 {
+        self.provider_gate.github_status()
+    }
+
+    pub fn resume_github_provider(&mut self) {
+        self.provider_gate.resume_github();
+    }
+
     /// Submit one complete repository batch as a single state transition.
     ///
     /// Every fallible condition is checked before the first canonical write.
@@ -1054,39 +1174,10 @@ impl InMemoryStateStore {
         tasks: &[NewRepositoryTaskV1],
         now: DateTime<Utc>,
     ) -> Result<SubmitOutcome, StoreError> {
-        request.spec.validate()?;
-        if request.job_id.0.is_empty() || request.idempotency_key.is_empty() || tasks.is_empty() {
-            return Err(StoreError::InvalidBatch);
-        }
+        let (task_ids, repositories) = Self::validate_submission_batch(request, tasks)?;
         let task_count = u64::try_from(tasks.len()).map_err(|_| StoreError::InvalidBatch)?;
-        if task_count > request.spec.bounds.repository_limit {
-            return Err(StoreError::InvalidBatch);
-        }
-
-        let mut task_ids = BTreeSet::new();
-        let mut repositories = BTreeSet::new();
-        for task in tasks {
-            if task.job_id != request.job_id
-                || task.task_id.0.trim().is_empty()
-                || task.repository_id.trim().is_empty()
-                || !task_ids.insert(task.task_id.clone())
-                || !repositories.insert(task.repository_id.clone())
-            {
-                return Err(StoreError::InvalidBatch);
-            }
-        }
-
-        if let Some(existing_id) = self.idempotency_keys.get(&request.idempotency_key) {
-            let existing = self
-                .jobs
-                .get(existing_id)
-                .ok_or(StoreError::ProgressInvariantViolation)?;
-            if existing.spec != request.spec
-                || self.repository_ids_for_job(existing_id) != repositories
-            {
-                return Err(StoreError::IdempotencyConflict);
-            }
-            return Ok(SubmitOutcome::Existing(existing_id.clone()));
+        if let Some(existing) = self.existing_submission(request, &repositories)? {
+            return Ok(SubmitOutcome::Existing(existing));
         }
         if self.jobs.contains_key(&request.job_id) {
             return Err(StoreError::JobAlreadyExists);
@@ -1138,6 +1229,62 @@ impl InMemoryStateStore {
             self.start_job(&job_id, now)?;
         }
         Ok(SubmitOutcome::Created(job_id))
+    }
+
+    pub(super) fn existing_batch_submission(
+        &self,
+        request: &SubmitJobV1,
+        tasks: &[NewRepositoryTaskV1],
+    ) -> Result<Option<JobId>, StoreError> {
+        let (_, repositories) = Self::validate_submission_batch(request, tasks)?;
+        self.existing_submission(request, &repositories)
+    }
+
+    fn existing_submission(
+        &self,
+        request: &SubmitJobV1,
+        repositories: &BTreeSet<String>,
+    ) -> Result<Option<JobId>, StoreError> {
+        let Some(existing_id) = self.idempotency_keys.get(&request.idempotency_key) else {
+            return Ok(None);
+        };
+        let existing = self
+            .jobs
+            .get(existing_id)
+            .ok_or(StoreError::ProgressInvariantViolation)?;
+        if existing.spec != request.spec
+            || &self.repository_ids_for_job(existing_id) != repositories
+        {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        Ok(Some(existing_id.clone()))
+    }
+
+    fn validate_submission_batch(
+        request: &SubmitJobV1,
+        tasks: &[NewRepositoryTaskV1],
+    ) -> Result<(BTreeSet<TaskId>, BTreeSet<String>), StoreError> {
+        request.spec.validate()?;
+        if request.job_id.0.is_empty() || request.idempotency_key.is_empty() || tasks.is_empty() {
+            return Err(StoreError::InvalidBatch);
+        }
+        let task_count = u64::try_from(tasks.len()).map_err(|_| StoreError::InvalidBatch)?;
+        if task_count > request.spec.bounds.repository_limit {
+            return Err(StoreError::InvalidBatch);
+        }
+        let mut task_ids = BTreeSet::new();
+        let mut repositories = BTreeSet::new();
+        for task in tasks {
+            if task.job_id != request.job_id
+                || task.task_id.0.trim().is_empty()
+                || task.repository_id.trim().is_empty()
+                || !task_ids.insert(task.task_id.clone())
+                || !repositories.insert(task.repository_id.clone())
+            {
+                return Err(StoreError::InvalidBatch);
+            }
+        }
+        Ok((task_ids, repositories))
     }
 
     pub(crate) fn snapshot(&self) -> StateSnapshotV1 {
@@ -1460,8 +1607,12 @@ impl InMemoryStateStore {
     fn ready_task_for_job(&self, job_id: &JobId, now: DateTime<Utc>) -> Option<TaskId> {
         self.pending_tasks_by_job
             .get(job_id)
-            .and_then(BTreeSet::first)
-            .filter(|(not_before, _)| *not_before <= now)
+            .and_then(|tasks| {
+                tasks
+                    .iter()
+                    .take_while(|(not_before, _)| *not_before <= now)
+                    .find(|(_, task_id)| !self.task_is_suppressed(&self.tasks[task_id]))
+            })
             .map(|(_, task_id)| task_id.clone())
     }
 

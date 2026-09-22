@@ -31,6 +31,14 @@ pub struct CredentialProfileV1 {
 impl CredentialProfileV1 {
     pub const SCHEMA_VERSION: u16 = 1;
 
+    /// Whether this profile currently authorizes new GitHub work and private reads.
+    pub fn is_github_eligible(&self, now: DateTime<Utc>) -> bool {
+        self.enabled
+            && self.provider == "github"
+            && self.provider_host == "api.github.com"
+            && self.validate(now).is_ok()
+    }
+
     pub fn validate(&self, now: DateTime<Utc>) -> Result<(), CredentialError> {
         if self.schema_version != Self::SCHEMA_VERSION {
             return Err(CredentialError::UnsupportedSchema(self.schema_version));
@@ -466,7 +474,21 @@ mod tests {
             updated_at: now(),
         };
         profile.validate(now()).unwrap();
+        assert!(profile.is_github_eligible(now()));
+        for field in ["enabled", "provider", "host", "expiry", "schema"] {
+            let mut ineligible = profile.clone();
+            match field {
+                "enabled" => ineligible.enabled = false,
+                "provider" => ineligible.provider = "other".to_owned(),
+                "host" => ineligible.provider_host = "github.example".to_owned(),
+                "expiry" => ineligible.expires_at = Some(now()),
+                "schema" => ineligible.schema_version = 2,
+                _ => unreachable!(),
+            }
+            assert!(!ineligible.is_github_eligible(now()), "{field}");
+        }
         profile.id.push(' ');
+        assert!(!profile.is_github_eligible(now()));
         assert!(matches!(
             profile.validate(now()),
             Err(CredentialError::InvalidField("profile ID"))

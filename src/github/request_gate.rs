@@ -68,6 +68,8 @@ pub struct GitHubRequestRateLimitV1 {
     pub resource: Option<GitHubRateResourceV1>,
     pub retry_after_seconds: Option<u64>,
     pub retry_after_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub secondary_limit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -88,42 +90,83 @@ pub struct GitHubRequestOutcomeV1 {
 }
 
 impl GitHubRequestOutcomeV1 {
-    /// Return the earliest useful retry instant carried by a rate-limit
-    /// response. This lets a remote gate release the repository task instead
-    /// of allowing the GitHub client's retry loop to sleep while it is leased.
+    pub fn is_secondary_rate_limit(&self) -> bool {
+        self.rate_limit
+            .as_ref()
+            .is_some_and(|rate| rate.secondary_limit)
+            || (self.status == Some(429)
+                && !self
+                    .rate_limit
+                    .as_ref()
+                    .is_some_and(|rate| rate.remaining == Some(0)))
+    }
+
+    /// Latest applicable deadline; exhaustion on a successful response blocks
+    /// subsequent requests without turning that successful response into a retry.
     pub fn rate_limit_retry_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let rate = self.rate_limit.as_ref();
-        let is_rate_limited = self.status == Some(429)
+        let exhausted = rate.is_some_and(|rate| rate.remaining == Some(0));
+        let is_rate_limited = self.is_secondary_rate_limit()
+            || self.status == Some(429)
             || (self.status == Some(403)
                 && rate.is_some_and(|rate| {
-                    rate.remaining == Some(0)
-                        || rate.retry_after_seconds.is_some()
-                        || rate.retry_after_at.is_some()
-                }));
+                    exhausted || rate.retry_after_seconds.is_some() || rate.retry_after_at.is_some()
+                }))
+            || (self
+                .status
+                .is_some_and(|status| (200..300).contains(&status))
+                && exhausted);
         if !is_rate_limited {
             return None;
         }
 
-        let retry_at = rate
+        let retry_after = rate
             .and_then(|rate| rate.retry_after_at)
-            .or_else(|| {
+            .into_iter()
+            .chain(
                 rate.and_then(|rate| rate.retry_after_seconds)
-                    .and_then(|seconds| i64::try_from(seconds).ok())
-                    .and_then(|seconds| now.checked_add_signed(TimeDelta::seconds(seconds)))
+                    .map(|seconds| {
+                        i64::try_from(seconds)
+                            .ok()
+                            .and_then(TimeDelta::try_seconds)
+                            .and_then(|delta| now.checked_add_signed(delta))
+                            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+                    }),
+            )
+            .max();
+        let reset = exhausted
+            .then(|| {
+                rate.and_then(|rate| rate.reset_epoch).map(|epoch| {
+                    i64::try_from(epoch)
+                        .ok()
+                        .and_then(|epoch| DateTime::<Utc>::from_timestamp(epoch, 0))
+                        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+                })
             })
-            .or_else(|| {
-                rate.and_then(|rate| rate.reset_epoch)
-                    .and_then(|epoch| i64::try_from(epoch).ok())
-                    .and_then(|epoch| DateTime::<Utc>::from_timestamp(epoch, 0))
-            })
-            .unwrap_or_else(|| now + TimeDelta::seconds(30));
-        Some(retry_at.max(now + TimeDelta::milliseconds(50)))
+            .flatten();
+        Some(
+            retry_after
+                .into_iter()
+                .chain(reset)
+                .filter(|deadline| *deadline > now)
+                .max()
+                .unwrap_or_else(|| {
+                    now.checked_add_signed(TimeDelta::seconds(60))
+                        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+                }),
+        )
     }
 
     /// Retry instant for a distributed worker. Remote workers cooperatively
     /// release their task lease after the first transient transport or server
     /// response; the ungated standalone client retains its local retry loop.
     pub fn cooperative_retry_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if self
+            .status
+            .is_some_and(|status| (200..300).contains(&status))
+        {
+            return None;
+        }
         self.rate_limit_retry_at(now).or_else(|| {
             let transient = matches!(
                 self.transport,
@@ -177,6 +220,7 @@ pub enum GitHubRequestGateError {
     /// Admission asked the caller to release any task lease and retry no
     /// earlier than this instant. The gate never sleeps while work is leased.
     DeferredUntil(DateTime<Utc>),
+    Suspended,
     Protocol,
 }
 
@@ -186,6 +230,7 @@ impl fmt::Display for GitHubRequestGateError {
             Self::Unavailable => "provider admission is unavailable",
             Self::Rejected => "provider request was not admitted",
             Self::DeferredUntil(_) => "provider request was deferred",
+            Self::Suspended => "provider requests are suspended pending explicit resume",
             Self::Protocol => "provider admission protocol failed",
         })
     }
@@ -246,6 +291,83 @@ mod tests {
         assert_eq!(
             outcome.rate_limit_retry_at(now()),
             Some(now() + TimeDelta::seconds(17))
+        );
+    }
+
+    #[test]
+    fn exhausted_primary_uses_the_latest_applicable_deadline() {
+        let mut outcome = rate_outcome(403);
+        outcome.rate_limit = Some(GitHubRequestRateLimitV1 {
+            remaining: Some(0),
+            retry_after_seconds: Some(17),
+            reset_epoch: Some((now() + TimeDelta::minutes(5)).timestamp() as u64),
+            ..GitHubRequestRateLimitV1::default()
+        });
+        assert_eq!(
+            outcome.rate_limit_retry_at(now()),
+            Some(now() + TimeDelta::minutes(5))
+        );
+        outcome.status = Some(200);
+        assert_eq!(
+            outcome.rate_limit_retry_at(now()),
+            Some(now() + TimeDelta::minutes(5))
+        );
+        assert_eq!(outcome.cooperative_retry_at(now()), None);
+    }
+
+    fn rate_outcome(status: u16) -> GitHubRequestOutcomeV1 {
+        GitHubRequestOutcomeV1 {
+            request: GitHubRequestAttemptV1 {
+                provider: OutboundProviderV1::GitHub,
+                resource: GitHubRequestResourceV1::Core,
+                attempt: 1,
+                max_attempts: 3,
+            },
+            transport: GitHubRequestTransportV1::ResponseHeaders,
+            status: Some(status),
+            rate_limit: None,
+        }
+    }
+
+    #[test]
+    fn secondary_limits_without_usable_deadlines_wait_one_minute() {
+        let mut outcome = rate_outcome(429);
+        assert_eq!(
+            outcome.rate_limit_retry_at(now()),
+            Some(now() + TimeDelta::seconds(60))
+        );
+        outcome.status = Some(403);
+        outcome.rate_limit = Some(GitHubRequestRateLimitV1 {
+            secondary_limit: true,
+            retry_after_at: Some(now() - TimeDelta::seconds(1)),
+            retry_after_seconds: Some(0),
+            ..GitHubRequestRateLimitV1::default()
+        });
+        assert_eq!(
+            outcome.rate_limit_retry_at(now()),
+            Some(now() + TimeDelta::seconds(60))
+        );
+    }
+
+    #[test]
+    fn extreme_deadlines_never_panic_or_shorten_cooldowns() {
+        let mut outcome = rate_outcome(429);
+        outcome.rate_limit = Some(GitHubRequestRateLimitV1 {
+            retry_after_seconds: Some(u64::MAX),
+            ..GitHubRequestRateLimitV1::default()
+        });
+        assert_eq!(
+            outcome.rate_limit_retry_at(now()),
+            Some(DateTime::<Utc>::MAX_UTC)
+        );
+        outcome.rate_limit = Some(GitHubRequestRateLimitV1 {
+            remaining: Some(0),
+            reset_epoch: Some(u64::MAX),
+            ..GitHubRequestRateLimitV1::default()
+        });
+        assert_eq!(
+            outcome.rate_limit_retry_at(now()),
+            Some(DateTime::<Utc>::MAX_UTC)
         );
     }
 

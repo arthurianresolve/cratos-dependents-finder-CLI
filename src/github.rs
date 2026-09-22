@@ -4,7 +4,7 @@ use std::{
     fmt,
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::Url;
 
 mod request_gate;
+mod suppression;
 mod tree_inventory;
+pub use suppression::RepositorySuppressed;
+use suppression::StandaloneSuppression;
 
 pub use request_gate::{
     GitHubRateResourceV1, GitHubRequestAttemptV1, GitHubRequestGate, GitHubRequestGateError,
@@ -52,12 +55,42 @@ const REST_SEARCH_PAGE_SIZE: usize = 100;
 /// Resolve GitHub credentials without exposing their source or value. A
 /// broker-minted GitHub App installation token takes precedence over PATs.
 pub fn preferred_token_from_environment() -> Option<String> {
+    preferred_credential_from_environment().map(|credential| credential.token)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GitHubCredentialKind {
+    #[default]
+    User,
+    Installation,
+}
+
+/// The secret is deliberately excluded from Debug output.
+pub struct GitHubCredential {
+    token: String,
+    kind: GitHubCredentialKind,
+}
+
+pub fn preferred_credential_from_environment() -> Option<GitHubCredential> {
+    credential_from_environment(|name| std::env::var(name).ok())
+}
+
+fn credential_from_environment(
+    mut read: impl FnMut(&str) -> Option<String>,
+) -> Option<GitHubCredential> {
     ["GITHUB_APP_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
         .into_iter()
         .find_map(|name| {
-            std::env::var(name)
-                .ok()
+            read(name)
                 .filter(|token| !token.trim().is_empty())
+                .map(|token| GitHubCredential {
+                    token,
+                    kind: if name == "GITHUB_APP_TOKEN" {
+                        GitHubCredentialKind::Installation
+                    } else {
+                        GitHubCredentialKind::User
+                    },
+                })
         })
 }
 
@@ -556,8 +589,54 @@ pub struct GitHubClient {
     client: Client,
     api_base: Url,
     token: Option<Arc<str>>,
+    credential_kind: GitHubCredentialKind,
     usage: Arc<GitHubUsageCounters>,
     request_gate: Option<Arc<dyn GitHubRequestGate>>,
+    cooldowns: Arc<Mutex<GitHubCooldowns>>,
+    suppression: Option<Arc<StandaloneSuppression>>,
+}
+
+#[derive(Default)]
+struct GitHubCooldowns {
+    secondary: Option<DateTime<Utc>>,
+    core: Option<DateTime<Utc>>,
+    search: Option<DateTime<Utc>>,
+}
+
+impl GitHubCooldowns {
+    fn deadline(&self, resource: GitHubRequestResourceV1) -> Option<DateTime<Utc>> {
+        self.secondary
+            .into_iter()
+            .chain(match resource {
+                GitHubRequestResourceV1::Core => self.core,
+                GitHubRequestResourceV1::Search => self.search,
+            })
+            .max()
+    }
+
+    fn observe(&mut self, outcome: &GitHubRequestOutcomeV1, now: DateTime<Utc>) {
+        let Some(deadline) = outcome.rate_limit_retry_at(now) else {
+            return;
+        };
+        if outcome.is_secondary_rate_limit() {
+            self.secondary = Some(
+                self.secondary
+                    .map_or(deadline, |current| current.max(deadline)),
+            );
+        }
+        if !outcome.is_secondary_rate_limit()
+            || outcome
+                .rate_limit
+                .as_ref()
+                .is_some_and(|rate| rate.remaining == Some(0))
+        {
+            let primary = match outcome.request.resource {
+                GitHubRequestResourceV1::Core => &mut self.core,
+                GitHubRequestResourceV1::Search => &mut self.search,
+            };
+            *primary = Some(primary.map_or(deadline, |current| current.max(deadline)));
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -573,6 +652,15 @@ struct GitHubUsageCounters {
 }
 
 impl GitHubClient {
+    pub fn with_credential(credential: Option<GitHubCredential>) -> Result<Self> {
+        let (token, kind) = credential.map_or((None, GitHubCredentialKind::User), |credential| {
+            (Some(credential.token), credential.kind)
+        });
+        let mut client = Self::new(token)?;
+        client.credential_kind = kind;
+        Ok(client)
+    }
+
     pub fn new(token: Option<String>) -> Result<Self> {
         Self::with_api_base(
             token,
@@ -624,8 +712,11 @@ impl GitHubClient {
             client,
             api_base,
             token,
+            credential_kind: GitHubCredentialKind::User,
             usage: Arc::new(GitHubUsageCounters::default()),
             request_gate: None,
+            cooldowns: Arc::new(Mutex::new(GitHubCooldowns::default())),
+            suppression: None,
         })
     }
 
@@ -634,6 +725,35 @@ impl GitHubClient {
     pub fn with_gate(mut self, gate: Arc<dyn GitHubRequestGate>) -> Self {
         self.request_gate = Some(gate);
         self
+    }
+
+    pub fn with_suppression_ledger(
+        mut self,
+        path: &std::path::Path,
+        key_path: &std::path::Path,
+    ) -> Result<Self> {
+        self.suppression = Some(Arc::new(StandaloneSuppression::load(path, key_path)?));
+        Ok(self)
+    }
+
+    pub fn repository_suppressed(&self, repository_id: &str, alias: &str) -> bool {
+        self.suppression
+            .as_ref()
+            .is_some_and(|policy| policy.suppresses(repository_id, alias))
+    }
+
+    pub(crate) fn suppression_paths(&self) -> Option<[&std::path::Path; 2]> {
+        self.suppression.as_ref().map(|policy| policy.paths())
+    }
+
+    pub(crate) fn validate_suppression_results<'a>(
+        &self,
+        identities: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<()> {
+        if let Some(policy) = &self.suppression {
+            policy.validate_results(identities)?;
+        }
+        Ok(())
     }
 
     pub fn usage(&self) -> GitHubUsage {
@@ -653,6 +773,9 @@ impl GitHubClient {
             .get_json(url)
             .await
             .with_context(|| format!("failed to read GitHub repository {repo}"))?;
+        if self.repository_suppressed(&repository.id.to_string(), &repository.full_name) {
+            return Err(RepositorySuppressed.into());
+        }
         Ok(repository)
     }
 
@@ -868,26 +991,39 @@ impl GitHubClient {
         let mut raw_count = 0usize;
         let mut page = 1usize;
         let mut complete = false;
+        let page_size = limit.min(REST_SEARCH_PAGE_SIZE);
         while raw_count < limit {
-            let page_size = (limit - raw_count).min(REST_SEARCH_PAGE_SIZE);
-            let mut url = self.endpoint(["user", "repos"])?;
+            let mut url = match self.credential_kind {
+                GitHubCredentialKind::User => self.endpoint(["user", "repos"]),
+                GitHubCredentialKind::Installation => {
+                    self.endpoint(["installation", "repositories"])
+                }
+            }?;
+            if self.credential_kind == GitHubCredentialKind::User {
+                url.query_pairs_mut()
+                    .append_pair("visibility", "all")
+                    .append_pair("affiliation", "owner,collaborator,organization_member")
+                    .append_pair("sort", "full_name")
+                    .append_pair("direction", "asc");
+            }
             url.query_pairs_mut()
-                .append_pair("visibility", "all")
-                .append_pair("affiliation", "owner,collaborator,organization_member")
-                .append_pair("sort", "full_name")
-                .append_pair("direction", "asc")
                 .append_pair("per_page", &page_size.to_string())
                 .append_pair("page", &page.to_string());
-            let repositories: Vec<GitHubRepository> = self
-                .get_json(url)
-                .await
-                .context("GitHub credential-visible repository inventory failed")?;
+            let repositories: Vec<GitHubRepository> = match self.credential_kind {
+                GitHubCredentialKind::User => self.get_json(url).await,
+                GitHubCredentialKind::Installation => self
+                    .get_json::<InstallationRepositories>(url)
+                    .await
+                    .map(|response| response.repositories),
+            }
+            .context("GitHub credential-visible repository inventory failed")?;
             let returned = repositories.len();
+            let remaining = limit - raw_count;
             raw_count = raw_count.saturating_add(returned);
-            for repository in repositories {
+            for repository in repositories.into_iter().take(remaining) {
                 by_id.entry(repository.id).or_insert(repository);
             }
-            if returned < page_size {
+            if returned < page_size && raw_count < limit {
                 complete = true;
                 break;
             }
@@ -971,71 +1107,136 @@ impl GitHubClient {
     }
 
     async fn send_get(&self, url: Url, accept: &'static str) -> Result<Response> {
+        if self.suppression.is_some()
+            && let Some(repo) = url.path_segments().and_then(|mut segments| {
+                (segments.next() == Some("repos")).then_some(())?;
+                GitHubRepo::new(segments.next()?, segments.next()?)
+            })
+            && self.repository_suppressed("", &repo.full_name())
+        {
+            return Err(RepositorySuppressed.into());
+        }
+        let mut waited = Duration::ZERO;
         for attempt in 0..MAX_ATTEMPTS {
-            let response_result = match self.request_gate.as_deref() {
-                Some(gate) => {
-                    let request = GitHubRequestAttemptV1 {
-                        provider: OutboundProviderV1::GitHub,
-                        resource: request_resource(&url),
-                        attempt: (attempt + 1) as u8,
-                        max_attempts: MAX_ATTEMPTS as u8,
-                    };
-                    let permit = gate
-                        .acquire(request)
+            let request = GitHubRequestAttemptV1 {
+                provider: OutboundProviderV1::GitHub,
+                resource: request_resource(&url),
+                attempt: (attempt + 1) as u8,
+                max_attempts: MAX_ATTEMPTS as u8,
+            };
+            let permit = if let Some(gate) = self.request_gate.as_deref() {
+                Some(
+                    gate.acquire(request)
                         .await
-                        .context("GitHub provider admission failed")?;
-                    let response_result = self.send_get_attempt(&url, accept).await;
-                    let outcome = match &response_result {
-                        Ok(response) => GitHubRequestOutcomeV1 {
-                            request,
-                            transport: GitHubRequestTransportV1::ResponseHeaders,
-                            status: Some(response.status().as_u16()),
-                            rate_limit: request_gate_rate_limit(response.headers()),
-                        },
-                        Err(error) => GitHubRequestOutcomeV1 {
-                            request,
-                            transport: request_transport(error),
-                            status: None,
-                            rate_limit: None,
-                        },
-                    };
-                    gate.finish(permit, outcome)
+                        .context("GitHub provider admission failed")?,
+                )
+            } else {
+                self.wait_for_cooldown(request.resource, &mut waited)
+                    .await?;
+                None
+            };
+            let mut response = match self.send_get_attempt(&url, accept).await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let (Some(gate), Some(permit)) = (self.request_gate.as_deref(), permit) {
+                        gate.finish(
+                            permit,
+                            GitHubRequestOutcomeV1 {
+                                request,
+                                transport: request_transport(&error),
+                                status: None,
+                                rate_limit: None,
+                            },
+                        )
                         .await
                         .context("GitHub provider outcome accounting failed")?;
-                    response_result
-                }
-                None => self.send_get_attempt(&url, accept).await,
-            };
-            let response = match response_result {
-                Ok(response) => response,
-                Err(error)
-                    if attempt + 1 < MAX_ATTEMPTS && (error.is_connect() || error.is_timeout()) =>
-                {
-                    tokio::time::sleep(short_backoff(attempt)).await;
-                    continue;
-                }
-                Err(error) => {
+                    }
+                    if attempt + 1 < MAX_ATTEMPTS
+                        && (error.is_connect() || error.is_timeout())
+                        && waited + short_backoff(attempt) <= MAX_SHORT_RETRY_AFTER
+                    {
+                        let delay = short_backoff(attempt);
+                        waited += delay;
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
                     return Err(error)
                         .with_context(|| format!("GitHub request failed for {}", url.path()));
                 }
             };
-            if response.status().is_success() {
-                return Ok(response);
+            let api_error = if response.status().is_success() {
+                None
+            } else {
+                Some(self.api_error(&mut response).await)
+            };
+            let mut rate_limit = request_gate_rate_limit(response.headers());
+            if is_secondary_limit(response.status(), rate_limit.as_ref(), api_error.as_ref()) {
+                rate_limit
+                    .get_or_insert_with(GitHubRequestRateLimitV1::default)
+                    .secondary_limit = true;
             }
+            let outcome = GitHubRequestOutcomeV1 {
+                request,
+                transport: GitHubRequestTransportV1::ResponseHeaders,
+                status: Some(response.status().as_u16()),
+                rate_limit,
+            };
+            if let (Some(gate), Some(permit)) = (self.request_gate.as_deref(), permit) {
+                gate.finish(permit, outcome.clone())
+                    .await
+                    .context("GitHub provider outcome accounting failed")?;
+            } else {
+                self.cooldowns
+                    .lock()
+                    .map_err(|_| anyhow!("GitHub cooldown state unavailable"))?
+                    .observe(&outcome, Utc::now());
+            }
+            let Some(api_error) = api_error else {
+                return Ok(response);
+            };
 
             if attempt + 1 < MAX_ATTEMPTS {
-                match retry_action(response.status(), response.headers(), attempt, Utc::now()) {
-                    RetryAction::RetryAfter(delay) => {
+                match retry_action(&outcome, attempt, Utc::now()) {
+                    RetryAction::RetryAfter(delay) if waited + delay <= MAX_SHORT_RETRY_AFTER => {
                         drop(response);
+                        waited += delay;
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    RetryAction::DoNotWaitForFarReset | RetryAction::DoNotRetry => {}
+                    _ => {}
                 }
             }
-            return Err(self.api_error(response).await.into());
+            if let Some(deadline) = outcome.rate_limit_retry_at(Utc::now()) {
+                return Err(
+                    anyhow!(GitHubRequestGateError::DeferredUntil(deadline)).context(api_error)
+                );
+            }
+            return Err(api_error.into());
         }
         unreachable!("GitHub request retry loop always returns")
+    }
+
+    async fn wait_for_cooldown(
+        &self,
+        resource: GitHubRequestResourceV1,
+        waited: &mut Duration,
+    ) -> Result<()> {
+        loop {
+            let deadline = self
+                .cooldowns
+                .lock()
+                .map_err(|_| anyhow!("GitHub cooldown state unavailable"))?
+                .deadline(resource);
+            let Some(deadline) = deadline.filter(|deadline| *deadline > Utc::now()) else {
+                return Ok(());
+            };
+            let delay = (deadline - Utc::now()).to_std().unwrap_or_default();
+            if *waited + delay > MAX_SHORT_RETRY_AFTER {
+                return Err(GitHubRequestGateError::DeferredUntil(deadline).into());
+            }
+            *waited += delay;
+            tokio::time::sleep(delay).await;
+        }
     }
 
     async fn send_get_attempt(&self, url: &Url, accept: &'static str) -> reqwest::Result<Response> {
@@ -1047,10 +1248,10 @@ impl GitHubClient {
             .await
     }
 
-    async fn api_error(&self, mut response: Response) -> GitHubApiError {
+    async fn api_error(&self, response: &mut Response) -> GitHubApiError {
         let status = response.status();
         let rate_limit = GitHubRateLimit::from_headers(response.headers());
-        let body = read_error_body(&mut response, &self.usage.downloaded_bytes).await;
+        let body = read_error_body(response, &self.usage.downloaded_bytes).await;
         let envelope = serde_json::from_slice::<ApiErrorResponse>(&body).ok();
         let raw_message = envelope
             .as_ref()
@@ -1069,7 +1270,9 @@ impl GitHubClient {
         GitHubApiError {
             status,
             message: self.redact(&raw_message),
-            documentation_url: envelope.and_then(|error| error.documentation_url),
+            documentation_url: envelope
+                .and_then(|error| error.documentation_url)
+                .map(|url| self.redact(&url)),
             rate_limit,
         }
     }
@@ -1149,7 +1352,30 @@ fn request_gate_rate_limit(headers: &HeaderMap) -> Option<GitHubRequestRateLimit
             .map(GitHubRateResourceV1::from_header),
         retry_after_seconds,
         retry_after_at,
+        secondary_limit: false,
     })
+}
+
+fn is_secondary_limit(
+    status: StatusCode,
+    rate: Option<&GitHubRequestRateLimitV1>,
+    error: Option<&GitHubApiError>,
+) -> bool {
+    if status == StatusCode::TOO_MANY_REQUESTS
+        && !rate.is_some_and(|rate| rate.remaining == Some(0))
+    {
+        return true;
+    }
+    matches!(
+        status,
+        StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+    ) && (rate
+        .is_some_and(|rate| rate.retry_after_seconds.is_some() || rate.retry_after_at.is_some())
+        || error.is_some_and(|error| {
+            let message = error.message.to_ascii_lowercase();
+            message.contains("secondary rate limit")
+                || message.contains("abuse detection mechanism")
+        }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1195,6 +1421,11 @@ struct SearchResponse<T> {
     items: Vec<T>,
 }
 
+#[derive(Deserialize)]
+struct InstallationRepositories {
+    repositories: Vec<GitHubRepository>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiErrorResponse {
     #[serde(default)]
@@ -1211,45 +1442,41 @@ enum RetryAction {
 }
 
 fn retry_action(
-    status: StatusCode,
-    headers: &HeaderMap,
+    outcome: &GitHubRequestOutcomeV1,
     attempt: usize,
     now: DateTime<Utc>,
 ) -> RetryAction {
-    let transient = matches!(
-        status,
-        StatusCode::REQUEST_TIMEOUT
-            | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::INTERNAL_SERVER_ERROR
-            | StatusCode::BAD_GATEWAY
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT
-    ) || (status == StatusCode::FORBIDDEN && headers.contains_key(RETRY_AFTER));
+    if let Some(deadline) = outcome.rate_limit_retry_at(now) {
+        let delay = (deadline - now).to_std().unwrap_or_default();
+        return if delay <= MAX_SHORT_RETRY_AFTER {
+            RetryAction::RetryAfter(delay)
+        } else {
+            RetryAction::DoNotWaitForFarReset
+        };
+    }
+    let transient = outcome
+        .status
+        .is_some_and(|status| status == 408 || (500..600).contains(&status));
     if !transient {
         return RetryAction::DoNotRetry;
     }
 
-    if let Some(retry_after) = headers
-        .get(RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-    {
-        let delay = retry_after
-            .parse::<u64>()
-            .ok()
+    let delay = outcome.rate_limit.as_ref().and_then(|rate| {
+        rate.retry_after_seconds
             .map(Duration::from_secs)
-            .or_else(|| {
-                DateTime::parse_from_rfc2822(retry_after).ok().map(|then| {
-                    let milliseconds = (then.with_timezone(&Utc) - now).num_milliseconds().max(0);
-                    Duration::from_millis(milliseconds as u64)
-                })
-            });
-        if let Some(delay) = delay {
-            return if delay <= MAX_SHORT_RETRY_AFTER {
-                RetryAction::RetryAfter(delay)
-            } else {
-                RetryAction::DoNotWaitForFarReset
-            };
-        }
+            .into_iter()
+            .chain(
+                rate.retry_after_at
+                    .map(|at| (at - now).to_std().unwrap_or_default()),
+            )
+            .max()
+    });
+    if let Some(delay) = delay {
+        return if delay <= MAX_SHORT_RETRY_AFTER {
+            RetryAction::RetryAfter(delay)
+        } else {
+            RetryAction::DoNotWaitForFarReset
+        };
     }
 
     RetryAction::RetryAfter(short_backoff(attempt))
@@ -1562,6 +1789,162 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(client.usage().requests, 1);
+    }
+
+    #[tokio::test]
+    async fn headerless_limit_blocks_clones_without_another_http_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({"message": "slow down"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&server, None);
+        let clone = client.clone();
+        let repo = GitHubRepo::new("acme", "widget").unwrap();
+        let before = Utc::now();
+        let error = client.repository(&repo).await.unwrap_err();
+        let Some(GitHubRequestGateError::DeferredUntil(deadline)) = error.downcast_ref() else {
+            panic!("expected structured deferral: {error:#}");
+        };
+        assert!(*deadline >= before + chrono::TimeDelta::seconds(60));
+        assert!(
+            clone
+                .repository(&repo)
+                .await
+                .unwrap_err()
+                .downcast_ref::<GitHubRequestGateError>()
+                .is_some()
+        );
+        assert_eq!(client.usage().requests, 1);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn secondary_message_is_classified_before_gate_feedback() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "message": "You have exceeded a secondary rate limit. secret-token"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gate = Arc::new(RecordingGate::default());
+        let error = test_client(&server, Some("secret-token".to_owned()))
+            .with_gate(gate.clone())
+            .repository(&GitHubRepo::new("acme", "widget").unwrap())
+            .await
+            .unwrap_err();
+        let events = gate.events();
+        let GateEvent::Finish(outcome) = &events[1] else {
+            panic!("missing outcome");
+        };
+        assert!(outcome.is_secondary_rate_limit());
+        assert!(!format!("{events:?} {error:#}").contains("secret-token"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn successful_exhaustion_blocks_only_subsequent_primary_requests() {
+        let server = MockServer::start().await;
+        let reset = (Utc::now() + chrono::TimeDelta::minutes(5))
+            .timestamp()
+            .to_string();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .insert_header("x-ratelimit-reset", reset.as_str())
+                    .set_body_json(repository_json("acme", "widget", 42)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&server, None);
+        let repo = GitHubRepo::new("acme", "widget").unwrap();
+        assert_eq!(client.repository(&repo).await.unwrap().id, 42);
+        assert!(
+            client
+                .clone()
+                .repository(&repo)
+                .await
+                .unwrap_err()
+                .downcast_ref::<GitHubRequestGateError>()
+                .is_some()
+        );
+        assert!(
+            client
+                .cooldowns
+                .lock()
+                .unwrap()
+                .deadline(GitHubRequestResourceV1::Search)
+                .is_none()
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_forbidden_is_not_retried_or_given_a_cooldown() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"message": "Resource not accessible"})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = test_client(&server, None);
+        let repo = GitHubRepo::new("acme", "widget").unwrap();
+        for _ in 0..2 {
+            assert!(
+                client
+                    .repository(&repo)
+                    .await
+                    .unwrap_err()
+                    .downcast_ref::<GitHubApiError>()
+                    .is_some()
+            );
+        }
+        assert!(
+            client
+                .cooldowns
+                .lock()
+                .unwrap()
+                .deadline(GitHubRequestResourceV1::Core)
+                .is_none()
+        );
+        server.verify().await;
+    }
+
+    #[test]
+    fn concurrent_success_cannot_shorten_an_existing_cooldown() {
+        let now = Utc::now();
+        let mut cooldowns = GitHubCooldowns::default();
+        let mut outcome = GitHubRequestOutcomeV1 {
+            request: GitHubRequestAttemptV1 {
+                provider: OutboundProviderV1::GitHub,
+                resource: GitHubRequestResourceV1::Core,
+                attempt: 1,
+                max_attempts: 3,
+            },
+            transport: GitHubRequestTransportV1::ResponseHeaders,
+            status: Some(429),
+            rate_limit: Some(GitHubRequestRateLimitV1 {
+                secondary_limit: true,
+                retry_after_seconds: Some(300),
+                ..GitHubRequestRateLimitV1::default()
+            }),
+        };
+        cooldowns.observe(&outcome, now);
+        outcome.status = Some(200);
+        outcome.rate_limit = None;
+        cooldowns.observe(&outcome, now);
+        assert_eq!(
+            cooldowns.deadline(GitHubRequestResourceV1::Search),
+            Some(now + chrono::TimeDelta::seconds(300))
+        );
     }
 
     #[test]
@@ -2286,36 +2669,122 @@ mod tests {
     }
 
     #[test]
+    fn environment_resolution_preserves_kind_and_precedence_without_secret_inspection() {
+        let credential = credential_from_environment(|name| match name {
+            "GITHUB_APP_TOKEN" => Some("opaque-installation".to_owned()),
+            "GITHUB_TOKEN" => Some("user-token".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(credential.kind, GitHubCredentialKind::Installation);
+        assert_eq!(credential.token, "opaque-installation");
+        let credential = credential_from_environment(|name| match name {
+            "GITHUB_APP_TOKEN" => Some("  ".to_owned()),
+            "GH_TOKEN" => Some("opaque-personal".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(credential.kind, GitHubCredentialKind::User);
+        assert_eq!(credential.token, "opaque-personal");
+    }
+
+    #[tokio::test]
+    async fn installation_inventory_uses_its_envelope_and_fixed_page_size() {
+        let server = MockServer::start().await;
+        for page in 1..=2 {
+            let items = ((page - 1) * 100 + 1..=page * 100)
+                .map(|id| repository_json("acme", &format!("widget-{id:03}"), id))
+                .collect::<Vec<_>>();
+            Mock::given(method("GET"))
+                .and(path("/installation/repositories"))
+                .and(query_param("per_page", "100"))
+                .and(query_param("page", page.to_string()))
+                .and(query_param_is_missing("visibility"))
+                .and(query_param_is_missing("affiliation"))
+                .and(query_param_is_missing("sort"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "total_count": 200,
+                    "repositories": items
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let mut client = test_client(&server, Some("installation-token".to_owned()));
+        client.credential_kind = GitHubCredentialKind::Installation;
+        let inventory = client.credential_visible_repositories(150).await.unwrap();
+        assert!(!inventory.complete);
+        assert_eq!(inventory.items.len(), 150);
+        assert_eq!(inventory.items[0].id, 1);
+        assert_eq!(inventory.items[149].id, 150);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_cooldown_wait_does_not_send_or_hold_the_lock() {
+        let server = MockServer::start().await;
+        let client = test_client(&server, None);
+        client.cooldowns.lock().unwrap().secondary =
+            Some(Utc::now() + chrono::TimeDelta::seconds(4));
+        let repo = GitHubRepo::new("acme", "widget").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), client.repository(&repo))
+                .await
+                .is_err()
+        );
+        assert!(client.cooldowns.try_lock().is_ok());
+        assert_eq!(client.usage().requests, 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
     fn retries_only_transient_statuses_and_short_delays() {
         let now = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let mut headers = HeaderMap::new();
+        let action = |status: StatusCode, headers: &HeaderMap, attempt| {
+            retry_action(
+                &GitHubRequestOutcomeV1 {
+                    request: GitHubRequestAttemptV1 {
+                        provider: OutboundProviderV1::GitHub,
+                        resource: GitHubRequestResourceV1::Core,
+                        attempt: 1,
+                        max_attempts: 3,
+                    },
+                    transport: GitHubRequestTransportV1::ResponseHeaders,
+                    status: Some(status.as_u16()),
+                    rate_limit: request_gate_rate_limit(headers),
+                },
+                attempt,
+                now,
+            )
+        };
         headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
         assert_eq!(
-            retry_action(StatusCode::TOO_MANY_REQUESTS, &headers, 0, now),
+            action(StatusCode::TOO_MANY_REQUESTS, &headers, 0),
             RetryAction::RetryAfter(Duration::from_secs(2))
         );
         headers.insert(RETRY_AFTER, HeaderValue::from_static("60"));
         assert_eq!(
-            retry_action(StatusCode::TOO_MANY_REQUESTS, &headers, 0, now),
+            action(StatusCode::TOO_MANY_REQUESTS, &headers, 0),
             RetryAction::DoNotWaitForFarReset
         );
         assert_eq!(
-            retry_action(StatusCode::FORBIDDEN, &HeaderMap::new(), 0, now),
+            action(StatusCode::FORBIDDEN, &HeaderMap::new(), 0),
             RetryAction::DoNotRetry
         );
         headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
         assert_eq!(
-            retry_action(StatusCode::FORBIDDEN, &headers, 0, now),
+            action(StatusCode::FORBIDDEN, &headers, 0),
             RetryAction::RetryAfter(Duration::from_secs(2))
         );
         assert_eq!(
-            retry_action(StatusCode::REQUEST_TIMEOUT, &HeaderMap::new(), 0, now),
+            action(StatusCode::REQUEST_TIMEOUT, &HeaderMap::new(), 0),
             RetryAction::RetryAfter(Duration::from_millis(100))
         );
         assert_eq!(
-            retry_action(StatusCode::BAD_GATEWAY, &HeaderMap::new(), 1, now),
+            action(StatusCode::BAD_GATEWAY, &HeaderMap::new(), 1),
             RetryAction::RetryAfter(Duration::from_millis(200))
         );
     }

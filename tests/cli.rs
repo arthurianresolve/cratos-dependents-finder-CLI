@@ -55,6 +55,54 @@ fn top_level_help_describes_non_exhaustive_inventory() {
 }
 
 #[test]
+fn github_provider_commands_require_control_listener_and_service_token_configuration() {
+    for action in ["status", "resume"] {
+        cargo_bin_cmd!("crate-dependent-repos")
+            .args(["coordinator", "github", action, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--control-url"))
+            .stdout(predicate::str::contains("--token-file"))
+            .stdout(predicate::str::contains("--token-env"));
+    }
+    command_without_network()
+        .args([
+            "coordinator",
+            "github",
+            "status",
+            "--control-url",
+            "http://localhost:8444",
+            "--ca",
+            "unused",
+            "--certificate",
+            "unused",
+            "--private-key",
+            "unused",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("HTTPS"));
+}
+
+#[test]
+fn privacy_commands_require_explicit_scope_and_reusable_removal_identity() {
+    for action in ["plan", "remove", "status", "retry"] {
+        cargo_bin_cmd!("crate-dependent-repos")
+            .args(["coordinator", "privacy", action, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--control-url"))
+            .stdout(predicate::str::contains("--token-file"));
+    }
+    cargo_bin_cmd!("crate-dependent-repos")
+        .args(["coordinator", "privacy", "remove", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--request-id"))
+        .stdout(predicate::str::contains("--plan"));
+}
+
+#[test]
 fn clap_usage_errors_exit_with_code_two() {
     cargo_bin_cmd!("crate-dependent-repos")
         .assert()

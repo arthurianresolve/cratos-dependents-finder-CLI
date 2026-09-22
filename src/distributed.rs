@@ -161,6 +161,7 @@ impl GitHubRequestGate for CoordinatorGitHubRequestGate {
                 PermitDecision::CapacityExhausted | PermitDecision::HalfOpenProbeInFlight => Err(
                     GitHubRequestGateError::DeferredUntil(self.deferred_for_capacity()),
                 ),
+                PermitDecision::Suspended => Err(GitHubRequestGateError::Suspended),
             }
         })
     }
@@ -525,6 +526,8 @@ fn provider_feedback_from_request(outcome: &GitHubRequestOutcomeV1) -> ProviderF
         .rate_limit
         .as_ref()
         .map(|rate| RateLimitObservationV1 {
+            secondary_limit: rate.secondary_limit,
+            shared_control_version: 1,
             remaining: rate.remaining,
             reset_at: rate
                 .reset_epoch
@@ -535,14 +538,19 @@ fn provider_feedback_from_request(outcome: &GitHubRequestOutcomeV1) -> ProviderF
                     u64::try_from(
                         retry_at
                             .signed_duration_since(Utc::now())
-                            .num_seconds()
-                            .max(0),
+                            .num_milliseconds()
+                            .max(0)
+                            .saturating_add(999)
+                            / 1_000,
                     )
                     .ok()
                 })
             }),
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| RateLimitObservationV1 {
+            shared_control_version: 1,
+            ..RateLimitObservationV1::default()
+        });
     let outcome_class = match outcome.transport {
         GitHubRequestTransportV1::ConnectFailure | GitHubRequestTransportV1::TransportFailure => {
             ProviderOutcomeClassV1::TransportFailure
@@ -550,7 +558,8 @@ fn provider_feedback_from_request(outcome: &GitHubRequestOutcomeV1) -> ProviderF
         GitHubRequestTransportV1::Timeout => ProviderOutcomeClassV1::Timeout,
         GitHubRequestTransportV1::ResponseHeaders => {
             let status = outcome.status.unwrap_or_default();
-            if status == 429
+            if observation.secondary_limit
+                || status == 429
                 || (status == 403
                     && (observation.remaining == Some(0)
                         || observation.retry_after_seconds.is_some()))
@@ -592,6 +601,7 @@ fn provider_defer(
                 deferred_after(unavailable_delay),
                 "github_admission_unavailable",
             )),
+            GitHubRequestGateError::Suspended => Some((Utc::now(), "github_provider_suspended")),
             GitHubRequestGateError::Rejected | GitHubRequestGateError::Protocol => None,
         }
     })
@@ -606,7 +616,9 @@ fn classify_task_failure(error: &anyhow::Error) -> TaskFailureClassV1 {
     for source in error.chain() {
         if let Some(error) = source.downcast_ref::<GitHubRequestGateError>() {
             return match error {
-                GitHubRequestGateError::DeferredUntil(_) => TaskFailureClassV1::ProviderRateLimited,
+                GitHubRequestGateError::DeferredUntil(_) | GitHubRequestGateError::Suspended => {
+                    TaskFailureClassV1::ProviderRateLimited
+                }
                 GitHubRequestGateError::Unavailable => TaskFailureClassV1::AnalysisTransient,
                 GitHubRequestGateError::Rejected => TaskFailureClassV1::ProviderAuthorization,
                 GitHubRequestGateError::Protocol => TaskFailureClassV1::AnalysisPermanent,
@@ -1070,6 +1082,7 @@ mod tests {
                 resource: Some(crate::github::GitHubRateResourceV1::Core),
                 retry_after_seconds: Some(17),
                 retry_after_at: None,
+                secondary_limit: false,
             }),
         });
         assert_eq!(feedback.outcome, ProviderOutcomeClassV1::RateLimited);

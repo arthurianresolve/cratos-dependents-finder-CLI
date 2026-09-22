@@ -1,6 +1,7 @@
 //! Encrypted, single-owner Turso journal for the coordinator state machine.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
@@ -96,6 +97,16 @@ struct JournalAppend {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DurableCommandV1 {
+    PrivacyCancelTasks {
+        task_ids: Vec<TaskId>,
+        now: DateTime<Utc>,
+    },
+    PrivacyRemoveArtifacts {
+        task_ids: Vec<TaskId>,
+    },
+    PrivacyRemoveFailedAttempts {
+        keys: Vec<FailedAttemptProjectionKeyV1>,
+    },
     /// Apply a command to the independent control-plane aggregate. The
     /// aggregate shares this authenticated journal without coupling its jobs
     /// or tasks to the legacy worker state machine.
@@ -143,6 +154,12 @@ pub enum DurableCommandV1 {
         lease_id: String,
         lease_seconds: u64,
         now: DateTime<Utc>,
+    },
+    /// Replay-only form; freezes the live selection across policy changes.
+    LeaseSelectedTask {
+        task_id: TaskId,
+        lease: super::LeaseV1,
+        global_cursor: Option<JobId>,
     },
     LeaseNextAuthorizedTask {
         authorization: AgentAuthorizationV1,
@@ -258,6 +275,9 @@ pub enum DurableCommandV1 {
     ConfigureProvider {
         key: ProviderKeyV1,
         policy: ProviderPolicyV1,
+    },
+    ResumeGithubProvider {
+        now: DateTime<Utc>,
     },
     AcquireProviderPermit {
         key: ProviderKeyV1,
@@ -382,6 +402,37 @@ pub enum FailedAttemptProjectionOutcomeV1 {
 type ReuseIndex = BTreeMap<(CacheNamespaceV1, ReuseFingerprintV1), BTreeSet<TaskId>>;
 
 enum ActorRequest {
+    ShutdownOffline {
+        response: oneshot::Sender<Result<(), String>>,
+    },
+    PrivacyTaskPage {
+        after: Option<TaskId>,
+        response: oneshot::Sender<Vec<RepositoryTaskV1>>,
+    },
+    ArtifactPage {
+        after: Option<TaskId>,
+        response: oneshot::Sender<Vec<ArtifactRecordV1>>,
+    },
+    ArtifactReferenced {
+        key: CacheKeyV1,
+        except: Option<TaskId>,
+        response: oneshot::Sender<bool>,
+    },
+    PrivacyFailedPage {
+        after: Option<FailedAttemptProjectionKeyV1>,
+        response: oneshot::Sender<Vec<FailedAttemptProjectionRecordV1>>,
+    },
+    AdoptPrivacyDeployment {
+        deployment_id: String,
+        response: oneshot::Sender<Result<(), String>>,
+    },
+    PrivacyLedger {
+        response: oneshot::Sender<Result<crate::privacy::SuppressionLedgerV1, String>>,
+    },
+    PutPrivacyRecord {
+        record: crate::privacy::RemovalRequestV1,
+        response: oneshot::Sender<Result<(), String>>,
+    },
     Apply {
         command: Box<DurableCommandV1>,
         response: oneshot::Sender<Result<DurableOutcomeV1, String>>,
@@ -395,6 +446,9 @@ enum ActorRequest {
     },
     ControlSnapshot {
         response: oneshot::Sender<ControlStateSnapshotV1>,
+    },
+    GithubProviderStatus {
+        response: oneshot::Sender<super::GithubProviderStatusV1>,
     },
     ControlSchedule {
         schedule_id: ScheduleId,
@@ -474,6 +528,7 @@ enum ActorRequest {
     },
     Backup {
         destination: PathBuf,
+        legacy_only: bool,
         response: oneshot::Sender<Result<BackupManifestV1, String>>,
     },
     Compact {
@@ -503,6 +558,93 @@ pub struct TursoCoordinatorStore {
 }
 
 impl TursoCoordinatorStore {
+    pub(crate) async fn shutdown_offline(self) -> Result<()> {
+        ensure!(
+            self.sender.strong_count() == 1,
+            "offline shutdown requires exclusive store ownership"
+        );
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::ShutdownOffline { response })
+            .await?;
+        result.await?.map_err(anyhow::Error::msg)
+    }
+    pub async fn privacy_task_page(&self, after: Option<TaskId>) -> Result<Vec<RepositoryTaskV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::PrivacyTaskPage { after, response })
+            .await?;
+        Ok(result.await?)
+    }
+
+    pub async fn artifact_page(&self, after: Option<TaskId>) -> Result<Vec<ArtifactRecordV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::ArtifactPage { after, response })
+            .await?;
+        Ok(result.await?)
+    }
+
+    pub async fn artifact_referenced_except(
+        &self,
+        key: CacheKeyV1,
+        except: Option<TaskId>,
+    ) -> Result<bool> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::ArtifactReferenced {
+                key,
+                except,
+                response,
+            })
+            .await?;
+        Ok(result.await?)
+    }
+
+    pub async fn privacy_failed_page(
+        &self,
+        after: Option<FailedAttemptProjectionKeyV1>,
+    ) -> Result<Vec<FailedAttemptProjectionRecordV1>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::PrivacyFailedPage { after, response })
+            .await?;
+        Ok(result.await?)
+    }
+
+    pub(crate) async fn adopt_privacy_deployment(&self, deployment_id: String) -> Result<()> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::AdoptPrivacyDeployment {
+                deployment_id,
+                response,
+            })
+            .await?;
+        result.await?.map_err(anyhow::Error::msg)
+    }
+    pub async fn privacy_ledger(&self) -> Result<crate::privacy::SuppressionLedgerV1> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::PrivacyLedger { response })
+            .await
+            .context("coordinator actor unavailable")?;
+        result
+            .await
+            .context("coordinator actor stopped")?
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub async fn put_privacy_record(&self, record: crate::privacy::RemovalRequestV1) -> Result<()> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::PutPrivacyRecord { record, response })
+            .await
+            .context("coordinator actor unavailable")?;
+        result
+            .await
+            .context("coordinator actor stopped")?
+            .map_err(anyhow::Error::msg)
+    }
     pub async fn open(database_path: impl Into<PathBuf>, key: EnvelopeKey) -> Result<Self> {
         let requested_path = database_path.into();
         let file_name = requested_path
@@ -530,6 +672,7 @@ impl TursoCoordinatorStore {
         let connection = database.connect().context("connecting to embedded Turso")?;
         migrate(&connection).await?;
         let loaded = replay(&connection, &key).await?;
+        let privacy = super::privacy_store::load(&connection, &key).await?;
 
         let (sender, receiver) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
         tokio::spawn(run_actor(
@@ -544,6 +687,7 @@ impl TursoCoordinatorStore {
             loaded.failed_attempt_projections,
             loaded.reuse_index,
             loaded.journal,
+            privacy,
             owner_lock.clone(),
         ));
         Ok(Self {
@@ -596,6 +740,17 @@ impl TursoCoordinatorStore {
         let (response, result) = oneshot::channel();
         self.sender
             .send(ActorRequest::ControlSnapshot { response })
+            .await
+            .map_err(|_| anyhow!("coordinator state actor stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow!("coordinator state actor dropped response"))
+    }
+
+    pub async fn github_provider_status(&self) -> Result<super::GithubProviderStatusV1> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(ActorRequest::GithubProviderStatus { response })
             .await
             .map_err(|_| anyhow!("coordinator state actor stopped"))?;
         result
@@ -901,10 +1056,26 @@ impl TursoCoordinatorStore {
 
     /// Checkpoint and copy the database while the actor prevents writes.
     pub async fn backup(&self, destination: impl Into<PathBuf>) -> Result<BackupManifestV1> {
+        self.backup_with_format(destination.into(), false).await
+    }
+
+    pub(crate) async fn backup_legacy(
+        &self,
+        destination: impl Into<PathBuf>,
+    ) -> Result<BackupManifestV1> {
+        self.backup_with_format(destination.into(), true).await
+    }
+
+    async fn backup_with_format(
+        &self,
+        destination: PathBuf,
+        legacy_only: bool,
+    ) -> Result<BackupManifestV1> {
         let (response, result) = oneshot::channel();
         self.sender
             .send(ActorRequest::Backup {
-                destination: destination.into(),
+                destination,
+                legacy_only,
                 response,
             })
             .await
@@ -979,19 +1150,9 @@ impl TursoCoordinatorStore {
 
     pub fn restore(backup: &Path, manifest: &BackupManifestV1, destination: &Path) -> Result<()> {
         ensure!(
-            manifest.schema_version == DATABASE_SCHEMA_VERSION,
+            matches!(manifest.schema_version, DATABASE_SCHEMA_VERSION | 2),
             "unsupported backup schema {}",
             manifest.schema_version
-        );
-        let bytes = fs::read(backup)
-            .with_context(|| format!("reading backup database {}", backup.display()))?;
-        ensure!(
-            bytes.len() as u64 == manifest.database_bytes,
-            "backup size does not match manifest"
-        );
-        ensure!(
-            sha256_hex(&bytes) == manifest.database_sha256,
-            "backup SHA-256 does not match manifest"
         );
         if destination.exists() {
             bail!(
@@ -999,19 +1160,11 @@ impl TursoCoordinatorStore {
                 destination.display()
             );
         }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating restore directory {}", parent.display()))?;
-        }
-        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-        let mut temp = tempfile::NamedTempFile::new_in(parent)
-            .with_context(|| format!("creating restore file beside {}", destination.display()))?;
-        use std::io::Write as _;
-        temp.write_all(&bytes)?;
-        temp.as_file_mut().sync_all()?;
-        temp.persist_noclobber(destination)
-            .map_err(|error| error.error)
-            .with_context(|| format!("restoring database {}", destination.display()))?;
+        copy_database_streamed(
+            backup,
+            destination,
+            Some((manifest.database_bytes, &manifest.database_sha256)),
+        )?;
         Ok(())
     }
 }
@@ -1074,12 +1227,122 @@ async fn run_actor(
     >,
     mut reuse_index: ReuseIndex,
     mut journal: JournalState,
+    mut privacy: crate::privacy::SuppressionLedgerV1,
     _owner_lock: Arc<File>,
 ) {
     let mut automatic_compaction = AutomaticCompaction::default();
+    let mut privacy_targets: Arc<[crate::privacy::SuppressionTargetV1]> = privacy
+        .records
+        .iter()
+        .map(|record| record.target.clone())
+        .collect();
     while let Some(request) = receiver.recv().await {
+        memory.set_privacy_targets(privacy_targets.clone());
         match request {
+            ActorRequest::ShutdownOffline { response } => {
+                let result = async {
+                    let mut rows = connection
+                        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+                        .await?;
+                    while rows.next().await?.is_some() {}
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+                .map_err(|error| error.to_string());
+                drop(connection);
+                drop(_database);
+                drop(_owner_lock);
+                let _ = response.send(result);
+                return;
+            }
+            ActorRequest::PrivacyTaskPage { after, response } => {
+                let _ = response.send(
+                    memory.privacy_task_page(after.as_ref(), crate::privacy::REMOVAL_BATCH_SIZE),
+                );
+            }
+            ActorRequest::ArtifactPage { after, response } => {
+                use std::ops::Bound::{Excluded, Unbounded};
+                let _ = response.send(
+                    artifacts
+                        .range((after.as_ref().map_or(Unbounded, Excluded), Unbounded))
+                        .take(crate::privacy::REMOVAL_BATCH_SIZE)
+                        .map(|(_, record)| record.clone())
+                        .collect(),
+                );
+            }
+            ActorRequest::ArtifactReferenced {
+                key,
+                except,
+                response,
+            } => {
+                let _ = response.send(artifacts.values().any(|record| {
+                    record.metadata.key == key && except.as_ref() != Some(&record.task_id)
+                }));
+            }
+            ActorRequest::PrivacyFailedPage { after, response } => {
+                use std::ops::Bound::{Excluded, Unbounded};
+                let _ = response.send(
+                    failed_attempt_projections
+                        .range((after.as_ref().map_or(Unbounded, Excluded), Unbounded))
+                        .take(crate::privacy::REMOVAL_BATCH_SIZE)
+                        .map(|(_, record)| record.clone())
+                        .collect(),
+                );
+            }
+            ActorRequest::AdoptPrivacyDeployment {
+                deployment_id,
+                response,
+            } => {
+                let result = super::privacy_store::adopt_deployment(
+                    &connection,
+                    &key,
+                    deployment_id.clone(),
+                )
+                .await
+                .map_err(|error| error.to_string());
+                if result.is_ok() {
+                    privacy.deployment_id = deployment_id;
+                }
+                let _ = response.send(result);
+            }
+            ActorRequest::PrivacyLedger { response } => {
+                let _ = response.send(Ok(privacy.clone()));
+            }
+            ActorRequest::PutPrivacyRecord { record, response } => {
+                let result = super::privacy_store::put(&connection, &key, &record)
+                    .await
+                    .map_err(|error| error.to_string());
+                if result.is_ok() {
+                    if let Some(existing) = privacy
+                        .records
+                        .iter_mut()
+                        .find(|item| item.request_id == record.request_id)
+                    {
+                        *existing = record;
+                    } else {
+                        privacy.revision = record.revision;
+                        privacy.records.push(record);
+                        privacy_targets = privacy
+                            .records
+                            .iter()
+                            .map(|record| record.target.clone())
+                            .collect();
+                    }
+                }
+                let _ = response.send(result);
+            }
             ActorRequest::Apply { command, response } => {
+                match validate_privacy_command(&privacy, &memory, &artifacts, &command) {
+                    Ok(Some(outcome)) => {
+                        let _ = response.send(Ok(outcome));
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = response.send(Err(error.to_string()));
+                        continue;
+                    }
+                    Ok(None) => {}
+                }
                 let result = apply_and_persist(
                     &connection,
                     &key,
@@ -1104,6 +1367,9 @@ async fn run_actor(
             }
             ActorRequest::ControlSnapshot { response } => {
                 let _ = response.send(control.snapshot());
+            }
+            ActorRequest::GithubProviderStatus { response } => {
+                let _ = response.send(memory.github_provider_status());
             }
             ActorRequest::ControlSchedule {
                 schedule_id,
@@ -1220,6 +1486,7 @@ async fn run_actor(
             }
             ActorRequest::Backup {
                 destination,
+                legacy_only,
                 response,
             } => {
                 let result = async {
@@ -1238,6 +1505,7 @@ async fn run_actor(
                         &database_path,
                         &destination,
                         journal.total_commands,
+                        legacy_only,
                     )
                     .await
                 }
@@ -1443,6 +1711,16 @@ async fn apply_and_persist(
     automatic_compaction: &mut AutomaticCompaction,
     command: &DurableCommandV1,
 ) -> Result<DurableOutcomeV1> {
+    ensure!(
+        !matches!(command, DurableCommandV1::LeaseSelectedTask { .. }),
+        "selected leases are journal-only commands"
+    );
+    // Resolve live eligibility before journaling. Legacy commands replay with
+    // their original authorization, independent of today's credential policy.
+    let Some(command) = live_credential_command(memory, control, command)? else {
+        return Ok(DurableOutcomeV1::Task(None));
+    };
+    let command = command.as_ref();
     validate_artifact_command(memory, artifacts, command)?;
     validate_failed_attempt_projection_command(memory, failed_attempt_projections, command)?;
     let control_generation = control.generation();
@@ -1472,7 +1750,22 @@ async fn apply_and_persist(
     {
         return Ok(outcome);
     }
-    let appended = match append(connection, key, command).await {
+    let selected_lease = match (command, &outcome) {
+        (
+            DurableCommandV1::LeaseNextTask { .. }
+            | DurableCommandV1::LeaseNextAuthorizedTask { .. },
+            DurableOutcomeV1::Task(Some(task)),
+        ) => Some(DurableCommandV1::LeaseSelectedTask {
+            task_id: task.id.clone(),
+            lease: task
+                .lease
+                .clone()
+                .expect("successful leasing returns lease metadata"),
+            global_cursor: memory.global_lease_cursor(),
+        }),
+        _ => None,
+    };
+    let appended = match append(connection, key, selected_lease.as_ref().unwrap_or(command)).await {
         Ok(appended) => appended,
         Err(error) => {
             let restored = replay(connection, key).await.unwrap_or_else(|replay_error| {
@@ -1521,6 +1814,65 @@ async fn apply_and_persist(
         }
     }
     Ok(outcome)
+}
+
+fn live_credential_command<'a>(
+    memory: &InMemoryStateStore,
+    control: &ControlState,
+    command: &'a DurableCommandV1,
+) -> Result<Option<Cow<'a, DurableCommandV1>>> {
+    match command {
+        DurableCommandV1::LeaseNextTask { job_id, now, .. } => {
+            if let Some(job) = memory.job(job_id)
+                && job.spec.repository_scope == RepositoryScopeV1::AllVisible
+                && !job
+                    .spec
+                    .credential_profile_id
+                    .as_deref()
+                    .and_then(|id| control.credential_profile(id))
+                    .is_some_and(|profile| profile.is_github_eligible(*now))
+            {
+                return Ok(None);
+            }
+        }
+        DurableCommandV1::LeaseNextAuthorizedTask {
+            authorization,
+            agent_id,
+            lease_id,
+            lease_seconds,
+            now,
+        } if !authorization.private_credential_profiles.is_empty() => {
+            let mut authorization = authorization.clone();
+            authorization.private_credential_profiles.retain(|id| {
+                control
+                    .credential_profile(id)
+                    .is_some_and(|profile| profile.is_github_eligible(*now))
+            });
+            return Ok(Some(Cow::Owned(
+                DurableCommandV1::LeaseNextAuthorizedTask {
+                    authorization,
+                    agent_id: agent_id.clone(),
+                    lease_id: lease_id.clone(),
+                    lease_seconds: *lease_seconds,
+                    now: *now,
+                },
+            )));
+        }
+        DurableCommandV1::AcquireProviderPermit { key, now, .. }
+            if key.provider == "github"
+                && (key.resource == "repository_analysis:all_visible"
+                    || key.resource.starts_with("request:all_visible:")) =>
+        {
+            ensure!(
+                control
+                    .credential_profile(&key.principal_id)
+                    .is_some_and(|profile| profile.is_github_eligible(*now)),
+                "credential profile is unavailable"
+            );
+        }
+        _ => {}
+    }
+    Ok(Some(Cow::Borrowed(command)))
 }
 
 fn outcome_reduced_state(outcome: &DurableOutcomeV1) -> bool {
@@ -1648,7 +2000,7 @@ async fn migrate(connection: &turso::Connection) -> Result<()> {
     if let Some(row) = rows.next().await? {
         let version: String = row.get(0)?;
         ensure!(
-            version == DATABASE_SCHEMA_VERSION.to_string(),
+            version == DATABASE_SCHEMA_VERSION.to_string() || version == "2",
             "unsupported coordinator database schema {version}"
         );
     } else {
@@ -1976,12 +2328,34 @@ async fn append(
     )?;
     let stored_bytes = payload.len() as u64;
     connection.execute_batch("BEGIN IMMEDIATE").await?;
-    let inserted = connection
-        .execute(
-            "INSERT INTO coordinator_journal (record_id, key_id, payload) VALUES (?1, ?2, ?3)",
-            turso::params![record_id, key.key_id(), payload],
-        )
-        .await;
+    let requires_current_reader = match command {
+        DurableCommandV1::LeaseSelectedTask { .. }
+        | DurableCommandV1::ResumeGithubProvider { .. }
+        | DurableCommandV1::PrivacyCancelTasks { .. }
+        | DurableCommandV1::PrivacyRemoveArtifacts { .. }
+        | DurableCommandV1::PrivacyRemoveFailedAttempts { .. } => true,
+        DurableCommandV1::FinishProviderRequest { observation, .. } => {
+            observation.shared_control_version != 0
+        }
+        _ => false,
+    };
+    let inserted = async {
+        if requires_current_reader {
+            connection
+                .execute(
+                    "UPDATE coordinator_metadata SET value='2' WHERE key='schema_version'",
+                    (),
+                )
+                .await?;
+        }
+        connection
+            .execute(
+                "INSERT INTO coordinator_journal (record_id, key_id, payload) VALUES (?1, ?2, ?3)",
+                turso::params![record_id, key.key_id(), payload],
+            )
+            .await
+    }
+    .await;
     let sequence = match inserted {
         Ok(_) => {
             let mut rows = connection.query("SELECT last_insert_rowid()", ()).await?;
@@ -2005,11 +2379,133 @@ async fn append(
     })
 }
 
+fn validate_privacy_command(
+    policy: &crate::privacy::SuppressionLedgerV1,
+    memory: &InMemoryStateStore,
+    artifacts: &BTreeMap<TaskId, ArtifactRecordV1>,
+    command: &DurableCommandV1,
+) -> Result<Option<DurableOutcomeV1>> {
+    if policy.records.is_empty() {
+        return Ok(None);
+    }
+    let blocked = |spec: &super::ScanSpecV1, id: &str, alias: &str| {
+        policy.suppresses(&crate::privacy::namespace_for_spec(spec), id, alias)
+    };
+    match command {
+        DurableCommandV1::SubmitJobWithTasks { request, tasks, .. } => {
+            if tasks
+                .iter()
+                .any(|task| blocked(&request.spec, "", &task.repository_id))
+            {
+                if let Some(existing) = memory.existing_batch_submission(request, tasks)? {
+                    return Ok(Some(DurableOutcomeV1::Submitted(SubmitOutcome::Existing(
+                        existing,
+                    ))));
+                }
+                bail!("repository_suppressed");
+            }
+        }
+        DurableCommandV1::EnqueueTask { task } => {
+            let job = memory.job(&task.job_id).context("job was not found")?;
+            ensure!(
+                !blocked(&job.spec, "", &task.repository_id),
+                "repository_suppressed"
+            );
+        }
+        DurableCommandV1::CompleteTaskWithArtifact {
+            task_id,
+            artifact,
+            agent_id,
+            lease_id,
+            result,
+            now,
+            ..
+        } => {
+            let task = memory.task(task_id).context("task was not found")?;
+            let job = memory.job(&task.job_id).context("job was not found")?;
+            let id = artifact
+                .metadata
+                .reuse_fingerprint
+                .as_ref()
+                .map_or("", |fingerprint| fingerprint.repository_id.as_str());
+            if task.state == RepositoryTaskStateV1::Succeeded {
+                memory.validate_completion(task_id, agent_id, lease_id, result, *now)?;
+                validate_artifact_command(memory, artifacts, command)?;
+                // A receipt survives removal; acknowledging it must not
+                // recreate artifact metadata, projections or quota writes.
+                return Ok(Some(DurableOutcomeV1::Applied));
+            }
+            ensure!(
+                !blocked(&job.spec, id, &task.repository_id),
+                "repository_suppressed"
+            );
+        }
+        DurableCommandV1::CompleteTask {
+            task_id,
+            agent_id,
+            lease_id,
+            result,
+            now,
+        } => {
+            let task = memory.task(task_id).context("task was not found")?;
+            let job = memory.job(&task.job_id).context("job was not found")?;
+            if task.state == RepositoryTaskStateV1::Succeeded {
+                memory.validate_completion(task_id, agent_id, lease_id, result, *now)?;
+                return Ok(Some(DurableOutcomeV1::Applied));
+            }
+            ensure!(
+                !blocked(&job.spec, "", &task.repository_id),
+                "repository_suppressed"
+            );
+        }
+        DurableCommandV1::FailTask {
+            task_id,
+            agent_id,
+            lease_id,
+            failure,
+            retry_at,
+            now,
+            ..
+        } => {
+            let task = memory.task(task_id).context("task was not found")?;
+            let job = memory.job(&task.job_id).context("job was not found")?;
+            if task.state == RepositoryTaskStateV1::Failed
+                && retry_at.is_none()
+                && memory.validate_failure(&TaskFailureV1 {
+                    task_id: task_id.clone(),
+                    agent_id: agent_id.clone(),
+                    lease_id: lease_id.clone(),
+                    failure: failure.clone(),
+                    retry_at: *retry_at,
+                    observed_at: *now,
+                })?
+            {
+                return Ok(Some(DurableOutcomeV1::Applied));
+            }
+            ensure!(
+                !blocked(&job.spec, "", &task.repository_id),
+                "repository_suppressed"
+            );
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
 fn apply_to_memory(
     memory: &mut InMemoryStateStore,
     command: &DurableCommandV1,
 ) -> Result<DurableOutcomeV1> {
     let outcome = match command {
+        DurableCommandV1::LeaseSelectedTask {
+            task_id,
+            lease,
+            global_cursor,
+        } => DurableOutcomeV1::Task(Some(memory.replay_selected_lease(
+            task_id.clone(),
+            lease.clone(),
+            global_cursor.clone(),
+        )?)),
         DurableCommandV1::Control { .. } => {
             bail!("control command requires the control-plane aggregate")
         }
@@ -2169,6 +2665,31 @@ fn apply_to_memory(
             auto_finalize_job(memory, &artifact.job_id, *now)?;
             DurableOutcomeV1::Applied
         }
+        DurableCommandV1::PrivacyCancelTasks { task_ids, now } => {
+            memory.cancel_selected_tasks(task_ids, *now)?;
+            let jobs = task_ids
+                .iter()
+                .filter_map(|id| memory.task(id).map(|task| task.job_id.clone()))
+                .collect::<BTreeSet<_>>();
+            for job in jobs {
+                auto_finalize_job(memory, &job, *now)?;
+            }
+            DurableOutcomeV1::Applied
+        }
+        DurableCommandV1::PrivacyRemoveArtifacts { task_ids } => {
+            ensure!(
+                task_ids.len() <= crate::privacy::REMOVAL_BATCH_SIZE,
+                "privacy batch exceeds limit"
+            );
+            DurableOutcomeV1::Applied
+        }
+        DurableCommandV1::PrivacyRemoveFailedAttempts { keys } => {
+            ensure!(
+                keys.len() <= crate::privacy::REMOVAL_BATCH_SIZE,
+                "privacy batch exceeds limit"
+            );
+            DurableOutcomeV1::Applied
+        }
         DurableCommandV1::RemoveExpiredArtifact { .. }
         | DurableCommandV1::InvalidateCacheKey { .. }
         | DurableCommandV1::TouchCacheKey { .. } => DurableOutcomeV1::Applied,
@@ -2242,6 +2763,10 @@ fn apply_to_memory(
         }
         DurableCommandV1::ConfigureProvider { key, policy } => {
             memory.configure_provider(key.clone(), *policy)?;
+            DurableOutcomeV1::Applied
+        }
+        DurableCommandV1::ResumeGithubProvider { .. } => {
+            memory.resume_github_provider();
             DurableOutcomeV1::Applied
         }
         DurableCommandV1::AcquireProviderPermit {
@@ -2531,6 +3056,13 @@ fn update_artifact_index(
                 .or_insert_with(|| artifact.as_ref().clone());
             index_reusable_artifact(reuse_index, artifact);
         }
+        DurableCommandV1::PrivacyRemoveArtifacts { task_ids } => {
+            for task_id in task_ids {
+                if let Some(artifact) = artifacts.remove(task_id) {
+                    remove_reusable_artifact(reuse_index, &artifact);
+                }
+            }
+        }
         DurableCommandV1::MarkArtifactProjected { task_id, now, .. } => {
             let artifact = artifacts
                 .get_mut(task_id)
@@ -2580,6 +3112,11 @@ fn update_failed_attempt_projection_outbox(
         return;
     }
     match command {
+        DurableCommandV1::PrivacyRemoveFailedAttempts { keys } => {
+            for key in keys {
+                projections.remove(key);
+            }
+        }
         DurableCommandV1::FailTask {
             task_id,
             retry_at,
@@ -2678,6 +3215,7 @@ async fn backup_database(
     source: &Path,
     destination: &Path,
     command_count: u64,
+    legacy_only: bool,
 ) -> Result<BackupManifestV1> {
     if destination.exists() {
         bail!(
@@ -2690,27 +3228,93 @@ async fn backup_database(
         .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
         .await?;
     while rows.next().await?.is_some() {}
-    if let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let bytes = tokio::fs::read(source)
-        .await
-        .with_context(|| format!("reading database {}", source.display()))?;
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    use std::io::Write as _;
-    temp.write_all(&bytes)?;
-    temp.as_file_mut().sync_all()?;
-    temp.persist_noclobber(destination)
-        .map_err(|error| error.error)?;
+    drop(rows);
+    let mut rows = connection
+        .query(
+            "SELECT value FROM coordinator_metadata WHERE key='schema_version'",
+            (),
+        )
+        .await?;
+    let schema_version: u16 = rows
+        .next()
+        .await?
+        .context("database schema metadata is missing")?
+        .get::<String>(0)?
+        .parse()
+        .context("invalid database schema metadata")?;
+    ensure!(
+        matches!(schema_version, DATABASE_SCHEMA_VERSION | 2),
+        "unsupported database schema"
+    );
+    ensure!(
+        !legacy_only || schema_version == DATABASE_SCHEMA_VERSION,
+        "this storage format requires a coherent --backup-set; legacy database-only restore cannot recover it"
+    );
+    drop(rows);
+    let copy_source = source.to_owned();
+    let copy_destination = destination.to_owned();
+    let (database_bytes, database_sha256) = tokio::task::spawn_blocking(move || {
+        copy_database_streamed(&copy_source, &copy_destination, None)
+    })
+    .await??;
     Ok(BackupManifestV1 {
-        schema_version: DATABASE_SCHEMA_VERSION,
+        schema_version,
         created_at: Utc::now(),
         source_database: source.display().to_string(),
-        database_sha256: sha256_hex(&bytes),
-        database_bytes: bytes.len() as u64,
+        database_sha256,
+        database_bytes,
         journal_commands: command_count,
     })
+}
+
+fn copy_database_streamed(
+    source: &Path,
+    destination: &Path,
+    expected: Option<(u64, &str)>,
+) -> Result<(u64, String)> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::{Read as _, Write as _};
+    ensure!(
+        !destination.exists(),
+        "database destination already exists; never overwriting"
+    );
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut input = fs::File::open(source)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(count as u64)
+            .context("database copy length overflow")?;
+        hasher.update(&buffer[..count]);
+        temporary.write_all(&buffer[..count])?;
+    }
+    let digest = crate::secure_cache::encode_digest(&hasher.finalize());
+    if let Some((expected_bytes, expected_digest)) = expected {
+        ensure!(
+            bytes == expected_bytes,
+            "backup size does not match manifest"
+        );
+        ensure!(
+            digest == expected_digest,
+            "backup SHA-256 does not match manifest"
+        );
+    }
+    temporary.as_file_mut().sync_all()?;
+    temporary
+        .persist_noclobber(destination)
+        .map_err(|error| error.error)?;
+    Ok((bytes, digest))
 }
 
 fn record_aad(record_id: &str, key_id: &str) -> String {
@@ -2837,6 +3441,28 @@ mod tests {
         ScheduledOccurrenceRefV1, Sha256Digest, UtcCronV1,
     };
 
+    #[tokio::test]
+    async fn legacy_backup_rejects_schema2_before_creating_an_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.db");
+        let destination = directory.path().join("legacy.db");
+        let database = turso::Builder::new_local(source.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let connection = database.connect().unwrap();
+        connection.execute_batch("CREATE TABLE coordinator_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO coordinator_metadata VALUES ('schema_version', '2');").await.unwrap();
+        let error = backup_database(&connection, &source, &destination, 0, true)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("coherent --backup-set"));
+        assert!(!destination.exists());
+        let modern = backup_database(&connection, &source, &destination, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(modern.schema_version, 2);
+    }
+
     fn submit_request(job: &str, now: DateTime<Utc>) -> SubmitJobV1 {
         SubmitJobV1 {
             job_id: JobId(job.to_owned()),
@@ -2876,6 +3502,209 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn github_suspension_survives_journal_snapshot_and_explicit_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("coordinator.db");
+        let key_path = directory.path().join("key");
+        let key = EnvelopeKey::generate("test-key");
+        key.persist_new(&key_path).unwrap();
+        let now = Utc::now();
+        let store = TursoCoordinatorStore::open(&database_path, key)
+            .await
+            .unwrap();
+        let provider = ProviderKeyV1::github_request(RepositoryScopeV1::PublicOnly, None, "core");
+        store
+            .apply(DurableCommandV1::ConfigureProvider {
+                key: provider.clone(),
+                policy: ProviderPolicyV1::github_requests(),
+            })
+            .await
+            .unwrap();
+        for (index, seconds) in [0, 60, 180, 420].into_iter().enumerate() {
+            let at = now + chrono::TimeDelta::seconds(seconds);
+            let permit_id = PermitId(format!("probe-{index}"));
+            assert!(matches!(
+                store
+                    .apply(DurableCommandV1::AcquireProviderPermit {
+                        key: provider.clone(),
+                        permit_id: permit_id.clone(),
+                        agent_id: "agent".to_owned(),
+                        now: at,
+                    })
+                    .await
+                    .unwrap(),
+                DurableOutcomeV1::Permit(PermitDecision::Granted(_))
+            ));
+            store
+                .apply(DurableCommandV1::FinishProviderRequest {
+                    permit_id,
+                    agent_id: "agent".to_owned(),
+                    outcome: ProviderOutcomeClassV1::RateLimited,
+                    observation: RateLimitObservationV1 {
+                        secondary_limit: true,
+                        shared_control_version: 1,
+                        ..RateLimitObservationV1::default()
+                    },
+                    now: at,
+                })
+                .await
+                .unwrap();
+        }
+        let suspended = store.github_provider_status().await.unwrap();
+        assert!(suspended.suspended);
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let store = TursoCoordinatorStore::open(
+            &database_path,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.github_provider_status().await.unwrap(), suspended);
+        store.compact().await.unwrap();
+        store
+            .apply(DurableCommandV1::ResumeGithubProvider { now })
+            .await
+            .unwrap();
+        let resumed = store.github_provider_status().await.unwrap();
+        assert!(!resumed.suspended);
+        assert!(resumed.recovery_required);
+        assert_eq!(
+            resumed.secondary_blocked_until,
+            suspended.secondary_blocked_until
+        );
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let store = TursoCoordinatorStore::open(
+            &database_path,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.github_provider_status().await.unwrap(), resumed);
+    }
+
+    #[test]
+    fn live_leases_filter_ineligible_profiles_without_changing_legacy_replay() {
+        let now = Utc::now();
+        let mut memory = InMemoryStateStore::default();
+        let mut control = ControlState::default();
+        let mut private = submit_request("private", now);
+        private.spec.repository_scope = RepositoryScopeV1::AllVisible;
+        private.spec.credential_profile_id = Some("private-profile".to_owned());
+        for request in [private, submit_request("public", now)] {
+            let job_id = request.job_id.0.clone();
+            apply_to_memory(
+                &mut memory,
+                &DurableCommandV1::SubmitJobWithTasks {
+                    request,
+                    tasks: vec![task(
+                        &job_id,
+                        &format!("task-{job_id}"),
+                        &format!("owner/{job_id}"),
+                        now,
+                    )],
+                    now,
+                },
+            )
+            .unwrap();
+        }
+        let explicit = DurableCommandV1::LeaseNextTask {
+            job_id: JobId("private".to_owned()),
+            agent_id: "agent".to_owned(),
+            lease_id: "private-lease".to_owned(),
+            lease_seconds: 60,
+            now,
+        };
+        assert!(
+            live_credential_command(&memory, &control, &explicit)
+                .unwrap()
+                .is_none()
+        );
+        let global = DurableCommandV1::LeaseNextAuthorizedTask {
+            authorization: AgentAuthorizationV1 {
+                private_credential_profiles: BTreeSet::from(["private-profile".to_owned()]),
+            },
+            agent_id: "agent".to_owned(),
+            lease_id: "global-lease".to_owned(),
+            lease_seconds: 60,
+            now,
+        };
+        let effective = live_credential_command(&memory, &control, &global)
+            .unwrap()
+            .unwrap();
+        let DurableOutcomeV1::Task(Some(leased)) =
+            apply_to_memory(&mut memory, effective.as_ref()).unwrap()
+        else {
+            panic!("public work must remain available");
+        };
+        assert_eq!(leased.job_id, JobId("public".to_owned()));
+        assert_eq!(
+            memory
+                .task(&TaskId("task-private".to_owned()))
+                .unwrap()
+                .attempt,
+            0
+        );
+        let permit = DurableCommandV1::AcquireProviderPermit {
+            key: ProviderKeyV1::github_request(
+                RepositoryScopeV1::AllVisible,
+                Some("private-profile"),
+                "core",
+            ),
+            permit_id: PermitId("permit".to_owned()),
+            agent_id: "agent".to_owned(),
+            now,
+        };
+        assert!(live_credential_command(&memory, &control, &permit).is_err());
+        let profile = super::super::CredentialProfileV1 {
+            schema_version: 1,
+            id: "private-profile".to_owned(),
+            provider: "github".to_owned(),
+            provider_host: "api.github.com".to_owned(),
+            secret_reference: "vault://profile".to_owned(),
+            principal_fingerprint: "installation:42".to_owned(),
+            secret_version: "1".to_owned(),
+            enabled: true,
+            expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        control
+            .apply(control_command(
+                "register",
+                now,
+                ControlActionV1::UpsertCredentialProfile { profile },
+            ))
+            .unwrap();
+        assert!(
+            live_credential_command(&memory, &control, &explicit)
+                .unwrap()
+                .is_some()
+        );
+        assert!(live_credential_command(&memory, &control, &permit).is_ok());
+        control
+            .apply(control_command(
+                "revoke",
+                now,
+                ControlActionV1::RevokeCredentialProfile {
+                    profile_id: "private-profile".to_owned(),
+                },
+            ))
+            .unwrap();
+        assert!(
+            live_credential_command(&memory, &control, &explicit)
+                .unwrap()
+                .is_none()
+        );
+        // Already committed legacy commands must retain their historical outcome.
+        assert!(matches!(
+            apply_to_memory(&mut memory, &explicit).unwrap(),
+            DurableOutcomeV1::Task(Some(_))
+        ));
+    }
+
     fn register_repository_set(
         command_id: &str,
         repository: &str,
@@ -2891,6 +3720,469 @@ mod tests {
                     .unwrap(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn privacy_policy_blocks_live_work_without_rewriting_history_or_mixed_jobs() {
+        use crate::privacy::{
+            RemovalPhaseV1, RemovalRequestV1, RemovalScopeV1, SuppressionTargetV1,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("coordinator.db");
+        let key_path = directory.path().join("key");
+        let key = EnvelopeKey::generate("test-key");
+        key.persist_new(&key_path).unwrap();
+        let now = Utc::now();
+        let store = TursoCoordinatorStore::open(&database_path, key)
+            .await
+            .unwrap();
+        for job in ["history", "inflight"] {
+            store
+                .apply(DurableCommandV1::SubmitJobWithTasks {
+                    request: submit_request(job, now),
+                    tasks: vec![task(job, job, "owner/suppressed", now)],
+                    now,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                store
+                    .apply(DurableCommandV1::LeaseNextTask {
+                        job_id: JobId(job.into()),
+                        agent_id: "agent".into(),
+                        lease_id: format!("lease-{job}"),
+                        lease_seconds: 120,
+                        now,
+                    })
+                    .await
+                    .unwrap(),
+                DurableOutcomeV1::Task(Some(_))
+            ));
+        }
+        let result = ArtifactRefV1 {
+            digest: Sha256Digest::parse("cd".repeat(32)).unwrap(),
+            media_type: "application/vnd.crate-dependent-repos.evidence.v1+json".into(),
+            stored_bytes: 12,
+        };
+        store
+            .apply(DurableCommandV1::CompleteTask {
+                task_id: TaskId("history".into()),
+                agent_id: "agent".into(),
+                lease_id: "lease-history".into(),
+                result: result.clone(),
+                now,
+            })
+            .await
+            .unwrap();
+        store
+            .apply(DurableCommandV1::SubmitJobWithTasks {
+                request: submit_request("mixed", now),
+                tasks: vec![
+                    task("mixed", "mixed-blocked", "owner/suppressed", now),
+                    task("mixed", "mixed-allowed", "owner/unrelated", now),
+                ],
+                now,
+            })
+            .await
+            .unwrap();
+        let initial = store.privacy_ledger().await.unwrap();
+        let request = RemovalRequestV1 {
+            schema_version: 1,
+            request_id: Uuid::new_v4().to_string(),
+            deployment_id: initial.deployment_id,
+            revision: 1,
+            target: SuppressionTargetV1 {
+                repository_id: "42".into(),
+                scope: RemovalScopeV1::Public,
+                aliases: BTreeSet::from(["owner/suppressed".into()]),
+            },
+            created_at: now,
+            phase: RemovalPhaseV1::Pending,
+            attempts_removed: 0,
+            artifacts_removed: 0,
+            failure_code: None,
+            task_cursor: None,
+            artifact_cursor: None,
+            failed_attempt_cursor: None,
+            pending_artifact: None,
+        };
+        store.put_privacy_record(request.clone()).await.unwrap();
+        store.put_privacy_record(request.clone()).await.unwrap();
+        for command in [
+            DurableCommandV1::LeaseNextTask {
+                job_id: JobId("inflight".into()),
+                agent_id: "agent".into(),
+                lease_id: "lease-inflight".into(),
+                lease_seconds: 120,
+                now,
+            },
+            DurableCommandV1::LeaseNextAuthorizedTask {
+                authorization: AgentAuthorizationV1::default(),
+                agent_id: "agent".into(),
+                lease_id: "lease-inflight".into(),
+                lease_seconds: 120,
+                now,
+            },
+        ] {
+            assert_eq!(
+                store.apply(command).await.unwrap(),
+                DurableOutcomeV1::Task(None),
+                "suppressed active leases must not be reissued"
+            );
+        }
+        let mut conflicting = request.clone();
+        conflicting.target.repository_id = "99".into();
+        assert!(store.put_privacy_record(conflicting).await.is_err());
+        assert_eq!(
+            store.privacy_ledger().await.unwrap().records,
+            vec![request.clone()]
+        );
+        assert!(
+            store
+                .apply(DurableCommandV1::SubmitJobWithTasks {
+                    request: submit_request("blocked-submission", now),
+                    tasks: vec![task(
+                        "blocked-submission",
+                        "new-task",
+                        "owner/suppressed",
+                        now
+                    )],
+                    now,
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .job(JobId("blocked-submission".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .apply(DurableCommandV1::CompleteTask {
+                    task_id: TaskId("inflight".into()),
+                    agent_id: "agent".into(),
+                    lease_id: "lease-inflight".into(),
+                    result,
+                    now
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .task(TaskId("inflight".into()))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RepositoryTaskStateV1::Leased
+        );
+        let DurableOutcomeV1::Task(Some(allowed)) = store
+            .apply(DurableCommandV1::LeaseNextTask {
+                job_id: JobId("mixed".into()),
+                agent_id: "agent".into(),
+                lease_id: "lease-mixed".into(),
+                lease_seconds: 120,
+                now,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("unrelated work must remain eligible");
+        };
+        assert_eq!(allowed.id, TaskId("mixed-allowed".into()));
+        assert_eq!(
+            store
+                .task(TaskId("mixed-blocked".into()))
+                .await
+                .unwrap()
+                .unwrap()
+                .attempt,
+            0
+        );
+        store
+            .apply(DurableCommandV1::PrivacyCancelTasks {
+                task_ids: vec![
+                    TaskId("history".into()),
+                    TaskId("inflight".into()),
+                    TaskId("mixed-blocked".into()),
+                ],
+                now,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .task(TaskId("history".into()))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RepositoryTaskStateV1::Succeeded
+        );
+        assert_eq!(
+            store
+                .task(TaskId("mixed-allowed".into()))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RepositoryTaskStateV1::Leased
+        );
+        let expected_mixed = store.job(JobId("mixed".into())).await.unwrap().unwrap();
+        assert_eq!(expected_mixed.state, ScanJobStateV1::Running);
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Privacy is loaded after replay: previously committed submissions,
+        // leases and success acknowledgments keep their original meaning.
+        let store = TursoCoordinatorStore::open(
+            &database_path,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.privacy_ledger().await.unwrap().records,
+            vec![request.clone()]
+        );
+        assert_eq!(
+            store
+                .task(TaskId("history".into()))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RepositoryTaskStateV1::Succeeded
+        );
+        assert_eq!(
+            store.job(JobId("mixed".into())).await.unwrap().unwrap(),
+            expected_mixed
+        );
+        store.compact().await.unwrap();
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let store = TursoCoordinatorStore::open(
+            &database_path,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.privacy_ledger().await.unwrap().records, vec![request]);
+        assert_eq!(
+            store.job(JobId("mixed".into())).await.unwrap().unwrap(),
+            expected_mixed
+        );
+    }
+
+    #[tokio::test]
+    async fn privacy_retries_acknowledge_receipts_without_recreating_removed_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("coordinator.db");
+        let key_path = directory.path().join("key");
+        let key = EnvelopeKey::generate("test-key");
+        key.persist_new(&key_path).unwrap();
+        let store = TursoCoordinatorStore::open(&database, key).await.unwrap();
+        let now = Utc::now();
+        let mut submissions = Vec::new();
+        for job in ["completed", "failed"] {
+            let submission = DurableCommandV1::SubmitJobWithTasks {
+                request: submit_request(job, now),
+                tasks: vec![task(job, job, "owner/removed", now)],
+                now,
+            };
+            store.apply(submission.clone()).await.unwrap();
+            submissions.push(submission);
+            store
+                .apply(DurableCommandV1::LeaseNextTask {
+                    job_id: JobId(job.into()),
+                    agent_id: "agent".into(),
+                    lease_id: format!("lease-{job}"),
+                    lease_seconds: 120,
+                    now,
+                })
+                .await
+                .unwrap();
+        }
+        let result = ArtifactRefV1 {
+            digest: Sha256Digest::parse("cd".repeat(32)).unwrap(),
+            media_type: "application/vnd.crate-dependent-repos.evidence.v1+json".into(),
+            stored_bytes: 12,
+        };
+        let completion = DurableCommandV1::CompleteTaskWithArtifact {
+            task_id: TaskId("completed".into()),
+            agent_id: "agent".into(),
+            lease_id: "lease-completed".into(),
+            result: result.clone(),
+            artifact: Box::new(ArtifactRecordV1 {
+                job_id: JobId("completed".into()),
+                task_id: TaskId("completed".into()),
+                metadata: CacheMetadataV1 {
+                    schema_version: SCHEMA_VERSION_V1,
+                    key: CacheKeyV1 {
+                        namespace: CacheNamespaceV1::Public,
+                        digest: result.digest.clone(),
+                    },
+                    content_kind: CacheContentKindV1::DerivedEvidence,
+                    content_length: result.stored_bytes,
+                    github_blob_sha: None,
+                    protection: CacheProtectionV1::EnvelopeEncrypted {
+                        algorithm: "AES-256-GCM".into(),
+                        wrapping_key_id: "test-key".into(),
+                    },
+                    completeness: EvidenceCompletenessV1::Complete,
+                    reuse_fingerprint: None,
+                    created_at: now,
+                    last_accessed_at: now,
+                    retain_until: now + chrono::TimeDelta::days(1),
+                    reference_count: 0,
+                },
+                inventory_projection: InventoryProjectionStateV1::Pending,
+            }),
+            usage: TaskUsageV1::default(),
+            now,
+        };
+        let failure = DurableCommandV1::FailTask {
+            task_id: TaskId("failed".into()),
+            agent_id: "agent".into(),
+            lease_id: "lease-failed".into(),
+            failure: "scan_failed".into(),
+            retry_at: None,
+            usage: TaskUsageV1::default(),
+            now,
+        };
+        store.apply(completion.clone()).await.unwrap();
+        store.apply(failure.clone()).await.unwrap();
+        let ledger = store.privacy_ledger().await.unwrap();
+        let removal =
+            serde_json::from_value::<crate::privacy::RemovalRequestV1>(serde_json::json!({
+                "schema_version": 1, "request_id": Uuid::new_v4().to_string(),
+                "deployment_id": ledger.deployment_id, "revision": 1,
+                "target": { "repository_id": "42", "scope": {"kind": "public"},
+                    "aliases": ["owner/removed"] },
+                "created_at": now, "phase": "completed", "attempts_removed": 0,
+                "artifacts_removed": 1, "failure_code": null
+            }))
+            .unwrap();
+        store.put_privacy_record(removal).await.unwrap();
+        store
+            .apply(DurableCommandV1::PrivacyRemoveArtifacts {
+                task_ids: vec![TaskId("completed".into())],
+            })
+            .await
+            .unwrap();
+        let failed_records = store.privacy_failed_page(None).await.unwrap();
+        assert_eq!(failed_records.len(), 1);
+        store
+            .apply(DurableCommandV1::PrivacyRemoveFailedAttempts {
+                keys: failed_records
+                    .into_iter()
+                    .map(|record| record.key)
+                    .collect(),
+            })
+            .await
+            .unwrap();
+        let events = store.events().await.unwrap();
+        let jobs = store.jobs().await.unwrap();
+        for (submission, job) in submissions.iter().zip(["completed", "failed"]) {
+            assert_eq!(
+                store.apply(submission.clone()).await.unwrap(),
+                DurableOutcomeV1::Submitted(SubmitOutcome::Existing(JobId(job.into())))
+            );
+        }
+        let mut retried_submission = submissions[0].clone();
+        if let DurableCommandV1::SubmitJobWithTasks { request, tasks, .. } = &mut retried_submission
+        {
+            request.job_id = JobId("unused-retry-job".into());
+            tasks[0].job_id = request.job_id.clone();
+            tasks[0].task_id = TaskId("unused-retry-task".into());
+        }
+        assert_eq!(
+            store.apply(retried_submission).await.unwrap(),
+            DurableOutcomeV1::Submitted(SubmitOutcome::Existing(JobId("completed".into())))
+        );
+        assert!(
+            store
+                .job(JobId("unused-retry-job".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for command in [
+            completion.clone(),
+            failure.clone(),
+            DurableCommandV1::CompleteTask {
+                task_id: TaskId("completed".into()),
+                agent_id: "agent".into(),
+                lease_id: "lease-completed".into(),
+                result,
+                now,
+            },
+        ] {
+            assert_eq!(
+                store.apply(command).await.unwrap(),
+                DurableOutcomeV1::Applied
+            );
+        }
+        let mut conflicting = submissions[0].clone();
+        if let DurableCommandV1::SubmitJobWithTasks { request, .. } = &mut conflicting {
+            request.spec.target.crate_name = "another_crate".into();
+        }
+        assert!(store.apply(conflicting).await.is_err());
+        let mut conflicting = completion.clone();
+        if let DurableCommandV1::CompleteTaskWithArtifact {
+            result, artifact, ..
+        } = &mut conflicting
+        {
+            result.digest = Sha256Digest::parse("ef".repeat(32)).unwrap();
+            artifact.metadata.key.digest = result.digest.clone();
+        }
+        assert!(store.apply(conflicting).await.is_err());
+        let mut conflicting = failure.clone();
+        if let DurableCommandV1::FailTask { failure, .. } = &mut conflicting {
+            *failure = "different_failure".into();
+        }
+        assert!(store.apply(conflicting).await.is_err());
+        assert_eq!(store.events().await.unwrap(), events);
+        assert_eq!(store.jobs().await.unwrap(), jobs);
+        assert!(
+            store
+                .artifact(TaskId("completed".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.privacy_failed_page(None).await.unwrap().is_empty());
+        store.shutdown_offline().await.unwrap();
+        let reopened = TursoCoordinatorStore::open(
+            &database,
+            EnvelopeKey::load(&key_path, "test-key").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.apply(completion).await.unwrap(),
+            DurableOutcomeV1::Applied
+        );
+        assert_eq!(
+            reopened.apply(failure).await.unwrap(),
+            DurableOutcomeV1::Applied
+        );
+        assert!(
+            reopened
+                .artifact(TaskId("completed".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(reopened.privacy_failed_page(None).await.unwrap().is_empty());
+        assert_eq!(reopened.events().await.unwrap(), events);
+        assert_eq!(reopened.jobs().await.unwrap(), jobs);
+        reopened.shutdown_offline().await.unwrap();
     }
 
     fn task(job: &str, task: &str, repository: &str, now: DateTime<Utc>) -> NewRepositoryTaskV1 {

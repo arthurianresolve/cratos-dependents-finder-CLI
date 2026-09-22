@@ -6,6 +6,7 @@ mod control_state;
 mod credential;
 mod dispatch;
 mod domain;
+mod privacy_store;
 mod provider;
 mod schedule;
 mod store;
@@ -41,9 +42,9 @@ pub use domain::{
     ScanSpecV1, ScanTargetV1, Sha256Digest, TaskId, TaskUsageV1,
 };
 pub use provider::{
-    CircuitPhaseV1, CircuitPolicyV1, PermitDecision, ProviderError, ProviderGate, ProviderKeyV1,
-    ProviderOutcomeClassV1, ProviderPermitV1, ProviderPolicyV1, ProviderRateStateV1,
-    RateLimitObservationV1,
+    CircuitPhaseV1, CircuitPolicyV1, GithubProviderStatusV1, PermitDecision, ProviderError,
+    ProviderGate, ProviderKeyV1, ProviderOutcomeClassV1, ProviderPermitV1, ProviderPolicyV1,
+    ProviderRateStateV1, RateLimitObservationV1,
 };
 pub use schedule::{
     CreateScheduleV1, CronError, InMemoryScheduler, MAX_SCHEDULE_RUN_AGE_SECONDS, MAX_SCHEDULES,

@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::{
     advisory::{DataSnapshotV1, SnapshotInputs, create_snapshot},
     crates_io::CratesIoClient,
-    github::{GitHubClient, RepositoryScope, preferred_token_from_environment},
+    github::{GitHubClient, RepositoryScope, preferred_credential_from_environment},
     inventory::{ScanOptions, scan},
     links::build_links,
     operations::{AgentArgs, CoordinatorArgs, JobArgs, SlaArgs},
@@ -164,6 +164,22 @@ struct LinksArgs {
 
 #[derive(Debug, Args)]
 struct ScanArgs {
+    /// Authenticated suppression ledger; all recorded namespaces apply to this standalone scan.
+    #[arg(
+        long,
+        env = "CRATOS_SUPPRESSION_LEDGER",
+        requires = "suppression_key_file"
+    )]
+    suppression_ledger: Option<PathBuf>,
+
+    /// Dedicated raw envelope key for the suppression ledger.
+    #[arg(
+        long,
+        env = "CRATOS_SUPPRESSION_KEY_FILE",
+        requires = "suppression_ledger"
+    )]
+    suppression_key_file: Option<PathBuf>,
+
     /// crates.io crate name, GitHub owner/repo, repository name, or GitHub URL.
     query: String,
 
@@ -382,7 +398,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         command => command,
     };
 
-    let github_token = preferred_token_from_environment();
+    let github_token = preferred_credential_from_environment();
     if cli.include_private && github_token.is_none() {
         anyhow::bail!("--include-private requires GITHUB_APP_TOKEN, GITHUB_TOKEN, or GH_TOKEN");
     }
@@ -392,7 +408,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         RepositoryScope::PublicOnly
     };
     let crates_io = CratesIoClient::new()?;
-    let github = GitHubClient::new(github_token)?;
+    let mut github = GitHubClient::with_credential(github_token)?;
+    if let Command::Scan(args) = &command
+        && let (Some(path), Some(key_path)) = (&args.suppression_ledger, &args.suppression_key_file)
+    {
+        github = github
+            .with_suppression_ledger(path, key_path)
+            .context("loading required standalone suppression policy")?;
+    }
 
     match command {
         Command::Resolve(args) => {

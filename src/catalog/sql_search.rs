@@ -485,7 +485,7 @@ impl CandidateSql {
                 AND latest.credential_profile_id = attempts.credential_profile_id\n\
                 AND latest.repository_id = attempts.repository_id\n\
                 AND latest.latest_attempt_id = attempts.attempt_id\n\
-              WHERE attempts.namespace_kind = ",
+              WHERE attempts.suppressed = 0 AND attempts.namespace_kind = ",
         );
         sql.bind(namespace.kind.to_owned());
         sql.push(" AND attempts.credential_profile_id = ");
@@ -549,7 +549,7 @@ impl CandidateSql {
                 AND latest.credential_profile_id = attempts.credential_profile_id\n\
                 AND latest.repository_id = attempts.repository_id\n\
                 AND latest.latest_attempt_id = attempts.attempt_id\n\
-              WHERE terms.namespace_kind = ",
+              WHERE attempts.suppressed = 0 AND terms.namespace_kind = ",
         );
         sql.bind(namespace.kind.to_owned());
         sql.push(" AND terms.credential_profile_id = ");
@@ -642,7 +642,8 @@ impl CandidateSql {
                  ON latest.namespace_kind = attempts.namespace_kind\n\
                 AND latest.credential_profile_id = attempts.credential_profile_id\n\
                 AND latest.repository_id = attempts.repository_id\n\
-                AND latest.latest_attempt_id = attempts.attempt_id)\n\
+                AND latest.latest_attempt_id = attempts.attempt_id\n\
+              WHERE attempts.suppressed = 0)\n\
              SELECT namespace_kind, credential_profile_id, attempt_id,\n\
                     relevance, freshness, has_observation\n\
                FROM ranked WHERE 1 = 1",
@@ -838,7 +839,7 @@ fn push_latest_selection(
             AND ",
     );
     sql.push(pointer);
-    sql.push(" WHERE attempts.projection_sequence <= ");
+    sql.push(" WHERE attempts.suppressed = 0 AND attempts.projection_sequence <= ");
     sql.bind(to_i64(watermark)?);
     sql.push(")");
     Ok(())
@@ -866,7 +867,7 @@ fn push_historical_selection(
              ON observations.namespace_kind = attempts.namespace_kind\n\
             AND observations.credential_profile_id = attempts.credential_profile_id\n\
             AND observations.observation_id = attempts.observation_id\n\
-          WHERE attempts.projection_sequence <= ",
+          WHERE attempts.suppressed = 0 AND attempts.projection_sequence <= ",
     );
     sql.bind(to_i64(watermark)?);
     if let Some(as_of) = query.as_of {
@@ -1654,7 +1655,7 @@ async fn load_latest_scored_candidates(
                     FROM requested
                     CROSS JOIN catalog_attempts AS attempts
                          INDEXED BY sqlite_autoindex_catalog_attempts_1
-                   WHERE attempts.namespace_kind = ",
+                   WHERE attempts.suppressed = 0 AND attempts.namespace_kind = ",
         );
         attempts_sql.bind(namespace.kind.to_owned());
         attempts_sql.push(" AND attempts.credential_profile_id = ");
@@ -1912,7 +1913,7 @@ async fn hydrate_attempt_candidate_batch(
     sql.bind(credential_profile_id.to_owned());
     sql.push(
         "\n\
-            AND attempts.attempt_id = requested.attempt_id)\n\
+            AND attempts.attempt_id = requested.attempt_id AND attempts.suppressed = 0)\n\
          SELECT attempts.attempt_id, attempts.attempt_json, repositories.repository_json,\n\
                 snapshots.snapshot_json,\n\
                 NULL AS observation_json, NULL AS package_json,\n\
@@ -1983,7 +1984,7 @@ async fn hydrate_candidate_batch(
     sql.bind(credential_profile_id.to_owned());
     sql.push(
         "\n\
-            AND counted.attempt_id = requested.attempt_id\n\
+            AND counted.attempt_id = requested.attempt_id AND counted.suppressed = 0\n\
            JOIN catalog_packages AS packages\n\
              ON packages.namespace_kind = counted.namespace_kind\n\
             AND packages.credential_profile_id = counted.credential_profile_id\n\
@@ -2012,7 +2013,7 @@ async fn hydrate_candidate_batch(
     sql.bind(credential_profile_id.to_owned());
     sql.push(
         "\n\
-            AND attempts.attempt_id = requested.attempt_id\n\
+            AND attempts.attempt_id = requested.attempt_id AND attempts.suppressed = 0\n\
            JOIN catalog_repositories AS repositories\n\
                 INDEXED BY sqlite_autoindex_catalog_repositories_1\n\
              ON repositories.namespace_kind = attempts.namespace_kind\n\
@@ -2306,7 +2307,7 @@ pub(crate) async fn persist_search_document(
         credential_profile_id,
         attempt.attempt_id.as_str(),
         &old_trigrams,
-        &bucket_postings,
+        Some(&bucket_postings),
     )
     .await?;
     connection
@@ -2634,13 +2635,41 @@ fn posting_json(attempt_id: &str, field: &str, term: &str) -> Result<String, Cat
     .map_err(unavailable)
 }
 
+pub(super) async fn remove_search_document(
+    connection: &turso::Connection,
+    namespace_kind: &str,
+    credential_profile_id: &str,
+    attempt_id: &str,
+) -> Result<(), CatalogError> {
+    let mut rows = connection.query(
+        "SELECT DISTINCT trigrams.value FROM catalog_search_terms AS terms CROSS JOIN json_each(terms.trigrams_json) AS trigrams WHERE terms.namespace_kind = ?1 AND terms.credential_profile_id = ?2 AND terms.attempt_id = ?3",
+        turso::params![namespace_kind, credential_profile_id, attempt_id],
+    ).await.map_err(unavailable)?;
+    let mut old_trigrams = BTreeSet::new();
+    while let Some(row) = rows.next().await.map_err(unavailable)? {
+        old_trigrams.insert(row.get::<String>(0).map_err(unavailable)?);
+    }
+    drop(rows);
+    persist_search_buckets(
+        connection,
+        namespace_kind,
+        credential_profile_id,
+        attempt_id,
+        &old_trigrams,
+        None,
+    )
+    .await?;
+    connection.execute("DELETE FROM catalog_search_documents WHERE namespace_kind = ?1 AND credential_profile_id = ?2 AND attempt_id = ?3", turso::params![namespace_kind, credential_profile_id, attempt_id]).await.map_err(unavailable)?;
+    Ok(())
+}
+
 async fn persist_search_buckets(
     connection: &turso::Connection,
     namespace_kind: &str,
     credential_profile_id: &str,
     attempt_id: &str,
     old_trigrams: &BTreeSet<String>,
-    new_postings: &SearchBucketPostings,
+    new_postings: Option<&SearchBucketPostings>,
 ) -> Result<(), CatalogError> {
     let shard = bucket_shard(attempt_id);
     let mut affected = old_trigrams
@@ -2654,7 +2683,12 @@ async fn persist_search_buckets(
             )
         })
         .collect::<BTreeSet<_>>();
-    affected.extend(new_postings.keys().cloned());
+    affected.extend(
+        new_postings
+            .into_iter()
+            .flat_map(|postings| postings.keys())
+            .cloned(),
+    );
 
     let mut merged = SearchBucketPostings::new();
     let mut empty = Vec::new();
@@ -2681,6 +2715,9 @@ async fn persist_search_buckets(
             let existing = match decode_postings(&encoded) {
                 Ok(postings) => postings,
                 Err(_) => {
+                    if new_postings.is_none() {
+                        return Err(CatalogError::StoreUnavailable);
+                    }
                     tracing::warn!(
                         reason = "malformed_postings",
                         "catalog index invalidated during projection"
@@ -2700,7 +2737,7 @@ async fn persist_search_buckets(
                 }
             }
         }
-        if let Some(additions) = new_postings.get(&key) {
+        if let Some(additions) = new_postings.and_then(|postings| postings.get(&key)) {
             postings.extend(additions.iter().cloned());
         }
         if postings.is_empty() {

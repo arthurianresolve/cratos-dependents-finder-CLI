@@ -31,12 +31,32 @@ use super::{
 const FIRST_DURABLE_SCHEMA_VERSION: u16 = 1;
 const SECOND_DURABLE_SCHEMA_VERSION: u16 = 2;
 const THIRD_DURABLE_SCHEMA_VERSION: u16 = 3;
-const DURABLE_SCHEMA_VERSION: u16 = 4;
+const FOURTH_DURABLE_SCHEMA_VERSION: u16 = 4;
+const DURABLE_SCHEMA_VERSION: u16 = 5;
 const MAX_BULK_BINDINGS: usize = 900;
+const SUPPRESSION_REPOSITORY_PREDICATE: &str = "(?1 = 'all' OR (repositories.namespace_kind = ?1 AND (?1 = 'public' OR repositories.credential_profile_id = ?2))) AND (repositories.repository_id = ?3 OR ((repositories.repository_id = '' OR repositories.repository_id GLOB '*[^0-9]*') AND (repositories.normalized_full_name IN (SELECT value FROM json_each(?4)) OR EXISTS (SELECT 1 FROM catalog_repository_aliases AS aliases WHERE aliases.namespace_kind = repositories.namespace_kind AND aliases.credential_profile_id = repositories.credential_profile_id AND aliases.repository_id = repositories.repository_id AND aliases.normalized_alias IN (SELECT value FROM json_each(?4))))))";
+
+fn suppression_parameters(
+    target: &crate::privacy::SuppressionTargetV1,
+) -> Result<(&str, &str, String), CatalogError> {
+    let (scope, profile) = match &target.scope {
+        crate::privacy::RemovalScopeV1::All => ("all", ""),
+        crate::privacy::RemovalScopeV1::Public => ("public", ""),
+        crate::privacy::RemovalScopeV1::CredentialProfile {
+            credential_profile_id,
+        } => ("private", credential_profile_id.as_str()),
+    };
+    Ok((
+        scope,
+        profile,
+        serde_json::to_string(&target.aliases).map_err(unavailable)?,
+    ))
+}
 
 struct DatabaseState {
     database: turso::Database,
     connection: turso::Connection,
+    suppressions: Vec<crate::privacy::SuppressionTargetV1>,
 }
 
 /// Durable read-model store owned by the coordinator process.
@@ -73,6 +93,7 @@ impl TursoInventoryStore {
             database: Mutex::new(DatabaseState {
                 database,
                 connection,
+                suppressions: Vec::new(),
             }),
             cursor_signer: CursorSigner::new(cursor_signing_key),
         })
@@ -89,6 +110,10 @@ impl TursoInventoryStore {
         let namespace_key = NamespaceKey::from(namespace);
         let database = self.database.lock().await;
         let connection = &database.connection;
+
+        if super::input_is_suppressed(&database.suppressions, &input) {
+            return Err(CatalogError::Unauthorized);
+        }
 
         if let Some(existing) =
             existing_projection(connection, namespace_key, &preview.outcome.attempt_id).await?
@@ -185,6 +210,9 @@ impl TursoInventoryStore {
 
         let database = self.database.lock().await;
         let connection = &database.connection;
+        unique.retain(|projection| {
+            !super::input_is_suppressed(&database.suppressions, &projection.input)
+        });
         connection
             .execute_batch("BEGIN IMMEDIATE")
             .await
@@ -436,6 +464,7 @@ impl TursoInventoryStore {
                    FROM catalog_repositories AS repositories
                   WHERE repositories.namespace_kind = ?1
                     AND repositories.credential_profile_id = ?2
+                    AND repositories.suppressed = 0
                     AND (repositories.normalized_full_name = ?3 OR EXISTS (
                         SELECT 1 FROM catalog_repository_aliases AS aliases
                          WHERE aliases.namespace_kind = repositories.namespace_kind
@@ -471,6 +500,61 @@ impl TursoInventoryStore {
 }
 
 impl InventoryProjectionStore for TursoInventoryStore {
+    fn install_suppressions<'a>(
+        &'a self,
+        targets: &'a [crate::privacy::SuppressionTargetV1],
+    ) -> BoxFuture<'a, Result<(), CatalogError>> {
+        async move {
+            for target in targets { target.validate().map_err(|_| CatalogError::InvalidInput("invalid suppression target".to_owned()))?; }
+            let mut database = self.database.lock().await;
+            let additions = targets.iter().filter(|target| !database.suppressions.contains(target)).cloned().collect::<Vec<_>>();
+            if additions.is_empty() { return Ok(()); }
+            let connection = &database.connection;
+            connection.execute_batch("BEGIN IMMEDIATE").await.map_err(unavailable)?;
+            let result = async {
+                for target in &additions {
+                    let (scope, profile, aliases) = suppression_parameters(target)?;
+                    let statement = format!("UPDATE catalog_repositories AS repositories SET suppressed = 1 WHERE suppressed = 0 AND {}", SUPPRESSION_REPOSITORY_PREDICATE);
+                    connection.execute(&statement, turso::params![scope, profile, target.repository_id.as_str(), aliases]).await.map_err(unavailable)?;
+                }
+                connection.execute_batch("UPDATE catalog_attempts SET suppressed = 1 WHERE suppressed = 0 AND (namespace_kind, credential_profile_id, repository_id) IN (SELECT namespace_kind, credential_profile_id, repository_id FROM catalog_repositories WHERE suppressed = 1)").await.map_err(unavailable)?;
+                let watermark = metadata_u64(connection, "watermark").await?.checked_add(1).ok_or(CatalogError::StoreUnavailable)?;
+                set_metadata_u64(connection, "watermark", watermark).await?;
+                set_metadata_u64(connection, "cursor_floor", watermark).await?;
+                Ok(())
+            }.await;
+            finish_transaction(connection, result).await?;
+            database.suppressions.extend(additions);
+            Ok(())
+        }.boxed()
+    }
+
+    fn purge_repository<'a>(
+        &'a self,
+        target: &'a crate::privacy::SuppressionTargetV1,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<usize, CatalogError>> {
+        async move {
+            target.validate().map_err(|_| CatalogError::InvalidInput("invalid suppression target".to_owned()))?;
+            if limit == 0 || limit > crate::privacy::REMOVAL_BATCH_SIZE { return Err(CatalogError::InvalidInput("invalid removal batch size".to_owned())); }
+            let database = self.database.lock().await;
+            let connection = &database.connection;
+            let (scope, profile, aliases) = suppression_parameters(target)?;
+            let statement = format!("SELECT inputs.namespace_kind, inputs.credential_profile_id, inputs.attempt_id, inputs.observation_id, inputs.repository_id FROM catalog_projection_inputs AS inputs JOIN catalog_repositories AS repositories ON repositories.namespace_kind = inputs.namespace_kind AND repositories.credential_profile_id = inputs.credential_profile_id AND repositories.repository_id = inputs.repository_id WHERE {} ORDER BY inputs.namespace_kind, inputs.credential_profile_id, inputs.attempt_id LIMIT ?5", SUPPRESSION_REPOSITORY_PREDICATE);
+            let mut rows = connection.query(&statement, turso::params![scope, profile, target.repository_id.as_str(), aliases, limit as i64]).await.map_err(unavailable)?;
+            let mut removed = Vec::new();
+            while let Some(row) = rows.next().await.map_err(unavailable)? {
+                let kind: String = row.get(0).map_err(unavailable)?;
+                removed.push(ExpiredAttempt {
+                    namespace: NamespaceKey { kind: match kind.as_str() { "public" => "public", "private" => "private", _ => return Err(CatalogError::StoreUnavailable) }, credential_profile_id: row.get(1).map_err(unavailable)? },
+                    attempt_id: row.get(2).map_err(unavailable)?, observation_id: row.get(3).map_err(unavailable)?, repository_id: row.get(4).map_err(unavailable)?,
+                });
+            }
+            drop(rows);
+            remove_attempts_durable(connection, &removed).await
+        }.boxed()
+    }
+
     fn project<'a>(
         &'a self,
         input: InventoryProjectionInputV1,
@@ -606,6 +690,7 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
                  namespace_kind TEXT NOT NULL,
                  credential_profile_id TEXT NOT NULL,
                  repository_id TEXT NOT NULL,
+                 suppressed INTEGER NOT NULL DEFAULT 0,
                  full_name TEXT NOT NULL,
                  normalized_full_name TEXT NOT NULL,
                  owner TEXT NOT NULL,
@@ -651,6 +736,7 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
                  projection_digest TEXT NOT NULL,
                  projection_sequence INTEGER NOT NULL,
                  repository_id TEXT NOT NULL,
+                 suppressed INTEGER NOT NULL DEFAULT 0,
                  normalized_repository_name TEXT NOT NULL,
                  normalized_repository_owner TEXT NOT NULL,
                  repository_visibility TEXT NOT NULL,
@@ -856,7 +942,7 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
              CREATE INDEX IF NOT EXISTS catalog_saved_query_identity
                  ON catalog_saved_query_revisions (query_id, revision);
              INSERT OR IGNORE INTO catalog_metadata (key, value)
-                 VALUES ('schema_version', '4');
+                 VALUES ('schema_version', '5');
              INSERT OR IGNORE INTO catalog_metadata (key, value)
                  VALUES ('watermark', '0');
             INSERT OR IGNORE INTO catalog_metadata (key, value)
@@ -878,8 +964,20 @@ async fn migrate(connection: &turso::Connection) -> Result<(), CatalogError> {
             migrate_search_bucket_shards(connection).await?;
         }
         THIRD_DURABLE_SCHEMA_VERSION => migrate_search_bucket_shards(connection).await?,
+        FOURTH_DURABLE_SCHEMA_VERSION => {}
         DURABLE_SCHEMA_VERSION => {}
         version => return Err(CatalogError::UnsupportedSchemaVersion(version)),
+    }
+    if schema_version < u64::from(DURABLE_SCHEMA_VERSION) {
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .await
+            .map_err(unavailable)?;
+        let migrated = async {
+            connection.execute_batch("ALTER TABLE catalog_repositories ADD COLUMN suppressed INTEGER NOT NULL DEFAULT 0; ALTER TABLE catalog_attempts ADD COLUMN suppressed INTEGER NOT NULL DEFAULT 0;").await.map_err(unavailable)?;
+            set_metadata_u64(connection, "schema_version", u64::from(DURABLE_SCHEMA_VERSION)).await
+        }.await;
+        finish_transaction(connection, migrated).await?;
     }
     Ok(())
 }
@@ -1073,7 +1171,7 @@ async fn migrate_search_bucket_shards(connection: &turso::Connection) -> Result<
         set_metadata_u64(
             connection,
             "schema_version",
-            u64::from(DURABLE_SCHEMA_VERSION),
+            u64::from(FOURTH_DURABLE_SCHEMA_VERSION),
         )
         .await?;
         Ok::<(), CatalogError>(())
@@ -2985,6 +3083,13 @@ async fn delete_attempt(
     connection: &turso::Connection,
     expired: &ExpiredAttempt,
 ) -> Result<(), CatalogError> {
+    sql_search::remove_search_document(
+        connection,
+        expired.namespace.kind,
+        &expired.namespace.credential_profile_id,
+        &expired.attempt_id,
+    )
+    .await?;
     if let Some(observation_id) = &expired.observation_id {
         for table in [
             "catalog_limitations",
@@ -3379,6 +3484,232 @@ mod tests {
     async fn scalar_i64(connection: &turso::Connection, sql: &str) -> i64 {
         let mut rows = connection.query(sql, ()).await.unwrap();
         rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn suppression_is_complete_scoped_bounded_and_rebuild_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("suppressed.db");
+        let durable = TursoInventoryStore::open(&database_path, [27; 32])
+            .await
+            .unwrap();
+        let reference = InMemoryInventoryStore::new([27; 32]);
+        let private = InventoryNamespaceV1::Private {
+            credential_profile_id: "company".to_owned(),
+        };
+        let inputs = vec![
+            observation("42", "owner/old-name", time(10)),
+            failed_at(
+                InventoryNamespaceV1::Public,
+                "42",
+                "owner/new-name",
+                "target-refresh",
+                time(11),
+            ),
+            observation("43", "owner/survivor", time(12)),
+            failed_at(
+                private.clone(),
+                "42",
+                "secret/kept",
+                "private-refresh",
+                time(13),
+            ),
+        ];
+        let mut removed_attempt_ids = Vec::new();
+        for input in &inputs {
+            reference.project(input.clone()).await.unwrap();
+            let outcome = durable.project(input.clone()).await.unwrap();
+            if removed_attempt_ids.len() < 2 {
+                removed_attempt_ids.push(outcome.attempt_id);
+            }
+        }
+        let access = InventoryAccessV1 {
+            principal_id: "admin".to_owned(),
+            private_credential_profiles: BTreeSet::from(["company".to_owned()]),
+        };
+        let mut initial_query = InventoryQueryV1::new();
+        initial_query.namespace = Some(InventoryNamespaceV1::Public);
+        initial_query.sort = super::super::InventorySortV1::RepositoryAsc;
+        let first = durable
+            .search(
+                &access,
+                &initial_query,
+                &InventoryPageRequestV1 {
+                    limit: Some(1),
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(first.next_cursor.is_some());
+        // Materialize posting buckets before deletion to exercise targeted cleanup.
+        let mut indexed = initial_query.clone();
+        indexed.search = Some("owner".to_owned());
+        indexed.match_mode = InventoryMatchModeV1::Fuzzy;
+        indexed.search_field = InventorySearchFieldV1::Repository;
+        durable
+            .search(&access, &indexed, &InventoryPageRequestV1::default())
+            .await
+            .unwrap();
+        let target = crate::privacy::SuppressionTargetV1 {
+            repository_id: "42".to_owned(),
+            scope: crate::privacy::RemovalScopeV1::Public,
+            aliases: BTreeSet::from(["owner/old-name".to_owned(), "owner/new-name".to_owned()]),
+        };
+        for store in [&durable as &dyn InventoryProjectionStore, &reference] {
+            store
+                .install_suppressions(std::slice::from_ref(&target))
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .repository_for_alias(&InventoryNamespaceV1::Public, "owner/old-name")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                store.project(inputs[0].clone()).await,
+                Err(CatalogError::Unauthorized)
+            ));
+        }
+        assert!(matches!(
+            durable
+                .search(
+                    &access,
+                    &initial_query,
+                    &InventoryPageRequestV1 {
+                        limit: Some(1),
+                        cursor: first.next_cursor
+                    }
+                )
+                .await,
+            Err(CatalogError::CursorStale)
+        ));
+        for history in [
+            InventoryHistoryModeV1::LatestAttempt,
+            InventoryHistoryModeV1::LatestEvidence,
+            InventoryHistoryModeV1::LastComplete,
+            InventoryHistoryModeV1::Observations,
+        ] {
+            for mode in [
+                InventoryMatchModeV1::Exact,
+                InventoryMatchModeV1::Prefix,
+                InventoryMatchModeV1::Substring,
+                InventoryMatchModeV1::Fuzzy,
+            ] {
+                for field in [
+                    InventorySearchFieldV1::Repository,
+                    InventorySearchFieldV1::Package,
+                    InventorySearchFieldV1::Any,
+                ] {
+                    for as_of in [None, Some(time(23))] {
+                        let mut query = InventoryQueryV1::new();
+                        query.namespace = Some(InventoryNamespaceV1::Public);
+                        query.history = history;
+                        query.match_mode = mode;
+                        query.search_field = field;
+                        query.search = Some(
+                            if field == InventorySearchFieldV1::Package {
+                                "serde"
+                            } else {
+                                "owner"
+                            }
+                            .to_owned(),
+                        );
+                        query.as_of = as_of;
+                        let expected = reference
+                            .search(&access, &query, &InventoryPageRequestV1::default())
+                            .await
+                            .unwrap();
+                        let actual = durable
+                            .search(&access, &query, &InventoryPageRequestV1::default())
+                            .await
+                            .unwrap();
+                        assert_eq!(actual, expected, "{query:?}");
+                        assert!(
+                            actual
+                                .items
+                                .iter()
+                                .all(|item| item.repository.key.repository_id != "42")
+                        );
+                    }
+                }
+            }
+        }
+        for store in [&durable as &dyn InventoryProjectionStore, &reference] {
+            assert_eq!(store.purge_repository(&target, 1).await.unwrap(), 1);
+            assert_eq!(store.purge_repository(&target, 1).await.unwrap(), 1);
+            assert_eq!(store.purge_repository(&target, 1).await.unwrap(), 0);
+            assert!(store.purge_repository(&target, 257).await.is_err());
+            let page = store
+                .search(
+                    &access,
+                    &InventoryQueryV1::new(),
+                    &InventoryPageRequestV1::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.items.len(), 2);
+            assert!(
+                page.items
+                    .iter()
+                    .any(|item| item.repository.key.namespace == private)
+            );
+        }
+        {
+            let database = durable.database.lock().await;
+            assert_eq!(scalar_i64(&database.connection, "SELECT COUNT(*) FROM catalog_projection_inputs WHERE namespace_kind = 'public' AND repository_id = '42'").await, 0);
+            assert_eq!(scalar_i64(&database.connection, "SELECT COUNT(*) FROM catalog_repository_aliases WHERE namespace_kind = 'public' AND repository_id = '42'").await, 0);
+            for attempt_id in &removed_attempt_ids {
+                let mut rows = database.connection.query("SELECT COUNT(*) FROM catalog_search_trigram_buckets WHERE instr(postings_json, ?1) > 0", turso::params![attempt_id.as_str()]).await.unwrap();
+                assert_eq!(
+                    rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                    0
+                );
+            }
+        }
+        for store in [&durable as &dyn InventoryProjectionStore, &reference] {
+            store.rebuild(inputs.clone()).await.unwrap();
+            assert_eq!(
+                store
+                    .search(
+                        &access,
+                        &InventoryQueryV1::new(),
+                        &InventoryPageRequestV1::default()
+                    )
+                    .await
+                    .unwrap()
+                    .items
+                    .len(),
+                2
+            );
+        }
+        drop(durable);
+        let reopened = TursoInventoryStore::open(database_path, [27; 32])
+            .await
+            .unwrap();
+        reopened
+            .install_suppressions(std::slice::from_ref(&target))
+            .await
+            .unwrap();
+        assert!(matches!(
+            reopened.project(inputs[0].clone()).await,
+            Err(CatalogError::Unauthorized)
+        ));
+        assert_eq!(
+            reopened
+                .search(
+                    &access,
+                    &InventoryQueryV1::new(),
+                    &InventoryPageRequestV1::default()
+                )
+                .await
+                .unwrap()
+                .items
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

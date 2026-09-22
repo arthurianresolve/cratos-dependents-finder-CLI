@@ -1,5 +1,8 @@
 //! Self-hosted coordinator, worker, job, and availability operations.
 
+mod control;
+mod privacy;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
@@ -65,6 +68,7 @@ const EVIDENCE_EXPORT_CONCURRENCY: usize = 8;
 const COORDINATOR_PAGE_SIZE: usize = 1_000;
 const EVIDENCE_SHARD_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 const BACKUP_SET_SCHEMA_VERSION_V2: u16 = 2;
+const BACKUP_SET_SCHEMA_VERSION_V3: u16 = 3;
 const BACKUP_SET_MANIFEST: &str = "backup-set.json";
 const BACKUP_SET_DATABASE: &str = "coordinator.db";
 const BACKUP_SET_DEPLOYMENT_MANIFEST: &str = "deployment-manifest.json";
@@ -94,6 +98,10 @@ enum CoordinatorCommand {
     Restore(CoordinatorRestoreArgs),
     /// Issue or revoke digest-only control API service tokens.
     Token(CoordinatorTokenArgs),
+    /// Inspect or explicitly resume shared GitHub rate-limit admission.
+    Github(control::GithubArgs),
+    /// Plan, apply, inspect, or retry online repository evidence removal.
+    Privacy(privacy::PrivacyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -176,6 +184,12 @@ struct CoordinatorServeArgs {
     /// Initialized coordinator state directory.
     #[arg(long)]
     directory: PathBuf,
+    /// Independently retained suppression ledger (default: state/suppression.ledger).
+    #[arg(long, requires = "suppression_key_file")]
+    suppression_ledger: Option<PathBuf>,
+    /// Dedicated suppression key (default: state/suppression.key).
+    #[arg(long, requires = "suppression_ledger")]
+    suppression_key_file: Option<PathBuf>,
     /// LAN address on which to accept mutual-TLS connections.
     #[arg(long, default_value = "127.0.0.1:8443")]
     listen: SocketAddr,
@@ -212,6 +226,11 @@ struct CoordinatorBackupArgs {
     /// Initialized coordinator state directory. The server must be stopped.
     #[arg(long)]
     directory: PathBuf,
+    /// Current suppression ledger when the server uses a non-default location.
+    #[arg(long, requires = "suppression_key_file")]
+    suppression_ledger: Option<PathBuf>,
+    #[arg(long, requires = "suppression_ledger")]
+    suppression_key_file: Option<PathBuf>,
     /// New legacy database backup path. Existing files are never overwritten.
     #[arg(
         long,
@@ -235,6 +254,14 @@ struct CoordinatorBackupArgs {
 
 #[derive(Debug, Args)]
 struct CoordinatorRestoreArgs {
+    /// Attest that a current ledger was independently matched to a legacy backup without policy identity.
+    #[arg(long, requires_all = ["suppression_ledger", "suppression_key_file", "backup_set"])]
+    accept_legacy_ledger_binding: bool,
+    /// Independently retained current suppression ledger; never take this from an old backup.
+    #[arg(long, requires_all = ["suppression_key_file", "backup_set"])]
+    suppression_ledger: Option<PathBuf>,
+    #[arg(long, requires_all = ["suppression_ledger", "backup_set"])]
+    suppression_key_file: Option<PathBuf>,
     /// Legacy database backup produced by `coordinator backup`.
     #[arg(
         long,
@@ -601,6 +628,15 @@ struct CoordinatorBackupSetV1 {
     catalog_cursor_key_fingerprint: String,
     external_references: Vec<BackupExternalReferenceV1>,
     agent_pki_recovery: AgentPkiRecoveryV1,
+    #[serde(default)]
+    suppression_policy: Option<BackupSuppressionPolicyV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct BackupSuppressionPolicyV1 {
+    deployment_id: String,
+    revision: u64,
+    policy_sha256: String,
 }
 
 /// One durable task-to-object edge captured from the checkpointed database.
@@ -682,6 +718,8 @@ pub async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
         CoordinatorCommand::Backup(args) => backup_coordinator(args).await,
         CoordinatorCommand::Restore(args) => restore_coordinator(args).await,
         CoordinatorCommand::Token(args) => manage_control_token(args).await,
+        CoordinatorCommand::Github(args) => control::run_github(args).await,
+        CoordinatorCommand::Privacy(args) => privacy::run(args).await,
     }
 }
 
@@ -861,7 +899,13 @@ async fn initialize_coordinator(args: CoordinatorInitArgs) -> Result<()> {
     let key = EnvelopeKey::generate(ENVELOPE_KEY_ID);
     key.persist_new(&paths.envelope_key)?;
     EnvelopeKey::generate(CATALOG_CURSOR_KEY_ID).persist_new(&paths.catalog_cursor_key)?;
+    let suppression_key = EnvelopeKey::generate(crate::privacy::LEDGER_KEY_ID);
+    suppression_key.persist_new(&paths.suppression_key)?;
     let store = TursoCoordinatorStore::open(&paths.database, key).await?;
+    store
+        .privacy_ledger()
+        .await?
+        .persist(&paths.suppression_ledger, &suppression_key)?;
     store
         .register_agent(AgentRecordV1 {
             agent_id: "operator".to_owned(),
@@ -881,6 +925,7 @@ async fn initialize_coordinator(args: CoordinatorInitArgs) -> Result<()> {
         pki_directory: paths.pki_directory.display().to_string(),
     };
     write_json_new(&paths.deployment_manifest, &manifest)?;
+    store.shutdown_offline().await?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&manifest)?);
     } else {
@@ -903,6 +948,28 @@ async fn serve_coordinator(args: CoordinatorServeArgs) -> Result<()> {
     let inventory = Arc::new(
         TursoInventoryStore::open(&paths.database, read_key_32(&paths.catalog_cursor_key)?).await?,
     );
+    let ledger_path = args
+        .suppression_ledger
+        .as_deref()
+        .unwrap_or(&paths.suppression_ledger);
+    let suppression_key_path = args
+        .suppression_key_file
+        .as_deref()
+        .unwrap_or(&paths.suppression_key);
+    if !suppression_key_path.exists() {
+        ensure!(
+            !ledger_path.exists() && store.privacy_ledger().await?.revision == 0,
+            "suppression key is missing; recover the dedicated key before serving"
+        );
+        EnvelopeKey::generate(crate::privacy::LEDGER_KEY_ID).persist_new(suppression_key_path)?;
+    }
+    let privacy = crate::privacy::PrivacyService::open_with_ledger(
+        store.clone(),
+        inventory.clone(),
+        ledger_path.to_owned(),
+        EnvelopeKey::load(suppression_key_path, crate::privacy::LEDGER_KEY_ID)?,
+    )
+    .await?;
     ensure!(
         args.listen != args.control_listen,
         "worker and control listeners must use different addresses"
@@ -920,9 +987,10 @@ async fn serve_coordinator(args: CoordinatorServeArgs) -> Result<()> {
             .map(|configuration| configuration.policy.clone()),
         args.enable_private_inventory,
     )
-    .map_err(anyhow::Error::new)?;
+    .map_err(anyhow::Error::new)?
+    .with_privacy(privacy.clone());
     let metrics = crate::telemetry::CoordinatorMetrics::new();
-    let worker = crate::coordinator_api::serve(
+    let worker = crate::coordinator_api::serve_with_privacy(
         CoordinatorServerConfig {
             listen: args.listen,
             ca_certificate: paths.ca_certificate.clone(),
@@ -941,6 +1009,7 @@ async fn serve_coordinator(args: CoordinatorServeArgs) -> Result<()> {
         store,
         inventory,
         metrics.clone(),
+        Some(privacy),
     );
     let scheduler_state = control_state.clone();
     let control = crate::control_api::serve(
@@ -971,7 +1040,14 @@ async fn backup_coordinator(args: CoordinatorBackupArgs) -> Result<()> {
             args.output.is_none() && args.manifest.is_none(),
             "--backup-set cannot be combined with legacy backup paths"
         );
-        return backup_coordinator_set(&args.directory, backup_set).await;
+        return backup_coordinator_set_with_policy(
+            &args.directory,
+            backup_set,
+            args.suppression_ledger
+                .as_deref()
+                .zip(args.suppression_key_file.as_deref()),
+        )
+        .await;
     }
     let output = args
         .output
@@ -993,7 +1069,11 @@ async fn backup_coordinator(args: CoordinatorBackupArgs) -> Result<()> {
     let paths = StatePaths::new(&args.directory);
     require_initialized(&paths)?;
     let store = open_store(&paths).await?;
-    let manifest = store.backup(output).await?;
+    ensure!(
+        store.privacy_ledger().await?.revision == 0,
+        "legacy database-only backup cannot preserve suppression recovery; use --backup-set"
+    );
+    let manifest = store.backup_legacy(output).await?;
     if let Err(error) = write_json_new(manifest_path, &manifest) {
         bail!(
             "database backup {} was created, but writing manifest {} failed: {error:#}",
@@ -1024,7 +1104,16 @@ async fn restore_coordinator(args: CoordinatorRestoreArgs) -> Result<()> {
             .sidecars
             .as_deref()
             .context("backup-set restore requires --sidecars")?;
-        return restore_coordinator_set(backup_set, directory, sidecars).await;
+        return restore_coordinator_set_with_policy(
+            backup_set,
+            directory,
+            sidecars,
+            args.suppression_ledger
+                .as_deref()
+                .zip(args.suppression_key_file.as_deref()),
+            args.accept_legacy_ledger_binding,
+        )
+        .await;
     }
     let backup = args
         .backup
@@ -1042,12 +1131,20 @@ async fn restore_coordinator(args: CoordinatorRestoreArgs) -> Result<()> {
         .with_context(|| format!("reading backup manifest {}", manifest_path.display()))?;
     let manifest: BackupManifestV1 = serde_json::from_str(&input)
         .with_context(|| format!("parsing backup manifest {}", manifest_path.display()))?;
+    ensure!(
+        manifest.schema_version == SCHEMA_VERSION_V1,
+        "suppression-aware databases require backup-set restore with a current suppression ledger"
+    );
     TursoCoordinatorStore::restore(backup, &manifest, database)?;
     println!("restored verified database to {}", database.display());
     Ok(())
 }
 
-async fn backup_coordinator_set(directory: &Path, backup_set: &Path) -> Result<()> {
+async fn backup_coordinator_set_with_policy(
+    directory: &Path,
+    backup_set: &Path,
+    policy: Option<(&Path, &Path)>,
+) -> Result<()> {
     ensure!(
         !backup_set.exists(),
         "backup-set destination {} already exists",
@@ -1081,6 +1178,24 @@ async fn backup_coordinator_set(directory: &Path, backup_set: &Path) -> Result<(
             )
         })?;
     let store = open_store(&paths).await?;
+    let ledger = store.privacy_ledger().await?;
+    let (ledger_path, ledger_key_path) =
+        policy.unwrap_or((&paths.suppression_ledger, &paths.suppression_key));
+    if policy.is_some() || ledger.revision > 0 || ledger_path.exists() {
+        let external = crate::privacy::SuppressionLedgerV1::load(
+            ledger_path,
+            &EnvelopeKey::load(ledger_key_path, crate::privacy::LEDGER_KEY_ID)?,
+        )?;
+        ensure!(
+            external.policy_digest()? == ledger.policy_digest()?,
+            "independent suppression ledger is not current; recover policy publication before backup"
+        );
+    }
+    let suppression_policy = Some(BackupSuppressionPolicyV1 {
+        deployment_id: ledger.deployment_id.clone(),
+        revision: ledger.revision,
+        policy_sha256: ledger.policy_digest()?,
+    });
     let database_path = staging.path().join(BACKUP_SET_DATABASE);
     let database_manifest = store.backup(&database_path).await?;
     let database_file = file_inventory_entry(&database_path, BACKUP_SET_DATABASE)?;
@@ -1104,8 +1219,9 @@ async fn backup_coordinator_set(directory: &Path, backup_set: &Path) -> Result<(
         staging.path(),
         &EnvelopeKey::load(&paths.envelope_key, ENVELOPE_KEY_ID)?,
     )?;
+    store.shutdown_offline().await?;
     let manifest = CoordinatorBackupSetV1 {
-        schema_version: BACKUP_SET_SCHEMA_VERSION_V2,
+        schema_version: BACKUP_SET_SCHEMA_VERSION_V3,
         created_at: database_manifest.created_at,
         database_manifest,
         database_file,
@@ -1115,6 +1231,7 @@ async fn backup_coordinator_set(directory: &Path, backup_set: &Path) -> Result<(
         catalog_cursor_key_fingerprint,
         external_references,
         agent_pki_recovery: AgentPkiRecoveryV1::ExternalEnrollmentPackagesOrReenrollmentRequired,
+        suppression_policy,
     };
     validate_backup_set_manifest(&manifest)?;
     write_json_new(&staging.path().join(BACKUP_SET_MANIFEST), &manifest)?;
@@ -1142,10 +1259,21 @@ async fn backup_coordinator_set(directory: &Path, backup_set: &Path) -> Result<(
     Ok(())
 }
 
+#[cfg(test)]
 async fn restore_coordinator_set(
     backup_set: &Path,
     destination: &Path,
     sidecars: &Path,
+) -> Result<()> {
+    restore_coordinator_set_with_policy(backup_set, destination, sidecars, None, false).await
+}
+
+async fn restore_coordinator_set_with_policy(
+    backup_set: &Path,
+    destination: &Path,
+    sidecars: &Path,
+    policy: Option<(&Path, &Path)>,
+    accept_legacy_ledger_binding: bool,
 ) -> Result<()> {
     ensure!(
         !destination.exists(),
@@ -1165,6 +1293,34 @@ async fn restore_coordinator_set(
         read_json_bounded(&manifest_path, MAX_BACKUP_SET_MANIFEST_BYTES)?;
     validate_backup_set_manifest(&manifest)?;
     verify_backup_set_members(backup_set, &manifest)?;
+    let current_policy = policy
+        .map(|(path, key_path)| {
+            let key = EnvelopeKey::load(key_path, crate::privacy::LEDGER_KEY_ID)?;
+            let ledger = crate::privacy::SuppressionLedgerV1::load(path, &key)?;
+            Ok::<_, anyhow::Error>((ledger, key))
+        })
+        .transpose()?;
+    if let Some(expected) = &manifest.suppression_policy {
+        if manifest.schema_version == BACKUP_SET_SCHEMA_VERSION_V3 || expected.revision > 0 {
+            ensure!(
+                current_policy.is_some(),
+                "current independent suppression ledger and key are required for restore"
+            );
+        }
+        if let Some((ledger, _)) = &current_policy {
+            ensure!(
+                ledger.deployment_id == expected.deployment_id
+                    && ledger.revision >= expected.revision,
+                "current suppression ledger belongs to another deployment or is stale"
+            );
+            if ledger.revision == expected.revision {
+                ensure!(
+                    ledger.policy_digest()? == expected.policy_sha256,
+                    "current suppression ledger conflicts with backup policy"
+                );
+            }
+        }
+    }
     let deployment: CoordinatorDeploymentV1 = read_json_bounded(
         &backup_set.join(&manifest.deployment_manifest.relative_path),
         MAX_DEPLOYMENT_MANIFEST_BYTES,
@@ -1224,6 +1380,13 @@ async fn restore_coordinator_set(
         &EnvelopeKey::load(&staged_paths.envelope_key, ENVELOPE_KEY_ID)?,
     )?;
     write_relocated_manifests(&deployment, &recovered_pki, &staged_paths, &final_paths)?;
+    apply_restore_suppression(
+        &staged_paths,
+        &manifest,
+        current_policy,
+        accept_legacy_ledger_binding,
+    )
+    .await?;
     require_coherent_backup_state(&staged_paths)?;
     ensure!(
         !destination.exists(),
@@ -1241,6 +1404,108 @@ async fn restore_coordinator_set(
         destination.display()
     );
     println!("external recovery sidecars were fingerprint-verified; RPO/RTO are not measured");
+    Ok(())
+}
+
+async fn apply_restore_suppression(
+    paths: &StatePaths,
+    manifest: &CoordinatorBackupSetV1,
+    current_policy: Option<(crate::privacy::SuppressionLedgerV1, EnvelopeKey)>,
+    accept_legacy_ledger_binding: bool,
+) -> Result<()> {
+    let store = open_store(paths).await?;
+    let durable = store.privacy_ledger().await?;
+    if let Some(expected) = &manifest.suppression_policy {
+        ensure!(
+            durable.deployment_id == expected.deployment_id
+                && durable.revision == expected.revision
+                && durable.policy_digest()? == expected.policy_sha256,
+            "checkpoint suppression policy disagrees with manifest"
+        );
+    }
+    let Some((mut ledger, key)) = current_policy else {
+        ensure!(
+            durable.revision == 0,
+            "restored database contains suppression; provide the current independent ledger"
+        );
+        let key = EnvelopeKey::generate(crate::privacy::LEDGER_KEY_ID);
+        key.persist_new(&paths.suppression_key)?;
+        durable.persist(&paths.suppression_ledger, &key)?;
+        return store.shutdown_offline().await;
+    };
+    require_legacy_binding_attestation(
+        manifest.suppression_policy.is_none(),
+        durable.revision,
+        ledger.revision,
+        accept_legacy_ledger_binding,
+    )?;
+    if durable.deployment_id != ledger.deployment_id {
+        ensure!(
+            manifest.suppression_policy.is_none()
+                && durable.revision == 0
+                && durable.records.is_empty(),
+            "suppression ledger deployment mismatch"
+        );
+        store
+            .adopt_privacy_deployment(ledger.deployment_id.clone())
+            .await?;
+    }
+    ensure!(
+        ledger.revision >= durable.revision,
+        "suppression ledger is older than restored state"
+    );
+    for old in &durable.records {
+        ensure!(
+            ledger
+                .records
+                .iter()
+                .any(|new| new.request_id == old.request_id
+                    && new.revision == old.revision
+                    && new.target == old.target
+                    && new.created_at == old.created_at),
+            "suppression ledger omits or changes durable policy"
+        );
+    }
+    ledger.records.sort_by_key(|record| record.revision);
+    for record in &mut ledger.records {
+        record.reset_for_recovery();
+        store.put_privacy_record(record.clone()).await?;
+    }
+    key.persist_new(&paths.suppression_key)?;
+    ledger.persist(&paths.suppression_ledger, &key)?;
+    let inventory: Arc<dyn crate::catalog::InventoryProjectionStore> = Arc::new(
+        TursoInventoryStore::open(&paths.database, read_key_32(&paths.catalog_cursor_key)?).await?,
+    );
+    let privacy = crate::privacy::PrivacyService::open_with_ledger(
+        store.clone(),
+        inventory.clone(),
+        paths.suppression_ledger.clone(),
+        key,
+    )
+    .await?;
+    crate::coordinator_api::purge_suppressed_before_restore(
+        store.clone(),
+        inventory.clone(),
+        SecureBlobCache::new(paths.artifact_cache.clone()),
+        Arc::new(EnvelopeKey::load(&paths.envelope_key, ENVELOPE_KEY_ID)?),
+        privacy.clone(),
+    )
+    .await?;
+    drop(privacy);
+    drop(inventory);
+    store.shutdown_offline().await
+}
+
+fn require_legacy_binding_attestation(
+    legacy_without_identity: bool,
+    durable_revision: u64,
+    supplied_revision: u64,
+    accepted: bool,
+) -> Result<()> {
+    ensure!(
+        !legacy_without_identity || durable_revision != 0 || supplied_revision == 0 || accepted,
+        "legacy backup has no suppression identity; independently verify the ledger association, then pass --accept-legacy-ledger-binding"
+    );
     Ok(())
 }
 
@@ -1632,10 +1897,22 @@ fn read_json_bounded<T: DeserializeOwned>(path: &Path, max_bytes: u64) -> Result
 
 fn validate_backup_set_manifest(manifest: &CoordinatorBackupSetV1) -> Result<()> {
     ensure!(
-        manifest.schema_version == BACKUP_SET_SCHEMA_VERSION_V2,
+        matches!(
+            manifest.schema_version,
+            BACKUP_SET_SCHEMA_VERSION_V2 | BACKUP_SET_SCHEMA_VERSION_V3
+        ),
         "unsupported backup-set schema {}",
         manifest.schema_version
     );
+    ensure!(
+        manifest.schema_version != BACKUP_SET_SCHEMA_VERSION_V3
+            || manifest.suppression_policy.is_some(),
+        "suppression-aware backup manifest omits its policy identity"
+    );
+    if let Some(policy) = &manifest.suppression_policy {
+        Uuid::parse_str(&policy.deployment_id).context("invalid backup policy deployment")?;
+        ensure_sha256_text(&policy.policy_sha256)?;
+    }
     validate_file_inventory(&manifest.database_file)?;
     validate_file_inventory(&manifest.deployment_manifest)?;
     ensure!(
@@ -3433,6 +3710,8 @@ struct StatePaths {
     database: PathBuf,
     envelope_key: PathBuf,
     catalog_cursor_key: PathBuf,
+    suppression_ledger: PathBuf,
+    suppression_key: PathBuf,
     pki_directory: PathBuf,
     pki_manifest: PathBuf,
     ca_certificate: PathBuf,
@@ -3453,6 +3732,8 @@ impl StatePaths {
             database: directory.join("coordinator.db"),
             envelope_key: directory.join("envelope.key"),
             catalog_cursor_key: directory.join("inventory-cursor.key"),
+            suppression_ledger: directory.join("suppression.ledger"),
+            suppression_key: directory.join("suppression.key"),
             pki_manifest: pki_directory.join("manifest.json"),
             ca_certificate: pki_directory.join("ca.pem"),
             ca_private_key: pki_directory.join("ca.key"),
@@ -3735,6 +4016,100 @@ mod tests {
     }
 
     #[test]
+    fn suppression_aware_backup_requires_a_valid_policy_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest = write_test_backup_set(directory.path());
+        manifest.schema_version = BACKUP_SET_SCHEMA_VERSION_V3;
+        assert!(validate_backup_set_manifest(&manifest).is_err());
+        manifest.suppression_policy = Some(BackupSuppressionPolicyV1 {
+            deployment_id: Uuid::new_v4().to_string(),
+            revision: 1,
+            policy_sha256: "a".repeat(64),
+        });
+        validate_backup_set_manifest(&manifest).unwrap();
+        manifest.suppression_policy.as_mut().unwrap().policy_sha256 = "invalid".into();
+        assert!(validate_backup_set_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn legacy_policy_adoption_requires_explicit_binding_attestation() {
+        assert!(require_legacy_binding_attestation(true, 0, 1, false).is_err());
+        assert!(require_legacy_binding_attestation(true, 0, 1, true).is_ok());
+        assert!(require_legacy_binding_attestation(true, 0, 0, false).is_ok());
+        assert!(require_legacy_binding_attestation(false, 0, 1, false).is_ok());
+        assert!(require_legacy_binding_attestation(true, 1, 1, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn revision_zero_format3_backup_still_requires_current_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let backup = directory.path().join("backup");
+        fs::create_dir(&backup).unwrap();
+        let mut manifest = write_test_backup_set(&backup);
+        manifest.schema_version = BACKUP_SET_SCHEMA_VERSION_V3;
+        let original = crate::privacy::SuppressionLedgerV1 {
+            schema_version: 1,
+            deployment_id: Uuid::new_v4().to_string(),
+            revision: 0,
+            records: vec![],
+        };
+        manifest.suppression_policy = Some(BackupSuppressionPolicyV1 {
+            deployment_id: original.deployment_id.clone(),
+            revision: 0,
+            policy_sha256: original.policy_digest().unwrap(),
+        });
+        fs::write(
+            backup.join(BACKUP_SET_MANIFEST),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        // A later suppression exists independently of this revision-zero backup.
+        let mut current = original;
+        current.revision = 1;
+        current.records.push(crate::privacy::RemovalRequestV1 {
+            schema_version: 1,
+            request_id: Uuid::new_v4().to_string(),
+            deployment_id: current.deployment_id.clone(),
+            revision: 1,
+            target: crate::privacy::SuppressionTargetV1 {
+                repository_id: "42".into(),
+                scope: crate::privacy::RemovalScopeV1::Public,
+                aliases: BTreeSet::new(),
+            },
+            created_at: Utc::now(),
+            phase: crate::privacy::RemovalPhaseV1::Completed,
+            attempts_removed: 1,
+            artifacts_removed: 0,
+            failure_code: None,
+            task_cursor: None,
+            artifact_cursor: None,
+            failed_attempt_cursor: None,
+            pending_artifact: None,
+        });
+        current
+            .persist(
+                &directory.path().join("current.ledger"),
+                &EnvelopeKey::generate(crate::privacy::LEDGER_KEY_ID),
+            )
+            .unwrap();
+        let destination = directory.path().join("restored");
+        let error = restore_coordinator_set_with_policy(
+            &backup,
+            &destination,
+            &directory.path().join("sidecars"),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("current independent suppression ledger and key are required")
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn referenced_artifact_backup_authenticates_and_copies_the_exact_object_set() {
         let source = tempfile::tempdir().unwrap();
         let backup = tempfile::tempdir().unwrap();
@@ -3769,6 +4144,356 @@ mod tests {
         verify_backup_set_members(backup.path(), &manifest).unwrap();
         verify_referenced_artifacts(&[record], &backup.path().join("artifacts"), &manifest, &key)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn older_backup_restores_current_suppression_before_publication() {
+        use crate::{
+            catalog::{
+                InventoryAccessV1, InventoryPageRequestV1, InventoryProjectionStore,
+                InventoryQueryV1,
+            },
+            privacy::{PrivacyService, RemovalPhaseV1, RemovalScopeV1, SuppressionTargetV1},
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let paths = StatePaths::new(&source);
+        initialize_coordinator(CoordinatorInitArgs {
+            directory: source.clone(),
+            server_name: "localhost".into(),
+            json: false,
+        })
+        .await
+        .unwrap();
+        let store = open_store(&paths).await.unwrap();
+        let inventory = Arc::new(
+            TursoInventoryStore::open(
+                &paths.database,
+                read_key_32(&paths.catalog_cursor_key).unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let removed = seed_backup_evidence(&paths, &store, inventory.as_ref(), "42").await;
+        let retained = seed_backup_evidence(&paths, &store, inventory.as_ref(), "43").await;
+        let history = store.jobs().await.unwrap();
+        let removed_task = store.task(removed.task_id.clone()).await.unwrap().unwrap();
+        let removed_events = store
+            .events_for_job(removed.job_id.clone(), None, 100)
+            .await
+            .unwrap();
+        let access = InventoryAccessV1 {
+            principal_id: "restore-test".into(),
+            private_credential_profiles: BTreeSet::new(),
+        };
+        assert_eq!(
+            inventory
+                .search(
+                    &access,
+                    &InventoryQueryV1::new(),
+                    &InventoryPageRequestV1::default()
+                )
+                .await
+                .unwrap()
+                .items
+                .len(),
+            2
+        );
+        drop(inventory);
+        store.shutdown_offline().await.unwrap();
+
+        let backup = directory.path().join("backup");
+        backup_coordinator_set_with_policy(&source, &backup, None)
+            .await
+            .unwrap();
+        let manifest: CoordinatorBackupSetV1 = read_json_bounded(
+            &backup.join(BACKUP_SET_MANIFEST),
+            MAX_BACKUP_SET_MANIFEST_BYTES,
+        )
+        .unwrap();
+        assert_eq!(manifest.suppression_policy.as_ref().unwrap().revision, 0);
+        assert_eq!(manifest.artifacts.len(), 2);
+
+        let store = open_store(&paths).await.unwrap();
+        let inventory = Arc::new(
+            TursoInventoryStore::open(
+                &paths.database,
+                read_key_32(&paths.catalog_cursor_key).unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let privacy = PrivacyService::open_with_ledger(
+            store.clone(),
+            inventory.clone(),
+            paths.suppression_ledger.clone(),
+            EnvelopeKey::load(&paths.suppression_key, crate::privacy::LEDGER_KEY_ID).unwrap(),
+        )
+        .await
+        .unwrap();
+        let plan = privacy
+            .plan(SuppressionTargetV1 {
+                repository_id: "42".into(),
+                scope: RemovalScopeV1::Public,
+                aliases: BTreeSet::new(),
+            })
+            .await
+            .unwrap();
+        let request = privacy
+            .submit(Uuid::new_v4().to_string(), plan)
+            .await
+            .unwrap();
+        crate::coordinator_api::purge_suppressed_before_restore(
+            store.clone(),
+            inventory.clone(),
+            SecureBlobCache::new(&paths.artifact_cache),
+            Arc::new(EnvelopeKey::load(&paths.envelope_key, ENVELOPE_KEY_ID).unwrap()),
+            privacy.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            privacy.status(&request.request_id).await.unwrap().phase,
+            RemovalPhaseV1::Completed
+        );
+        // Retain a completed current ledger independently of the old backup. Restore
+        // must reset its progress and remove the old backup's resurrected objects.
+        let policy_path = directory.path().join("current-policy.ledger");
+        store
+            .privacy_ledger()
+            .await
+            .unwrap()
+            .persist(
+                &policy_path,
+                &EnvelopeKey::load(&paths.suppression_key, crate::privacy::LEDGER_KEY_ID).unwrap(),
+            )
+            .unwrap();
+        drop(privacy);
+        drop(inventory);
+        store.shutdown_offline().await.unwrap();
+
+        let destination = directory.path().join("restored");
+        assert!(!destination.exists());
+        restore_coordinator_set_with_policy(
+            &backup,
+            &destination,
+            &source,
+            Some((&policy_path, &paths.suppression_key)),
+            false,
+        )
+        .await
+        .unwrap();
+        // This also exercises closed database handles before the staged-directory
+        // rename on Windows. There is no serving process to perform cleanup later.
+        let restored_paths = StatePaths::new(&destination);
+        let restored = open_store(&restored_paths).await.unwrap();
+        let ledger = restored.privacy_ledger().await.unwrap();
+        assert_eq!(ledger.revision, 1);
+        assert_eq!(ledger.records[0].phase, RemovalPhaseV1::Completed);
+        assert_eq!(ledger.records[0].attempts_removed, 1);
+        assert_eq!(ledger.records[0].artifacts_removed, 1);
+        assert_eq!(restored.jobs().await.unwrap(), history);
+        assert_eq!(
+            restored.task(removed.task_id.clone()).await.unwrap(),
+            Some(removed_task)
+        );
+        assert_eq!(
+            restored
+                .events_for_job(removed.job_id.clone(), None, 100)
+                .await
+                .unwrap(),
+            removed_events
+        );
+        assert!(
+            restored
+                .artifact(removed.task_id.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            restored.artifact(retained.task_id.clone()).await.unwrap(),
+            Some(retained.clone())
+        );
+        let cache = SecureBlobCache::new(&restored_paths.artifact_cache);
+        let key = EnvelopeKey::load(&restored_paths.envelope_key, ENVELOPE_KEY_ID).unwrap();
+        let removed_member = manifest
+            .artifact_references
+            .iter()
+            .find(|reference| reference.task_id == removed.task_id)
+            .unwrap();
+        assert!(!destination.join(&removed_member.relative_path).exists());
+        let body = cache
+            .get(
+                &SecureCacheNamespace::Public,
+                "evidence",
+                retained.metadata.key.digest.as_str(),
+                &key,
+            )
+            .unwrap();
+        let evidence: EvidenceBundleV1 = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            evidence.repositories[0].repository_id.as_deref(),
+            Some("43")
+        );
+        // Open without installing in-memory suppression: the old rows themselves
+        // must be gone, rather than merely hidden by a process-local filter.
+        let catalog = TursoInventoryStore::open(
+            &restored_paths.database,
+            read_key_32(&restored_paths.catalog_cursor_key).unwrap(),
+        )
+        .await
+        .unwrap();
+        let results = catalog
+            .search(
+                &access,
+                &InventoryQueryV1::new(),
+                &InventoryPageRequestV1::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.items.len(), 1);
+        assert_eq!(results.items[0].repository.key.repository_id, "43");
+        assert_eq!(results.items[0].packages.len(), 1);
+        drop(catalog);
+        restored.shutdown_offline().await.unwrap();
+        fs::rename(&destination, directory.path().join("restored-closed")).unwrap();
+    }
+
+    async fn seed_backup_evidence(
+        paths: &StatePaths,
+        store: &TursoCoordinatorStore,
+        inventory: &TursoInventoryStore,
+        repository_id: &str,
+    ) -> ArtifactRecordV1 {
+        use crate::{
+            cargo_evidence::RecordedRelation,
+            catalog::{
+                InventoryNamespaceV1, InventoryObservationEnvelopeV1, InventoryProjectionInputV1,
+                InventoryProjectionStore, RepositoryRevisionV1,
+            },
+            coordinator::{
+                ArtifactRefV1, DurableCommandV1, NewRepositoryTaskV1, SubmitJobV1, TaskUsageV1,
+            },
+            evidence::{
+                EvidenceCompletenessV1, EvidenceStrengthV1, PackageEvidenceV1,
+                RepositoryExplanationV1, RepositoryVisibilityV1,
+            },
+        };
+        let now = timestamp(1_800_000_000);
+        let repository = format!("owner/repository-{repository_id}");
+        let job_id = JobId(format!("job-{repository_id}"));
+        let task_id = TaskId(format!("task-{repository_id}"));
+        let mut bundle = empty_bundle(semver::Version::new(0, 4, 3), now);
+        bundle.repositories.push(RepositoryEvidenceV1 {
+            repository: repository.clone(),
+            repository_id: Some(repository_id.into()),
+            visibility: RepositoryVisibilityV1::Public,
+            head_committed_at: Some(now),
+            completeness: EvidenceCompletenessV1::Complete,
+            requirements: Vec::new(),
+            exact_resolution_count: 1,
+            recorded_relation: RecordedRelation::Direct,
+            direct_witness: None,
+            transitive_witness: None,
+            msrv: None,
+            package_inventory_complete: true,
+            packages: vec![PackageEvidenceV1 {
+                package: bundle.target.clone(),
+                license_expression: None,
+            }],
+            vulnerabilities: Vec::new(),
+            explanation: RepositoryExplanationV1 {
+                repository: repository.clone(),
+                observed_at: now,
+                strength: EvidenceStrengthV1::VerifiedExactGraph,
+                completeness: EvidenceCompletenessV1::Complete,
+                steps: Vec::new(),
+                limitations: Vec::new(),
+                direct_witness: None,
+                transitive_witness: None,
+            },
+        });
+        let stored = SecureBlobCache::new(&paths.artifact_cache)
+            .put(
+                SecureCacheNamespace::Public,
+                "evidence",
+                &serde_json::to_vec(&bundle).unwrap(),
+                &EnvelopeKey::load(&paths.envelope_key, ENVELOPE_KEY_ID).unwrap(),
+            )
+            .unwrap();
+        let mut artifact = test_artifact_record(&task_id.0, &stored.sha256, stored.bytes);
+        artifact.job_id = job_id.clone();
+        let result = ArtifactRefV1 {
+            digest: artifact.metadata.key.digest.clone(),
+            media_type: EVIDENCE_MEDIA_TYPE_V1.into(),
+            stored_bytes: stored.bytes,
+        };
+        for command in [
+            DurableCommandV1::SubmitJob {
+                request: SubmitJobV1 {
+                    job_id: job_id.clone(),
+                    idempotency_key: job_id.0.clone(),
+                    spec: job(ScanJobStateV1::Queued, BTreeSet::new()).spec,
+                    submitted_at: now,
+                },
+            },
+            DurableCommandV1::EnqueueTask {
+                task: NewRepositoryTaskV1 {
+                    task_id: task_id.clone(),
+                    job_id: job_id.clone(),
+                    repository_id: repository,
+                    not_before: now,
+                    created_at: now,
+                },
+            },
+            DurableCommandV1::StartJob {
+                job_id: job_id.clone(),
+                now,
+            },
+            DurableCommandV1::LeaseNextTask {
+                job_id: job_id.clone(),
+                agent_id: "worker".into(),
+                lease_id: "lease".into(),
+                lease_seconds: 120,
+                now,
+            },
+            DurableCommandV1::CompleteTaskWithArtifact {
+                task_id: task_id.clone(),
+                agent_id: "worker".into(),
+                lease_id: "lease".into(),
+                result: result.clone(),
+                artifact: Box::new(artifact.clone()),
+                usage: TaskUsageV1::default(),
+                now,
+            },
+        ] {
+            store.apply(command).await.unwrap();
+        }
+        inventory
+            .project(InventoryProjectionInputV1::Observation(
+                InventoryObservationEnvelopeV1 {
+                    schema_version: 1,
+                    namespace: InventoryNamespaceV1::Public,
+                    job_id,
+                    task_id,
+                    task_attempt: 1,
+                    artifact: result,
+                    repository_id: repository_id.into(),
+                    revision: RepositoryRevisionV1 {
+                        commit_sha: format!("commit-{repository_id}"),
+                        tree_sha: format!("tree-{repository_id}"),
+                        analyzer_profile_digest: "analyzer-v1".into(),
+                    },
+                    target_selector: "=0.4.3".into(),
+                    completed_at: now,
+                    evidence: bundle,
+                },
+            ))
+            .await
+            .unwrap();
+        artifact
     }
 
     #[test]
@@ -3990,6 +4715,7 @@ mod tests {
             external_references,
             agent_pki_recovery:
                 AgentPkiRecoveryV1::ExternalEnrollmentPackagesOrReenrollmentRequired,
+            suppression_policy: None,
         };
         validate_backup_set_manifest(&manifest).unwrap();
         fs::write(

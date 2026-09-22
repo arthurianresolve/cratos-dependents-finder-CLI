@@ -18,6 +18,7 @@ pub mod operations;
 pub mod output;
 pub mod pki;
 pub mod policy;
+pub mod privacy;
 pub mod report;
 pub mod repository_analyzer;
 pub mod resolve;

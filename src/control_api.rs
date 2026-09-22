@@ -1,10 +1,13 @@
 //! Product control/read REST API, separate from the worker mTLS protocol.
 
 mod coordinator;
+mod privacy;
 mod product;
+mod provider;
 mod scheduler;
 
 pub use coordinator::CoordinatorControlApiState;
+pub use privacy::RemovalSubmissionV1;
 pub use scheduler::{DurableSchedulerRunner, SchedulerRunReportV1};
 
 use std::{io, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -177,6 +180,25 @@ pub async fn serve<StateT: ControlApiState>(
 /// State Interface for the product listener. Durable schedule/job methods can
 /// be added here without coupling the listener to the worker coordinator API.
 pub trait ControlApiState: Clone + Send + Sync + 'static {
+    fn privacy(&self) -> Option<&Arc<crate::privacy::PrivacyService>> {
+        None
+    }
+    fn github_provider_status(
+        &self,
+    ) -> BoxFuture<'_, Result<crate::coordinator::GithubProviderStatusV1, ControlApiStateError>>
+    {
+        Box::pin(async { Err(ControlApiStateError::Unavailable) })
+    }
+
+    fn resume_github_provider(
+        &self,
+        now: DateTime<Utc>,
+    ) -> BoxFuture<'_, Result<crate::coordinator::GithubProviderStatusV1, ControlApiStateError>>
+    {
+        let _ = now;
+        Box::pin(async { Err(ControlApiStateError::Unavailable) })
+    }
+
     fn inventory(&self) -> &(dyn InventoryProjectionStore + Send + Sync);
 
     fn readiness(&self) -> BoxFuture<'_, Result<(), ControlApiStateError>>;
@@ -393,6 +415,8 @@ fn router_with_transport<StateT: ControlApiState>(
         )
         .route("/api/v1/openapi.json", get(openapi))
         .merge(product::standard_routes::<StateT>())
+        .merge(privacy::routes::<StateT>())
+        .merge(provider::routes::<StateT>())
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_CONTROL_REQUEST_BYTES));
     let explicit_repository_routes = product::explicit_repository_routes::<StateT>()
@@ -494,6 +518,16 @@ async fn search_inventory<StateT: ControlApiState>(
     payload: Result<Json<InventorySearchRequestV1>, JsonRejection>,
 ) -> Response {
     let request_id = request_id(&headers);
+    let _privacy_guard = match state.privacy() {
+        Some(privacy) => {
+            let guard = privacy.gate.read().await;
+            if !guard.ready {
+                return failure(state_problem(ControlApiStateError::Unavailable, request_id));
+            }
+            Some(guard)
+        }
+        None => None,
+    };
     let request = match payload {
         Ok(Json(request)) => request,
         Err(error) => return failure(json_problem(error, request_id)),
@@ -907,6 +941,24 @@ pub fn openapi_document() -> Value {
             "version": "1.0.0"
         },
         "paths": {
+            "/api/v1/providers/github": {
+                "get": { "operationId": "githubProviderStatus", "security": [{ "serviceToken": [] }, { "trustedProxyOidc": [] }], "responses": { "200": { "description": "Admin-only deployment-wide GitHub rate control status" }, "404": { "$ref": "#/components/responses/Problem" }, "503": { "$ref": "#/components/responses/Problem" } } }
+            },
+            "/api/v1/providers/github/resume": {
+                "post": { "operationId": "resumeGithubProvider", "security": [{ "serviceToken": [] }, { "trustedProxyOidc": [] }], "responses": { "200": { "description": "Suspension cleared for one recovery probe without shortening deadlines" }, "404": { "$ref": "#/components/responses/Problem" }, "503": { "$ref": "#/components/responses/Problem" } } }
+            },
+            "/api/v1/privacy/removal-plans": {
+                "post": { "operationId": "planRepositoryRemoval", "description": "Admin-only, namespace-authorized dry run; aliases are resolved from retained inventory without publishing suppression.", "security": [{ "serviceToken": [] }, { "trustedProxyOidc": [] }], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SuppressionTargetV1" } } } }, "responses": { "200": { "description": "Repository removal plan", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemovalPlanV1" } } } }, "401": { "$ref": "#/components/responses/Problem" }, "404": { "$ref": "#/components/responses/Problem" }, "422": { "$ref": "#/components/responses/Problem" }, "503": { "$ref": "#/components/responses/Problem" } } }
+            },
+            "/api/v1/privacy/removals": {
+                "post": { "operationId": "submitRepositoryRemoval", "description": "Admin-only, namespace-authorized suppression and resumable purge. The body request_id is the idempotency key; acceptance publishes suppression before returning, not completion of physical deletion.", "security": [{ "serviceToken": [] }, { "trustedProxyOidc": [] }], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemovalSubmissionV1" } } } }, "responses": { "202": { "description": "Suppression accepted or matching request replayed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemovalRequestV1" } } } }, "401": { "$ref": "#/components/responses/Problem" }, "404": { "$ref": "#/components/responses/Problem" }, "409": { "$ref": "#/components/responses/Problem" }, "422": { "$ref": "#/components/responses/Problem" }, "503": { "$ref": "#/components/responses/Problem" } } }
+            },
+            "/api/v1/privacy/removals/{id}": {
+                "get": { "operationId": "readRepositoryRemoval", "description": "Admin-only removal progress within the principal's authorized namespace.", "security": [{ "serviceToken": [] }, { "trustedProxyOidc": [] }], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }], "responses": { "200": { "description": "Current removal progress", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemovalRequestV1" } } } }, "401": { "$ref": "#/components/responses/Problem" }, "404": { "$ref": "#/components/responses/Problem" }, "503": { "$ref": "#/components/responses/Problem" } } }
+            },
+            "/api/v1/privacy/removals/{id}/retry": {
+                "post": { "operationId": "retryRepositoryRemoval", "description": "Admin-only retry of an incomplete purge; suppression remains in force.", "security": [{ "serviceToken": [] }, { "trustedProxyOidc": [] }], "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }], "responses": { "202": { "description": "Removal retry accepted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemovalRequestV1" } } } }, "401": { "$ref": "#/components/responses/Problem" }, "404": { "$ref": "#/components/responses/Problem" }, "503": { "$ref": "#/components/responses/Problem" } } }
+            },
             "/livez": { "get": { "operationId": "liveness", "responses": { "200": { "description": "process is live" } } } },
             "/readyz": { "get": { "operationId": "readiness", "responses": { "200": { "description": "dependencies are ready" }, "503": { "$ref": "#/components/responses/Problem" } } } },
             "/api/v1/inventory/search": {
@@ -983,6 +1035,14 @@ pub fn openapi_document() -> Value {
                 "CreateScheduleRequestV1": { "type": "object", "required": ["schema_version", "schedule_id", "enabled", "definition"] },
                 "SubmitJobRequestV1": { "type": "object", "required": ["schema_version", "spec", "repositories"], "properties": { "repositories": { "type": "array", "maxItems": 10000, "items": { "type": "string" } } } },
                 "CredentialProfileV1": { "type": "object", "description": "metadata-only external broker profile; no credential material is accepted or returned" },
+                "RemovalScopeV1": { "oneOf": [
+                    { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "enum": ["all", "public"] } } },
+                    { "type": "object", "additionalProperties": false, "required": ["kind", "credential_profile_id"], "properties": { "kind": { "const": "credential_profile" }, "credential_profile_id": { "type": "string" } } }
+                ] },
+                "SuppressionTargetV1": { "type": "object", "additionalProperties": false, "required": ["repository_id", "scope", "aliases"], "properties": { "repository_id": { "type": "string", "pattern": "^[0-9]{1,32}$", "description": "Stable GitHub numeric repository ID, not owner/name" }, "scope": { "$ref": "#/components/schemas/RemovalScopeV1" }, "aliases": { "type": "array", "uniqueItems": true, "maxItems": 256, "items": { "type": "string", "maxLength": 256 }, "description": "Server-resolved aliases; supply an empty array for a new plan" } } },
+                "RemovalPlanV1": { "type": "object", "additionalProperties": false, "required": ["schema_version", "deployment_id", "target", "estimated_attempts"], "properties": { "schema_version": { "const": 1 }, "deployment_id": { "type": "string", "format": "uuid" }, "target": { "$ref": "#/components/schemas/SuppressionTargetV1" }, "estimated_attempts": { "type": "integer", "minimum": 0 } } },
+                "RemovalSubmissionV1": { "type": "object", "additionalProperties": false, "required": ["request_id", "plan"], "properties": { "request_id": { "type": "string", "format": "uuid", "description": "Idempotency key; reuse only with the identical target and plan" }, "plan": { "$ref": "#/components/schemas/RemovalPlanV1" } } },
+                "RemovalRequestV1": { "type": "object", "required": ["schema_version", "request_id", "deployment_id", "revision", "target", "created_at", "phase", "attempts_removed", "artifacts_removed", "failure_code"], "properties": { "schema_version": { "const": 1 }, "request_id": { "type": "string", "format": "uuid" }, "deployment_id": { "type": "string", "format": "uuid" }, "revision": { "type": "integer", "minimum": 1 }, "target": { "$ref": "#/components/schemas/SuppressionTargetV1" }, "created_at": { "type": "string", "format": "date-time" }, "phase": { "enum": ["pending", "catalog", "artifacts", "verifying", "completed", "failed"] }, "attempts_removed": { "type": "integer", "minimum": 0 }, "artifacts_removed": { "type": "integer", "minimum": 0 }, "failure_code": { "type": ["string", "null"] } } },
                 "ApiProblemV1": { "type": "object", "required": ["schema_version", "type", "title", "status", "code", "detail", "request_id"] }
             },
             "responses": {
@@ -999,10 +1059,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openapi_covers_every_control_read_route() {
+    fn openapi_covers_every_control_route() {
         let document = openapi_document();
         let paths = document["paths"].as_object().unwrap();
         for path in [
+            "/api/v1/providers/github",
+            "/api/v1/providers/github/resume",
+            "/api/v1/privacy/removal-plans",
+            "/api/v1/privacy/removals",
+            "/api/v1/privacy/removals/{id}",
+            "/api/v1/privacy/removals/{id}/retry",
             "/livez",
             "/readyz",
             "/api/v1/inventory/search",
@@ -1024,6 +1090,54 @@ mod tests {
             assert!(paths.contains_key(path));
         }
         assert_eq!(document["openapi"], "3.1.0");
+        for (path, method, status, schema) in [
+            (
+                "/api/v1/privacy/removal-plans",
+                "post",
+                "200",
+                "RemovalPlanV1",
+            ),
+            (
+                "/api/v1/privacy/removals",
+                "post",
+                "202",
+                "RemovalRequestV1",
+            ),
+            (
+                "/api/v1/privacy/removals/{id}",
+                "get",
+                "200",
+                "RemovalRequestV1",
+            ),
+            (
+                "/api/v1/privacy/removals/{id}/retry",
+                "post",
+                "202",
+                "RemovalRequestV1",
+            ),
+        ] {
+            let operation = &paths[path][method];
+            assert!(!operation["security"].as_array().unwrap().is_empty());
+            assert_eq!(
+                operation["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{schema}")
+            );
+        }
+        for schema in [
+            "RemovalScopeV1",
+            "SuppressionTargetV1",
+            "RemovalPlanV1",
+            "RemovalSubmissionV1",
+            "RemovalRequestV1",
+        ] {
+            assert!(document["components"]["schemas"][schema].is_object());
+        }
+        assert_eq!(
+            paths["/api/v1/privacy/removals"]["post"]["requestBody"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/RemovalSubmissionV1"
+        );
+        assert!(paths["/api/v1/privacy/removals"]["post"]["responses"]["409"].is_object());
     }
 
     #[test]

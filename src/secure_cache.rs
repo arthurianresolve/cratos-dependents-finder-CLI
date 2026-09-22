@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     fmt, fs,
-    io::Write as _,
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, Weak},
 };
@@ -356,6 +356,46 @@ impl SecureBlobCache {
         self.get_unlocked(namespace, content_kind, digest, key, &path)
     }
 
+    pub(crate) fn get_bounded(
+        &self,
+        namespace: &SecureCacheNamespace<'_>,
+        content_kind: &str,
+        digest: &str,
+        key: &EnvelopeKey,
+        maximum_plaintext_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        ensure_safe_label(content_kind, "content kind")?;
+        ensure_sha256(digest)?;
+        let path = self.object_path(namespace, content_kind, digest);
+        let object_lock = self.locks.object_lock(&path)?;
+        let _guard = object_lock
+            .read()
+            .map_err(|_| anyhow!("cache object lock poisoned"))?;
+        let overhead = MAGIC.len()
+            + 1
+            + ENVELOPE_MAGIC.len()
+            + NONCE_BYTES * 2
+            + WRAPPED_KEY_BYTES
+            + GCM_TAG_BYTES;
+        let maximum_encoded_bytes = maximum_plaintext_bytes
+            .checked_add(overhead as u64)
+            .context("cache read bound overflow")?;
+        let mut encoded = Vec::new();
+        fs::File::open(&path)?
+            .take(maximum_encoded_bytes.saturating_add(1))
+            .read_to_end(&mut encoded)?;
+        ensure!(
+            encoded.len() as u64 <= maximum_encoded_bytes,
+            "cache object exceeds read bound"
+        );
+        let plaintext = self.decode_object(namespace, content_kind, digest, key, &encoded)?;
+        ensure!(
+            plaintext.len() as u64 <= maximum_plaintext_bytes,
+            "cache plaintext exceeds read bound"
+        );
+        Ok(plaintext)
+    }
+
     /// Authenticate one stored object and verify its durable plaintext
     /// metadata without returning the potentially sensitive plaintext to the
     /// caller. The returned path is the canonical content-addressed location
@@ -386,6 +426,17 @@ impl SecureBlobCache {
     ) -> Result<Vec<u8>> {
         let encoded = fs::read(path)
             .with_context(|| format!("reading encrypted cache object {}", path.display()))?;
+        self.decode_object(namespace, content_kind, digest, key, &encoded)
+    }
+
+    fn decode_object(
+        &self,
+        namespace: &SecureCacheNamespace<'_>,
+        content_kind: &str,
+        digest: &str,
+        key: &EnvelopeKey,
+        encoded: &[u8],
+    ) -> Result<Vec<u8>> {
         let header_bytes = MAGIC.len() + 1 + NONCE_BYTES;
         ensure!(encoded.len() >= header_bytes, "truncated cache object");
         ensure!(
@@ -538,6 +589,10 @@ fn ensure_sha256(value: &str) -> Result<()> {
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
+    encode_digest(&digest)
+}
+
+pub(crate) fn encode_digest(digest: &[u8]) -> String {
     let mut encoded = String::with_capacity(digest.len() * 2);
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in digest {
@@ -632,6 +687,17 @@ mod tests {
         let stored = cache
             .put(private_a.clone(), "cargo_blob", b"secret", &key)
             .unwrap();
+        assert_eq!(
+            cache
+                .get_bounded(&private_a, "cargo_blob", &stored.sha256, &key, 6)
+                .unwrap(),
+            b"secret"
+        );
+        assert!(
+            cache
+                .get_bounded(&private_a, "cargo_blob", &stored.sha256, &key, 5)
+                .is_err()
+        );
         assert_eq!(
             cache
                 .get(&private_a, "cargo_blob", &stored.sha256, &key)
